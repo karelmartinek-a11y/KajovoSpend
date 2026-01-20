@@ -22,6 +22,8 @@ MODEL_URLS = {
     "ch_ppocr_server_v2.0_det_infer.onnx": "https://github.com/RapidAI/RapidOCR/releases/download/v1.0.0/ch_ppocr_server_v2.0_det_infer.onnx",
     # Recognition model
     "ch_ppocr_server_v2.0_rec_infer.onnx": "https://github.com/RapidAI/RapidOCR/releases/download/v1.0.0/ch_ppocr_server_v2.0_rec_infer.onnx",
+    # Optional classifier (some RapidOCR configs reference it)
+    "ch_ppocr_mobile_v2.0_cls_infer.onnx": "https://github.com/RapidAI/RapidOCR/releases/download/v1.0.0/ch_ppocr_mobile_v2.0_cls_infer.onnx",
     # Character dictionary
     "ppocr_keys_v1.txt": "https://github.com/RapidAI/RapidOCR/releases/download/v1.0.0/ppocr_keys_v1.txt",
 }

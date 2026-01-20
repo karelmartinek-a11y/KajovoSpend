@@ -46,7 +46,12 @@ class Processor:
         self.cfg = cfg
         self.paths = paths
         self.log = logger
-        self.ocr_engine = RapidOcrEngine(paths.models_dir)
+        # OCR engine is optional; if unavailable we quarantine rather than crash service.
+        try:
+            self.ocr_engine = RapidOcrEngine(paths.models_dir)
+        except Exception as e:
+            self.log.warning(f"OCR init failed; will quarantine documents. Error: {e}")
+            self.ocr_engine = None
 
     def _ocr_pdf(self, pdf_path: Path) -> Tuple[str, float, int]:
         # Try embedded text first
@@ -64,6 +69,8 @@ class Processor:
             # treat embedded text as high confidence
             return txt, 0.95, len(text_parts)
         # fallback to image OCR
+        if self.ocr_engine is None:
+            return "", 0.0, 0
         images = render_pdf_to_images(pdf_path, dpi=int(self.cfg["ocr"].get("pdf_dpi", 200)))
         texts = []
         confs = []
@@ -77,6 +84,8 @@ class Processor:
         return "\n".join(texts), float(sum(confs) / max(len(confs), 1)), len(images)
 
     def _ocr_image(self, path: Path) -> Tuple[str, float, int]:
+        if self.ocr_engine is None:
+            return "", 0.0, 1
         img = Image.open(path)
         t, c = self.ocr_engine.image_to_text(img)
         return t, c, 1

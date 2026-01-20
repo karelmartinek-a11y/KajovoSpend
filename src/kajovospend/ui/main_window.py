@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTabWidget, QTableView,
     QLineEdit, QFormLayout, QSplitter, QTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QFileDialog,
     QMessageBox, QDateEdit, QProgressBar, QDialog, QDialogButtonBox, QHeaderView, QAbstractItemView,
+    QCheckBox,
 )
 
 from sqlalchemy.orm import Session
@@ -86,6 +87,44 @@ class StatusDialog(QDialog):
         bb = QDialogButtonBox(QDialogButtonBox.Ok)
         bb.accepted.connect(self.accept)
         lay.addWidget(bb)
+
+
+class SupplierDialog(QDialog):
+    def __init__(self, parent=None, initial: Optional[Dict[str, Any]] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Dodavatel")
+        self._initial = initial or {}
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.ed_ico = QLineEdit(self._initial.get("ico", "") or "")
+        self.ed_name = QLineEdit(self._initial.get("name", "") or "")
+        self.ed_dic = QLineEdit(self._initial.get("dic", "") or "")
+        self.ed_addr = QLineEdit(self._initial.get("address", "") or "")
+        self.cb_vat = QCheckBox("Plátce DPH")
+        self.cb_vat.setChecked(bool(self._initial.get("is_vat_payer") is True))
+
+        form.addRow("IČO", self.ed_ico)
+        form.addRow("Název", self.ed_name)
+        form.addRow("DIČ", self.ed_dic)
+        form.addRow("Adresa", self.ed_addr)
+        form.addRow("", self.cb_vat)
+
+        lay.addLayout(form)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def values(self) -> Dict[str, Any]:
+        return {
+            "ico": self.ed_ico.text().strip(),
+            "name": self.ed_name.text().strip() or None,
+            "dic": self.ed_dic.text().strip() or None,
+            "address": self.ed_addr.text().strip() or None,
+            "is_vat_payer": True if self.cb_vat.isChecked() else False,
+        }
 
 
 class MainWindow(QMainWindow):
@@ -481,10 +520,27 @@ class MainWindow(QMainWindow):
         return str(model.data(model.index(idx.row(), 0), Qt.DisplayRole) or "")
 
     def on_add_supplier(self):
-        ico, ok = QFileDialog.getOpenFileName(self, "Zadej IČO do názvu souboru...", "", "*.*")
-        # hack: keep UI minimal (avoid custom dialogs)
-        # user can add via ARES button after selecting row.
-        QMessageBox.information(self, "Dodavatelé", "Přidání: použij ARES-AKTUALIZACE na vybrané IČO nebo vlož doklad.")
+        dlg = SupplierDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        vals = dlg.values()
+        ico = (vals.get("ico") or "").strip()
+        if not ico:
+            QMessageBox.warning(self, "Dodavatelé", "IČO je povinné.")
+            return
+        with self.sf() as session:
+            s = session.execute(select(Supplier).where(Supplier.ico == ico)).scalar_one_or_none()
+            if not s:
+                s = Supplier(ico=ico)
+            s.name = vals.get("name")
+            s.dic = vals.get("dic")
+            s.address = vals.get("address")
+            # allow None (unknown) by storing NULL if user doesn't want to decide:
+            # checkbox implies explicit True/False; keep False if unchecked
+            s.is_vat_payer = bool(vals.get("is_vat_payer"))
+            session.add(s)
+            session.commit()
+        self.refresh_suppliers()
 
     def on_delete_supplier(self):
         ico = self._selected_supplier_ico()
@@ -683,15 +739,75 @@ class MainWindow(QMainWindow):
         self.money_summary.setText("\n".join(txt))
 
     def _export(self, kind: str):
-        # export current doc table
-        path, _ = QFileDialog.getSaveFileName(self, f"Uložit {kind.upper()}", str(Path.home() / f"kajovospend_export.{kind}"), f"*.{kind}")
+        # export current filtered documents (same filter as in UI)
+        q = self.ed_doc_search.text().strip()
+        dfrom = self.dt_from.date().toPython()
+        dto = self.dt_to.date().toPython()
+
+        default_name = f"kajovospend_export_{dt.date.today().isoformat()}.{kind}"
+        path, _ = QFileDialog.getSaveFileName(self, f"Uložit {kind.upper()}", str(Path.home() / default_name))
         if not path:
             return
-        import pandas as pd
-        data = self.doc_model.rows if hasattr(self, "doc_model") else []
-        df = pd.DataFrame(data, columns=self.doc_model.headers)
-        if kind == "csv":
-            df.to_csv(path, index=False, sep=';')
-        else:
-            df.to_excel(path, index=False)
-        QMessageBox.information(self, "Export", "Hotovo.")
+
+        with self.sf() as session:
+            docs = db_api.list_documents(session, q=q, date_from=dfrom, date_to=dto)
+            # Flatten for export including line items.
+            rows: List[Dict[str, Any]] = []
+            for d, f in docs:
+                items = session.execute(select(LineItem).where(LineItem.document_id == d.id).order_by(LineItem.line_no)).scalars().all()
+                if not items:
+                    rows.append({
+                        "document_id": d.id,
+                        "issue_date": d.issue_date.isoformat() if d.issue_date else None,
+                        "supplier_ico": d.supplier_ico,
+                        "doc_number": d.doc_number,
+                        "bank_account": d.bank_account,
+                        "total_with_vat": d.total_with_vat,
+                        "currency": d.currency,
+                        "requires_review": bool(d.requires_review),
+                        "review_reasons": d.review_reasons,
+                        "file_path": f.current_path,
+                        "item_line_no": None,
+                        "item_name": None,
+                        "item_quantity": None,
+                        "item_vat_rate": None,
+                        "item_line_total": None,
+                    })
+                else:
+                    for it in items:
+                        rows.append({
+                            "document_id": d.id,
+                            "issue_date": d.issue_date.isoformat() if d.issue_date else None,
+                            "supplier_ico": d.supplier_ico,
+                            "doc_number": d.doc_number,
+                            "bank_account": d.bank_account,
+                            "total_with_vat": d.total_with_vat,
+                            "currency": d.currency,
+                            "requires_review": bool(d.requires_review),
+                            "review_reasons": d.review_reasons,
+                            "file_path": f.current_path,
+                            "item_line_no": it.line_no,
+                            "item_name": it.name,
+                            "item_quantity": it.quantity,
+                            "item_vat_rate": it.vat_rate,
+                            "item_line_total": it.line_total,
+                        })
+
+        try:
+            if kind == "csv":
+                import csv
+                with open(path, "w", newline="", encoding="utf-8") as fp:
+                    w = csv.DictWriter(fp, fieldnames=list(rows[0].keys()) if rows else [])
+                    w.writeheader()
+                    for r in rows:
+                        w.writerow(r)
+            elif kind == "xlsx":
+                import pandas as pd
+                df = pd.DataFrame(rows)
+                df.to_excel(path, index=False)
+            else:
+                raise ValueError(f"unknown export kind: {kind}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export", f"Export selhal: {e}")
+            return
+        QMessageBox.information(self, "Export", f"Uloženo: {path}")

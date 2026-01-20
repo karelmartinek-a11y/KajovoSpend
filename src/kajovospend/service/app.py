@@ -137,8 +137,23 @@ class ServiceApp:
 
                 time.sleep(scan_interval)
         finally:
-            self._watcher.stop()
-            self._executor.shutdown(wait=False, cancel_futures=False)
-            with self.sf() as session:
-                update_service_state(session, running=False)
-                session.commit()
+            # best-effort shutdown; never raise from finally
+            try:
+                self._watcher.stop()
+            except Exception:
+                pass
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            try:
+                with self.sf() as session:
+                    update_service_state(
+                        session,
+                        running=False,
+                        last_seen=dt.datetime.utcnow(),
+                        queue_size=queue_size(session),
+                    )
+                    session.commit()
+            except Exception:
+                pass

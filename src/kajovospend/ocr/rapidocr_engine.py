@@ -21,19 +21,32 @@ class OcrLine:
 
 class RapidOcrEngine:
     def __init__(self, models_dir: Path | None = None):
+        # Do NOT hard-fail the whole app if OCR runtime isn't available.
+        # Service will quarantine docs instead.
+        self._engine = None
         if RapidOCR is None:
-            raise RuntimeError("rapidocr-onnxruntime is not installed")
+            return
         kwargs = {}
         if models_dir and models_dir.exists():
-            # RapidOCR expects model paths; keep it simple: default internal models if not pinned.
-            # If pinned models exist, user can still rely on default behavior.
-            kwargs["det_model_path"] = str(models_dir / "ch_ppocr_server_v2.0_det_infer.onnx") if (models_dir / "ch_ppocr_server_v2.0_det_infer.onnx").exists() else None
-            kwargs["rec_model_path"] = str(models_dir / "ch_ppocr_server_v2.0_rec_infer.onnx") if (models_dir / "ch_ppocr_server_v2.0_rec_infer.onnx").exists() else None
-            kwargs["cls_model_path"] = str(models_dir / "ch_ppocr_mobile_v2.0_cls_infer.onnx") if (models_dir / "ch_ppocr_mobile_v2.0_cls_infer.onnx").exists() else None
+            # Deterministic offline pinning (if present).
+            det = models_dir / "ch_ppocr_server_v2.0_det_infer.onnx"
+            rec = models_dir / "ch_ppocr_server_v2.0_rec_infer.onnx"
+            cls = models_dir / "ch_ppocr_mobile_v2.0_cls_infer.onnx"
+            keys = models_dir / "ppocr_keys_v1.txt"
+            kwargs["det_model_path"] = str(det) if det.exists() else None
+            kwargs["rec_model_path"] = str(rec) if rec.exists() else None
+            kwargs["cls_model_path"] = str(cls) if cls.exists() else None
+            # Some RapidOCR builds accept rec_char_dict_path; safe to pass only if exists.
+            kwargs["rec_char_dict_path"] = str(keys) if keys.exists() else None
             kwargs = {k: v for k, v in kwargs.items() if v}
         self._engine = RapidOCR(**kwargs)
 
+    def is_available(self) -> bool:
+        return self._engine is not None
+
     def image_to_lines(self, image: Image.Image) -> List[OcrLine]:
+        if self._engine is None:
+            return []
         arr = np.array(image.convert("RGB"))
         result, _ = self._engine(arr)
         lines: List[OcrLine] = []
