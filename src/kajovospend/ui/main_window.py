@@ -7,13 +7,13 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex
+from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread
 from PySide6.QtGui import QIcon, QPixmap, QImage
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTabWidget, QTableView,
     QLineEdit, QFormLayout, QSplitter, QTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QFileDialog,
     QMessageBox, QDateEdit, QProgressBar, QDialog, QDialogButtonBox, QHeaderView, QAbstractItemView,
-    QCheckBox,
+    QCheckBox, QProgressDialog, QApplication,
 )
 
 from sqlalchemy.orm import Session
@@ -66,10 +66,31 @@ class TableModel(QAbstractTableModel):
 
 
 def pil_to_pixmap(img) -> QPixmap:
+    return QPixmap.fromImage(pil_to_qimage(img))
+
+
+def pil_to_qimage(img) -> QImage:
     img = img.convert("RGB")
     data = img.tobytes("raw", "RGB")
-    qimg = QImage(data, img.width, img.height, QImage.Format_RGB888)
-    return QPixmap.fromImage(qimg)
+    return QImage(data, img.width, img.height, QImage.Format_RGB888)
+
+
+class _Worker(QObject):
+    done = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    @Slot()
+    def run(self):
+        try:
+            res = self._fn()
+        except Exception as e:
+            self.error.emit(str(e))
+            return
+        self.done.emit(res)
 
 
 class StatusDialog(QDialog):
@@ -133,6 +154,9 @@ class MainWindow(QMainWindow):
         self.config_path = config_path
         self.assets_dir = assets_dir
         self.cfg = self._load_or_create_config()
+        # keep threads/workers alive
+        self._threads: List[QThread] = []
+        self._dialogs: List[QProgressDialog] = []
 
         self.paths = resolve_app_paths(
             self.cfg["app"].get("data_dir"),
@@ -171,19 +195,111 @@ class MainWindow(QMainWindow):
         cfg.setdefault("performance", {})
         return cfg
 
+    def _run_with_busy(self, title: str, message: str, fn, on_done, on_error=None):
+        """
+        Run fn() in background thread with a modal indeterminate progress dialog.
+        """
+        dlg = QProgressDialog(message, "", 0, 0, self)
+        dlg.setWindowTitle(title)
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setAutoClose(True)
+        dlg.setAutoReset(True)
+        dlg.show()
+        self._dialogs.append(dlg)
+
+        th = QThread(self)
+        wk = _Worker(fn)
+        wk.moveToThread(th)
+        th.started.connect(wk.run)
+
+        def _cleanup():
+            try:
+                dlg.close()
+            except Exception:
+                pass
+            try:
+                th.quit()
+                th.wait(2000)
+            except Exception:
+                pass
+            try:
+                self._threads.remove(th)
+            except Exception:
+                pass
+            try:
+                self._dialogs.remove(dlg)
+            except Exception:
+                pass
+
+        def _ok(res):
+            _cleanup()
+            try:
+                on_done(res)
+            except Exception:
+                self.log.exception("UI on_done handler failed")
+
+        def _err(msg: str):
+            _cleanup()
+            if on_error:
+                try:
+                    on_error(msg)
+                    return
+                except Exception:
+                    self.log.exception("UI on_error handler failed")
+            QMessageBox.critical(self, title, f"Chyba: {msg}")
+
+        wk.done.connect(_ok)
+        wk.error.connect(_err)
+
+        self._threads.append(th)
+        th.start()
+
+    def _load_logo_pixmap(self) -> Optional[QPixmap]:
+        # Prefer a dedicated logo if present, fallback to app.ico.
+        for cand in ["logo.png", "logo.bmp", "logo.jpg"]:
+            p = self.assets_dir / cand
+            if p.exists():
+                px = QPixmap(str(p))
+                if not px.isNull():
+                    return px
+        ico = self.assets_dir / "app.ico"
+        if ico.exists():
+            ic = QIcon(str(ico))
+            px = ic.pixmap(28, 28)
+            if not px.isNull():
+                return px
+        return None
+
     def _build_ui(self):
         root = QWidget()
         v = QVBoxLayout(root)
 
         # Header
         header = QWidget()
+        header.setObjectName("HeaderBar")
         hl = QHBoxLayout(header)
         hl.setContentsMargins(12, 12, 12, 6)
 
+        self.logo = QLabel()
+        self.logo.setObjectName("LogoLabel")
+        self.logo.setFixedSize(28, 28)
+        self.logo.setScaledContents(True)
+        px = self._load_logo_pixmap()
+        if px:
+            self.logo.setPixmap(px)
         title = QLabel("KájovoSpend")
         title.setObjectName("TitleLabel")
 
-        hl.addWidget(title)
+        left = QWidget()
+        left.setProperty("panel", True)
+        lhl = QHBoxLayout(left)
+        lhl.setContentsMargins(10, 6, 10, 6)
+        lhl.setSpacing(10)
+        lhl.addWidget(self.logo)
+        lhl.addWidget(title)
+        hl.addWidget(left)
         hl.addStretch(1)
 
         self.btn_status = QPushButton("STAV")
@@ -214,6 +330,7 @@ class MainWindow(QMainWindow):
         self.lbl_suppliers = QLabel("Dodavatelé: 0")
         for lab in [self.lbl_unprocessed, self.lbl_processed, self.lbl_docs, self.lbl_suppliers]:
             lab.setMinimumWidth(180)
+            lab.setProperty("card", True)
             cl.addWidget(lab)
         cl.addStretch(1)
         dl.addWidget(cards)
@@ -231,6 +348,8 @@ class MainWindow(QMainWindow):
         self.tab_ops = QWidget()
         ol = QVBoxLayout(self.tab_ops)
         self.ops_table = QTableView()
+        self.ops_table.setAlternatingRowColors(True)
+        self.ops_table.setShowGrid(True)
         self.ops_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.ops_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         ol.addWidget(self.ops_table)
@@ -240,6 +359,8 @@ class MainWindow(QMainWindow):
         self.tab_susp = QWidget()
         sl = QVBoxLayout(self.tab_susp)
         self.susp_table = QTableView()
+        self.susp_table.setAlternatingRowColors(True)
+        self.susp_table.setShowGrid(True)
         self.susp_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.susp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         sl.addWidget(self.susp_table)
@@ -308,6 +429,8 @@ class MainWindow(QMainWindow):
             tl.addWidget(b)
         spl.addWidget(top)
         self.sup_table = QTableView()
+        self.sup_table.setAlternatingRowColors(True)
+        self.sup_table.setShowGrid(True)
         self.sup_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.sup_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.sup_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -317,7 +440,8 @@ class MainWindow(QMainWindow):
         # Účty
         self.tab_docs = QWidget()
         dl2 = QVBoxLayout(self.tab_docs)
-        filters = QWidget(); fl = QHBoxLayout(filters); fl.setContentsMargins(0,0,0,0)
+        filters = QWidget(); filters.setProperty("panel", True)
+        fl = QHBoxLayout(filters); fl.setContentsMargins(10,6,10,6)
         self.ed_doc_search = QLineEdit(); self.ed_doc_search.setPlaceholderText("Fulltext (doklady + položky)")
         self.dt_from = QDateEdit(); self.dt_from.setCalendarPopup(True); self.dt_from.setDisplayFormat("dd.MM.yyyy")
         self.dt_to = QDateEdit(); self.dt_to.setCalendarPopup(True); self.dt_to.setDisplayFormat("dd.MM.yyyy")
@@ -337,6 +461,8 @@ class MainWindow(QMainWindow):
         splitter = QSplitter()
         left = QWidget(); ll = QVBoxLayout(left)
         self.doc_table = QTableView()
+        self.doc_table.setAlternatingRowColors(True)
+        self.doc_table.setShowGrid(True)
         self.doc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.doc_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.doc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -345,10 +471,12 @@ class MainWindow(QMainWindow):
 
         right = QWidget(); rl = QVBoxLayout(right)
         self.preview = QLabel("Náhled")
+        self.preview.setObjectName("PreviewBox")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumWidth(420)
-        self.preview.setStyleSheet("border: 1px solid #E5E5E5; border-radius: 12px;")
         self.items_table = QTableView()
+        self.items_table.setAlternatingRowColors(True)
+        self.items_table.setShowGrid(True)
         self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         rl.addWidget(self.preview, 3)
         rl.addWidget(self.items_table, 2)
@@ -362,6 +490,8 @@ class MainWindow(QMainWindow):
         self.tab_unrec = QWidget()
         ul = QVBoxLayout(self.tab_unrec)
         self.unrec_table = QTableView()
+        self.unrec_table.setAlternatingRowColors(True)
+        self.unrec_table.setShowGrid(True)
         self.unrec_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.unrec_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.unrec_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -423,7 +553,20 @@ class MainWindow(QMainWindow):
             line_edit.setText(d)
 
     def _service_status(self) -> Dict[str, Any]:
-        return send_cmd(self.cfg["service"].get("host", "127.0.0.1"), int(self.cfg["service"].get("port", 8765)), "status")
+        try:
+            return send_cmd(self.cfg["service"].get("host", "127.0.0.1"), int(self.cfg["service"].get("port", 8765)), "status")
+        except Exception as e:
+            # Never crash UI because the service is down.
+            self.log.warning("service status failed: %s", e)
+            return {
+                "ok": False,
+                "running": False,
+                "queue_size": None,
+                "last_success": None,
+                "last_error": str(e),
+                "last_error_at": dt.datetime.utcnow().isoformat(),
+                "last_seen": None,
+            }
 
     def _start_service_process(self) -> bool:
         # Start service as detached process
@@ -448,7 +591,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "RUN", "Služba spuštěna.")
 
     def on_stop_service(self):
-        send_cmd(self.cfg["service"].get("host", "127.0.0.1"), int(self.cfg["service"].get("port", 8765)), "stop")
+        try:
+            send_cmd(self.cfg["service"].get("host", "127.0.0.1"), int(self.cfg["service"].get("port", 8765)), "stop")
+        except Exception as e:
+            # Stop should not crash if service is already down.
+            QMessageBox.warning(self, "STOP", f"Službu se nepodařilo zastavit (možná neběží): {e}")
 
     def on_restart_service(self):
         self.on_stop_service()
@@ -474,13 +621,13 @@ class MainWindow(QMainWindow):
         if not api_key:
             QMessageBox.warning(self, "Modely", "Nejdřív zadej API-KEY.")
             return
-        try:
-            models = list_models(api_key)
+        def work():
+            return list_models(api_key)
+        def done(models: List[str]):
             self.cb_model.clear()
             self.cb_model.addItems(models)
             QMessageBox.information(self, "Modely", f"Načteno: {len(models)}")
-        except Exception as e:
-            QMessageBox.critical(self, "Modely", f"Chyba: {e}")
+        self._run_with_busy("Modely", "Načítám dostupné modely…", work, done)
 
     def refresh_all(self):
         self.refresh_dashboard()
@@ -492,14 +639,17 @@ class MainWindow(QMainWindow):
         self.refresh_money()
 
     def refresh_dashboard(self):
-        with self.sf() as session:
-            c = db_api.counts(session)
-        self.lbl_unprocessed.setText(f"Nezpracované: {c['unprocessed']}")
-        self.lbl_processed.setText(f"Zpracované: {c['processed']}")
-        self.lbl_docs.setText(f"Účty: {c['documents']}")
-        self.lbl_suppliers.setText(f"Dodavatelé: {c['suppliers']}")
+        try:
+            with self.sf() as session:
+                c = db_api.counts(session)
+            self.lbl_unprocessed.setText(f"Nezpracované: {c['unprocessed']}")
+            self.lbl_processed.setText(f"Zpracované: {c['processed']}")
+            self.lbl_docs.setText(f"Účty: {c['documents']}")
+            self.lbl_suppliers.setText(f"Dodavatelé: {c['suppliers']}")
+        except Exception:
+            self.log.exception("refresh_dashboard counts failed")
         st = self._service_status()
-        running = st.get("running")
+        running = bool(st.get("running"))
         self.lbl_service.setText(f"Služba: {'běží' if running else 'neběží'} | fronta: {st.get('queue_size')}")
         qsz = st.get("queue_size") or 0
         self.progress.setValue(0 if qsz == 0 else min(95, int(100 / (qsz + 1))))
@@ -560,23 +710,22 @@ class MainWindow(QMainWindow):
         if not ico:
             QMessageBox.warning(self, "ARES", "Vyber dodavatele v tabulce.")
             return
-        try:
-            rec = fetch_by_ico(ico)
-        except Exception as e:
-            QMessageBox.critical(self, "ARES", f"Chyba: {e}")
-            return
-        with self.sf() as session:
-            s = session.execute(select(Supplier).where(Supplier.ico == ico)).scalar_one_or_none()
-            if not s:
-                s = Supplier(ico=ico)
-            s.name = rec.name
-            s.dic = rec.dic
-            s.address = rec.address
-            s.is_vat_payer = rec.is_vat_payer
-            s.ares_last_sync = rec.fetched_at
-            session.add(s)
-            session.commit()
-        self.refresh_suppliers()
+        def work():
+            return fetch_by_ico(ico)
+        def done(rec):
+            with self.sf() as session:
+                s = session.execute(select(Supplier).where(Supplier.ico == ico)).scalar_one_or_none()
+                if not s:
+                    s = Supplier(ico=ico)
+                s.name = rec.name
+                s.dic = rec.dic
+                s.address = rec.address
+                s.is_vat_payer = rec.is_vat_payer
+                s.ares_last_sync = rec.fetched_at
+                session.add(s)
+                session.commit()
+            self.refresh_suppliers()
+        self._run_with_busy("ARES", "Načítám data z ARES…", work, done)
 
     def refresh_documents(self):
         q = self.ed_doc_search.text().strip()
@@ -599,24 +748,33 @@ class MainWindow(QMainWindow):
             detail = db_api.get_document_detail(session, doc_id)
             f: DocumentFile = detail["file"]
             items: List[LineItem] = detail["items"]
-        # preview
-        p = Path(f.current_path)
-        pix = None
-        try:
-            if p.suffix.lower() == ".pdf":
-                imgs = render_pdf_to_images(p, dpi=160, max_pages=1)
-                pix = pil_to_pixmap(imgs[0]) if imgs else None
-            else:
-                from PIL import Image
-                pix = pil_to_pixmap(Image.open(p))
-        except Exception:
-            pix = None
-        if pix:
-            self.preview.setPixmap(pix.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        else:
-            self.preview.setText("Nelze načíst náhled")
         it_rows = [[i.line_no, i.name, i.quantity, i.vat_rate, i.line_total] for i in items]
         self.items_table.setModel(TableModel(["#", "Název", "Počet", "DPH %", "Cena"], it_rows))
+
+        # preview in background (PDF render / image load can block)
+        self.preview.setText("Načítám náhled…")
+        self.preview.setPixmap(QPixmap())
+        QApplication.processEvents()
+
+        p = Path(f.current_path)
+
+        def work():
+            if p.suffix.lower() == ".pdf":
+                imgs = render_pdf_to_images(p, dpi=160, max_pages=1)
+                if not imgs:
+                    return None
+                return pil_to_qimage(imgs[0])
+            from PIL import Image
+            return pil_to_qimage(Image.open(p))
+
+        def done(qimg):
+            if qimg is None:
+                self.preview.setText("Nelze načíst náhled")
+                return
+            pix = QPixmap.fromImage(qimg)
+            self.preview.setPixmap(pix.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        self._run_with_busy("Náhled", "Generuji náhled dokladu…", work, done)
 
     def refresh_unrecognized(self):
         with self.sf() as session:

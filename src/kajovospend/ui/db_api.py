@@ -36,9 +36,10 @@ def list_suppliers(session: Session, q: str = "") -> List[Supplier]:
 def list_documents(session: Session, q: str = "", date_from: Optional[dt.date] = None, date_to: Optional[dt.date] = None) -> List[Tuple[Document, DocumentFile]]:
     stmt = select(Document, DocumentFile).join(DocumentFile, DocumentFile.id == Document.file_id)
     if date_from:
-        stmt = stmt.where(Document.issue_date >= date_from)
+        # Allow docs with unknown date to still show up (prevents "empty list" when OCR didn't extract date).
+        stmt = stmt.where((Document.issue_date.is_(None)) | (Document.issue_date >= date_from))
     if date_to:
-        stmt = stmt.where(Document.issue_date <= date_to)
+        stmt = stmt.where((Document.issue_date.is_(None)) | (Document.issue_date <= date_to))
     if q.strip():
         # FTS5 needs raw SQL to collect ids
         ids = set()
