@@ -718,7 +718,8 @@ class MainWindow(QMainWindow):
             ).fetchall()
             txt = ["Rozpad výdajů (měsíc):"]
             for ym, cur, total, cnt in rows:
-                txt.append(f"{ym} {cur}: {total:,.2f} ({cnt} dokladů)".replace(",", " "))
+                total_val = float(total or 0)
+                txt.append(f"{ym} {cur}: {total_val:,.2f} ({int(cnt or 0)} dokladů)".replace(",", " "))
             top = session.execute(
                 text(
                     """
@@ -733,7 +734,8 @@ class MainWindow(QMainWindow):
             ).fetchall()
             txt.append("\nTop dodavatelé (objem):")
             for ico, total, cnt in top:
-                txt.append(f"{ico}: {total:,.2f} ({cnt})".replace(",", " "))
+                total_val = float(total or 0)
+                txt.append(f"{ico}: {total_val:,.2f} ({int(cnt or 0)})".replace(",", " "))
             qcnt = session.execute(select(Document).where(Document.requires_review == True)).scalars().all()  # noqa
             txt.append(f"\nVyžaduje kontrolu: {len(qcnt)}")
         self.money_summary.setText("\n".join(txt))
