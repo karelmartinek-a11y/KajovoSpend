@@ -1,0 +1,18 @@
+# Virtualenvs
+.venv/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# App runtime data
+OUTPUT/
+INPUT/
+service.pid
+
+# IDE
+.idea/
+.vscode/
