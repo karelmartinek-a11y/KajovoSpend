@@ -1,0 +1,32 @@
+app:
+  data_dir: ""  # empty = default %LOCALAPPDATA%\\KajovoSpend
+  db_path: ""   # empty = <data_dir>/kajovospend.sqlite
+  log_dir: ""   # empty = <data_dir>/logs
+
+paths:
+  input_dir: "C:/KajovoSpend/INPUT"
+  output_dir: "C:/KajovoSpend/OUTPUT"
+  quarantine_dir_name: "KARANTENA"
+  duplicate_dir_name: "DUPLICITY"
+
+service:
+  host: "127.0.0.1"
+  port: 8765
+  workers: 2
+  scan_interval_sec: 2
+  graceful_shutdown_sec: 10
+
+ocr:
+  engine: "rapidocr"
+  models_dir: ""  # empty = <data_dir>/models/rapidocr
+  pdf_dpi: 200
+  min_confidence: 0.65
+
+openai:
+  enabled: false
+  api_key: ""   # stored locally; not masked in UI
+  model: ""     # chosen model
+
+performance:
+  image_max_px: 3000
+  parallel_pages: 2

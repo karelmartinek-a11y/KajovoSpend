@@ -1,0 +1,24 @@
+PySide6==6.10.1
+
+SQLAlchemy==2.0.32
+pydantic==2.12.5
+PyYAML==6.0.2
+watchdog==4.0.1
+requests==2.32.3
+python-dateutil==2.9.0.post0
+
+# Pillow 10.4.0 může na některých kombinacích končit buildem ze zdrojů; na 3.13 je bezpečnější 11+
+pillow>=11.0.0
+
+numpy==2.0.1
+pypdf==4.3.1
+pypdfium2==4.30.0
+
+# OCR (Varianta B) – onnxruntime/rapidocr; pokud by na tvé platformě chyběl wheel, dočasně to lze vypnout
+rapidocr-onnxruntime; python_version < "3.14"
+
+pandas==2.2.2
+openpyxl==3.1.5
+
+# editable install projektu
+-e .

@@ -1,0 +1,86 @@
+# KájovoSpend
+
+Desktopová aplikace pro evidenci a kategorizaci dokladů (faktury, účtenky, daňové doklady, stvrzenky) s lokální background „službou“, která sleduje vstupní adresář a automaticky zpracovává přidané soubory do lokální SQLite databáze.
+
+## Funkce (aktuální implementace)
+
+- GUI (PySide6): záhlaví s tlačítky STAV / RUN / STOP / RESTART / EXIT, karty podle zadání.
+- Služba: watchdog + periodické skenování, fronta v DB, paralelizace přes worker pool.
+- Idempotence: deduplikace podle SHA256 (duplicitní soubory se přesunou do OUTPUT/DUPLICITY).
+- OCR varianta B: RapidOCR (offline) + PDF render přes PDFium (pypdfium2). Pokud PDF obsahuje textovou vrstvu, použije se primárně ta.
+- ARES: dotažení dodavatele podle IČO (při neúspěchu jde doklad do kontroly).
+- Režim „raději do karantény“: při nízké jistotě vytěžení se soubor přesune do OUTPUT/KARANTENA a objeví se v kartě NEROZPOZNANÉ pro ruční doplnění.
+- Fulltext (FTS5) pro hledání v dokladech i položkách.
+- Exporty CSV/XLSX ze seznamu dokladů.
+
+## Požadavky
+
+- Windows 10/11
+- Python 3.11 - 3.13 (Python 3.14 zatím ne: chybí Windows wheels pro Pillow a onnxruntime, které vyžaduje RapidOCR)
+
+## Instalace
+
+```powershell
+cd KajovoSpend
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+1) Vytvoř konfiguraci:
+
+```powershell
+copy config.example.yaml config.yaml
+```
+
+2) Uprav v `config.yaml` cesty `paths.input_dir` a `paths.output_dir`.
+
+3) Inicializace DB proběhne automaticky při startu GUI nebo služby.
+
+## Spuštění
+
+GUI:
+
+```powershell
+.\.venv\Scripts\python.exe app_gui.py
+```
+
+Služba (ručně v konzoli):
+
+```powershell
+.\.venv\Scripts\python.exe service_main.py --config config.yaml
+```
+
+## Instalace služby na Windows (Task Scheduler)
+
+V `scripts/` jsou připravené PowerShell skripty:
+
+- `install_service_task.ps1` – vytvoří Scheduled Task, který spouští službu při přihlášení uživatele.
+- `uninstall_service_task.ps1` – odebere úlohu.
+
+Příklad:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_service_task.ps1 -ProjectDir "C:\\path\\to\\KajovoSpend"
+```
+
+GUI tlačítko RUN/STOP/RESTART pracuje primárně přes lokální RPC (127.0.0.1:8765). Pokud služba běží jako Scheduled Task, STOP ji ukončí korektně a Task ji znovu spustí při dalším startu úlohy.
+
+## OCR modely (volitelné „připnutí“)
+
+RapidOCR funguje i bez ručního stahování modelů. Pokud chceš držet modely explicitně lokálně, použij:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\download_ocr_models.py --models-dir "%LOCALAPPDATA%\\KajovoSpend\\models\\rapidocr"
+```
+
+Pozn.: odkazy na modely se mohou časem změnit; skript je koncipovaný jako helper (případně doplň URL podle zvoleného modelového balíku).
+
+## Databáze
+
+SQLite je v `%LOCALAPPDATA%\\KajovoSpend\\kajovospend.sqlite` (pokud v configu nepřepíšeš).
+
+## Logy
+
+`%LOCALAPPDATA%\\KajovoSpend\\logs\\kajovospend_service.log` a `kajovospend_gui.log`.
+
