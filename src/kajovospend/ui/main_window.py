@@ -442,21 +442,25 @@ class MainWindow(QMainWindow):
         dl2 = QVBoxLayout(self.tab_docs)
         filters = QWidget(); filters.setProperty("panel", True)
         fl = QHBoxLayout(filters); fl.setContentsMargins(10,6,10,6)
-        self.ed_doc_search = QLineEdit(); self.ed_doc_search.setPlaceholderText("Fulltext (doklady + položky)")
+        self.ed_doc_search = QLineEdit(); self.ed_doc_search.setPlaceholderText("Číslo, VS/KS/SS, text…")
+        self.cb_all_dates = QCheckBox("Vše"); self.cb_all_dates.setToolTip("Ignorovat datumové omezení a zobrazit všechny doklady/účty"); self.cb_all_dates.setChecked(True)
         self.dt_from = QDateEdit(); self.dt_from.setCalendarPopup(True); self.dt_from.setDisplayFormat("dd.MM.yyyy")
         self.dt_to = QDateEdit(); self.dt_to.setCalendarPopup(True); self.dt_to.setDisplayFormat("dd.MM.yyyy")
-        self.dt_from.setDate(dt.date.today() - dt.timedelta(days=90))
+        self.dt_from.setDate(dt.date.today() - dt.timedelta(days=365))
         self.dt_to.setDate(dt.date.today())
         self.btn_doc_search = QPushButton("Hledat")
         self.btn_export_csv = QPushButton("Export CSV")
         self.btn_export_xlsx = QPushButton("Export XLSX")
         fl.addWidget(self.ed_doc_search, 1)
+        fl.addWidget(self.cb_all_dates)
         fl.addWidget(self.dt_from)
         fl.addWidget(self.dt_to)
         fl.addWidget(self.btn_doc_search)
         fl.addWidget(self.btn_export_csv)
         fl.addWidget(self.btn_export_xlsx)
         dl2.addWidget(filters)
+        # start state
+        self._toggle_doc_dates(True)
 
         splitter = QSplitter()
         left = QWidget(); ll = QVBoxLayout(left)
@@ -534,9 +538,11 @@ class MainWindow(QMainWindow):
 
         self.btn_doc_search.clicked.connect(self.refresh_documents)
         self.ed_doc_search.returnPressed.connect(self.refresh_documents)
+        self.cb_all_dates.toggled.connect(self._toggle_doc_dates)
+        self.cb_all_dates.toggled.connect(lambda _checked: self.refresh_documents())
         self.doc_table.clicked.connect(self.on_doc_selected)
-        self.btn_export_csv.clicked.connect(lambda: self._export("csv"))
-        self.btn_export_xlsx.clicked.connect(lambda: self._export("xlsx"))
+        self.btn_export_csv.clicked.connect(lambda: self._export_with_busy("csv"))
+        self.btn_export_xlsx.clicked.connect(lambda: self._export_with_busy("xlsx"))
 
         self.unrec_table.clicked.connect(self.on_unrec_selected)
         self.btn_u_save.clicked.connect(self.on_unrec_save)
@@ -551,6 +557,35 @@ class MainWindow(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "Vyber adresář", line_edit.text() or str(Path.home()))
         if d:
             line_edit.setText(d)
+
+    def _toggle_doc_dates(self, all_dates: bool) -> None:
+        # UI helper: datumové filtry zbytečně matou, pokud je zvoleno „Vše“
+        try:
+            self.dt_from.setEnabled(not all_dates)
+            self.dt_to.setEnabled(not all_dates)
+        except Exception:
+            pass
+
+    def _export_with_busy(self, fmt: str) -> None:
+        """
+        Export může obsahovat UI interakce (např. dialog pro výběr souboru),
+        proto zůstává v UI vlákně. Použijeme modal „busy“ progress, aby uživatel
+        dostal jasnou odezvu.
+        """
+        dlg = QProgressDialog("Exportuji…", None, 0, 0, self)
+        dlg.setWindowTitle("Export")
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.show()
+        QApplication.processEvents()
+        try:
+            self._export(fmt)
+        finally:
+            try:
+                dlg.close()
+            except Exception:
+                pass
 
     def _service_status(self) -> Dict[str, Any]:
         try:
@@ -656,10 +691,21 @@ class MainWindow(QMainWindow):
 
     def refresh_suppliers(self):
         q = self.ed_sup_search.text().strip()
-        with self.sf() as session:
-            sups = db_api.list_suppliers(session, q=q)
-            rows = [[s.ico, s.name, s.dic, s.address, "ANO" if s.is_vat_payer else ("NE" if s.is_vat_payer is False else "?")] for s in sups]
-        m = TableModel(["IČO", "Název", "DIČ", "Adresa", "Plátce DPH"], rows)
+        try:
+            with self.sf() as session:
+                sups = db_api.list_suppliers(session, q=q)
+                rows = [[
+                    s.ico,
+                    s.name,
+                    s.dic,
+                    s.address,
+                    "ANO" if s.is_vat_payer else ("NE" if s.is_vat_payer is False else "?"),
+                    s.ares_last_sync.strftime("%Y-%m-%d %H:%M") if getattr(s, "ares_last_sync", None) else "",
+                ] for s in sups]
+        except Exception as e:
+            QMessageBox.critical(self, "Dodavatelé", f"Nepodařilo se načíst seznam dodavatelů: {e}")
+            return
+        m = TableModel(["IČO", "Název", "DIČ", "Adresa", "Plátce DPH", "ARES sync"], rows)
         self.sup_table.setModel(m)
 
     def _selected_supplier_ico(self) -> Optional[str]:
@@ -731,6 +777,12 @@ class MainWindow(QMainWindow):
         q = self.ed_doc_search.text().strip()
         dfrom = self.dt_from.date().toPython()
         dto = self.dt_to.date().toPython()
+        if getattr(self, "cb_all_dates", None) is not None and self.cb_all_dates.isChecked():
+            dfrom = None
+            dto = None
+        else:
+            if dfrom and dto and dfrom > dto:
+                dfrom, dto = dto, dfrom
         with self.sf() as session:
             docs = db_api.list_documents(session, q=q, date_from=dfrom, date_to=dto)
             rows = []

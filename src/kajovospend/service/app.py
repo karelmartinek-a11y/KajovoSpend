@@ -24,7 +24,8 @@ class ServiceApp:
         self.log = logger
         self._stop = threading.Event()
         self._watcher = DirectoryWatcher(Path(cfg["paths"]["input_dir"]), self.enqueue_path)
-        self._executor = ThreadPoolExecutor(max_workers=int(cfg["service"].get("workers", 2)))
+        self._max_workers = int(cfg["service"].get("workers", 2))
+        self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
         self._processor = Processor(cfg, paths, logger)
 
     def enqueue_path(self, p: Path) -> None:
@@ -127,13 +128,23 @@ class ServiceApp:
 
                 # claim jobs and dispatch
                 with self.sf() as session:
-                    update_service_state(session, queue_size=queue_size(session))
+                    update_service_state(
+                        session,
+                        queue_size=queue_size(session),
+                        last_seen=dt.datetime.utcnow(),
+                    )
                     session.commit()
-                    job = self._claim_next_job(session)
-                    if job:
+
+                    # dispatch více jobů v jednom cyklu (až do kapacity workerů)
+                    dispatched = 0
+                    while dispatched < self._max_workers:
+                        job = self._claim_next_job(session)
+                        if not job:
+                            break
                         job_id = job.id
                         session.commit()
                         self._executor.submit(self._run_job, job_id)
+                        dispatched += 1
 
                 time.sleep(scan_interval)
         finally:

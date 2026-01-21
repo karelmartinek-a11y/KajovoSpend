@@ -28,7 +28,12 @@ def list_suppliers(session: Session, q: str = "") -> List[Supplier]:
     stmt = select(Supplier)
     if q.strip():
         qq = f"%{q.strip()}%"
-        stmt = stmt.where((Supplier.ico.like(qq)) | (Supplier.name.like(qq)))
+        stmt = stmt.where(
+            (Supplier.ico.like(qq))
+            | (Supplier.name.like(qq))
+            | (Supplier.dic.like(qq))
+            | (Supplier.address.like(qq))
+        )
     stmt = stmt.order_by(Supplier.name.is_(None), Supplier.name)
     return list(session.execute(stmt).scalars().all())
 
@@ -41,15 +46,28 @@ def list_documents(session: Session, q: str = "", date_from: Optional[dt.date] =
     if date_to:
         stmt = stmt.where((Document.issue_date.is_(None)) | (Document.issue_date <= date_to))
     if q.strip():
-        # FTS5 needs raw SQL to collect ids
+        qtxt = q.strip()
         ids = set()
-        for row in session.execute(text("SELECT document_id FROM documents_fts WHERE documents_fts MATCH :q"), {"q": q}).fetchall():
-            ids.add(int(row[0]))
-        for row in session.execute(text("SELECT document_id FROM items_fts WHERE items_fts MATCH :q"), {"q": q}).fetchall():
-            ids.add(int(row[0]))
-        if not ids:
-            return []
-        stmt = stmt.where(Document.id.in_(sorted(ids)))
+        try:
+            for row in session.execute(text("SELECT document_id FROM documents_fts WHERE documents_fts MATCH :q"), {"q": qtxt}).fetchall():
+                ids.add(int(row[0]))
+            for row in session.execute(text("SELECT document_id FROM items_fts WHERE items_fts MATCH :q"), {"q": qtxt}).fetchall():
+                ids.add(int(row[0]))
+        except Exception:
+            qq = f"%{qtxt}%"
+            stmt = (
+                stmt.where(
+                    (Document.doc_number.like(qq))
+                    | (Document.var_symbol.like(qq))
+                    | (Document.par_symbol.like(qq))
+                    | (Document.supplier_ico.like(qq))
+                    | (DocumentFile.current_path.like(qq))
+                )
+            )
+        else:
+            if not ids:
+                return []
+            stmt = stmt.where(Document.id.in_(sorted(ids)))
     stmt = stmt.order_by(Document.issue_date.desc().nullslast(), Document.created_at.desc())
     return list(session.execute(stmt).all())
 
