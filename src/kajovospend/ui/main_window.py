@@ -198,6 +198,7 @@ class MainWindow(QMainWindow):
         # keep threads/workers alive
         self._threads: List[QThread] = []
         self._dialogs: List[QProgressDialog] = []
+        self._sup_sel_connected = False
 
         self.paths = resolve_app_paths(
             self.cfg["app"].get("data_dir"),
@@ -819,11 +820,16 @@ class MainWindow(QMainWindow):
         self.sup_table.setModel(self.sup_model)
         self.sup_table.setColumnHidden(0, True)
 
-        try:
-            self.sup_table.selectionModel().selectionChanged.disconnect(self._on_sup_selection_changed)
-        except Exception:
-            pass
-        self.sup_table.selectionModel().selectionChanged.connect(self._on_sup_selection_changed)
+        sm = self.sup_table.selectionModel()
+        if sm:
+            if self._sup_sel_connected:
+                try:
+                    sm.selectionChanged.disconnect(self._on_sup_selection_changed)
+                except Exception:
+                    pass
+                self._sup_sel_connected = False
+            sm.selectionChanged.connect(self._on_sup_selection_changed)
+            self._sup_sel_connected = True
 
         if keep_id is not None:
             self._select_supplier_in_table(keep_id)
@@ -1186,6 +1192,17 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Uloženo", "Doklad uložen a vyjmut z karantény.")
         self.refresh_unrecognized()
         self.refresh_documents()
+
+    def closeEvent(self, event):
+        # Make sure background threads are stopped to avoid PySide warnings.
+        for th in list(self._threads):
+            try:
+                if th.isRunning():
+                    th.quit()
+                    th.wait(2000)
+            except Exception:
+                pass
+        super().closeEvent(event)
 
     def refresh_ops(self):
         with self.sf() as session:
