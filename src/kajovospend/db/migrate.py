@@ -23,9 +23,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
 """
 
 
+def _ensure_supplier_columns(conn) -> None:
+    # Lightweight SQLite migration: add missing columns (no destructive changes).
+    cols = {r[1] for r in conn.execute(text("PRAGMA table_info(suppliers)")).fetchall()}
+    to_add: list[tuple[str, str]] = [
+        ("legal_form", "TEXT"),
+        ("street", "TEXT"),
+        ("street_number", "TEXT"),
+        ("orientation_number", "TEXT"),
+        ("city", "TEXT"),
+        ("zip_code", "TEXT"),
+    ]
+    for name, coltype in to_add:
+        if name not in cols:
+            conn.execute(text(f"ALTER TABLE suppliers ADD COLUMN {name} {coltype}"))
+
+
 def init_db(engine) -> None:
     Base.metadata.create_all(engine)
     with engine.begin() as conn:
+        _ensure_supplier_columns(conn)
         conn.execute(text(FTS_DOCS))
         conn.execute(text(FTS_ITEMS))
         # singleton row

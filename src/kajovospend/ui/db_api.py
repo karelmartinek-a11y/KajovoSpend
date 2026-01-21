@@ -33,10 +33,41 @@ def list_suppliers(session: Session, q: str = "") -> List[Supplier]:
             | (Supplier.name.like(qq))
             | (Supplier.dic.like(qq))
             | (Supplier.address.like(qq))
+            | (Supplier.city.like(qq))
+            | (Supplier.legal_form.like(qq))
+            | (Supplier.street.like(qq))
         )
     stmt = stmt.order_by(Supplier.name.is_(None), Supplier.name)
     return list(session.execute(stmt).scalars().all())
 
+
+def merge_suppliers(session: Session, keep_id: int, merge_ids: List[int]) -> None:
+    merge_ids = [i for i in merge_ids if i != keep_id]
+    if not merge_ids:
+        return
+    keep = session.get(Supplier, keep_id)
+    if not keep:
+        raise KeyError(keep_id)
+
+    docs = session.execute(select(Document).where(Document.supplier_id.in_(merge_ids))).scalars().all()
+    for d in docs:
+        d.supplier_id = keep_id
+        d.supplier_ico = keep.ico
+        session.add(d)
+        # keep FTS consistent
+        try:
+            session.execute(
+                text("UPDATE documents_fts SET supplier_ico=:ico WHERE document_id=:id"),
+                {"ico": keep.ico or "", "id": int(d.id)},
+            )
+        except Exception:
+            pass
+
+    for sid in merge_ids:
+        sup = session.get(Supplier, sid)
+        if sup:
+            session.delete(sup)
+    session.flush()
 
 def list_documents(session: Session, q: str = "", date_from: Optional[dt.date] = None, date_to: Optional[dt.date] = None) -> List[Tuple[Document, DocumentFile]]:
     stmt = select(Document, DocumentFile).join(DocumentFile, DocumentFile.id == Document.file_id)

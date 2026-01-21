@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Any, Dict
 
@@ -26,7 +26,30 @@ class ServiceApp:
         self._watcher = DirectoryWatcher(Path(cfg["paths"]["input_dir"]), self.enqueue_path)
         self._max_workers = int(cfg["service"].get("workers", 2))
         self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
+        self._inflight_lock = threading.Lock()
+        self._inflight: set[Future] = set()
         self._processor = Processor(cfg, paths, logger)
+
+    def _drop_future(self, fut: Future) -> None:
+        # callback runs in worker thread; keep it tiny and safe
+        try:
+            with self._inflight_lock:
+                self._inflight.discard(fut)
+        except Exception:
+            # never let bookkeeping crash service threads
+            pass
+
+    def _inflight_count(self) -> int:
+        with self._inflight_lock:
+            # prune done futures (in case callback didn't run for any reason)
+            self._inflight = {f for f in self._inflight if not f.done()}
+            return len(self._inflight)
+
+    def _submit_job(self, job_id: int) -> None:
+        fut = self._executor.submit(self._run_job, job_id)
+        with self._inflight_lock:
+            self._inflight.add(fut)
+        fut.add_done_callback(self._drop_future)
 
     def enqueue_path(self, p: Path) -> None:
         # wait briefly for file to finish writing
@@ -92,7 +115,7 @@ class ServiceApp:
                     update_service_state(session, last_error=str(e), last_error_at=dt.datetime.utcnow())
                     session.commit()
                 except Exception:
-                    pass
+                    self.log.exception("Failed to persist job failure state")
 
     def get_status(self) -> Dict[str, Any]:
         with self.sf() as session:
@@ -136,14 +159,15 @@ class ServiceApp:
                     session.commit()
 
                     # dispatch více jobů v jednom cyklu (až do kapacity workerů)
+                    available = max(0, self._max_workers - self._inflight_count())
                     dispatched = 0
-                    while dispatched < self._max_workers:
+                    while dispatched < available:
                         job = self._claim_next_job(session)
                         if not job:
                             break
                         job_id = job.id
                         session.commit()
-                        self._executor.submit(self._run_job, job_id)
+                        self._submit_job(job_id)
                         dispatched += 1
 
                 time.sleep(scan_interval)
@@ -152,11 +176,11 @@ class ServiceApp:
             try:
                 self._watcher.stop()
             except Exception:
-                pass
+                self.log.exception("Watcher stop failed")
             try:
                 self._executor.shutdown(wait=False, cancel_futures=True)
             except Exception:
-                pass
+                self.log.exception("Executor shutdown failed")
             try:
                 with self.sf() as session:
                     update_service_state(
@@ -167,4 +191,4 @@ class ServiceApp:
                     )
                     session.commit()
             except Exception:
-                pass
+                self.log.exception("Failed to persist service shutdown state")

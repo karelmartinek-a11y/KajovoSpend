@@ -9,9 +9,22 @@ from sqlalchemy.orm import Session
 from .models import Supplier, DocumentFile, Document, LineItem, ImportJob, ServiceState
 
 
-def upsert_supplier(session: Session, ico: str, name: str | None = None, dic: str | None = None,
-                    address: str | None = None, is_vat_payer: bool | None = None,
-                    ares_last_sync: dt.datetime | None = None) -> Supplier:
+def upsert_supplier(
+    session: Session,
+    ico: str,
+    name: str | None = None,
+    dic: str | None = None,
+    address: str | None = None,
+    is_vat_payer: bool | None = None,
+    ares_last_sync: dt.datetime | None = None,
+    *,
+    legal_form: str | None = None,
+    street: str | None = None,
+    street_number: str | None = None,
+    orientation_number: str | None = None,
+    city: str | None = None,
+    zip_code: str | None = None,
+) -> Supplier:
     ico = ico.strip()
     existing = session.execute(select(Supplier).where(Supplier.ico == ico)).scalar_one_or_none()
     if existing:
@@ -19,8 +32,20 @@ def upsert_supplier(session: Session, ico: str, name: str | None = None, dic: st
             existing.name = name
         if dic is not None:
             existing.dic = dic
+        if legal_form is not None:
+            existing.legal_form = legal_form
         if address is not None:
             existing.address = address
+        if street is not None:
+            existing.street = street
+        if street_number is not None:
+            existing.street_number = street_number
+        if orientation_number is not None:
+            existing.orientation_number = orientation_number
+        if city is not None:
+            existing.city = city
+        if zip_code is not None:
+            existing.zip_code = zip_code
         if is_vat_payer is not None:
             existing.is_vat_payer = is_vat_payer
         if ares_last_sync is not None:
@@ -32,7 +57,13 @@ def upsert_supplier(session: Session, ico: str, name: str | None = None, dic: st
         ico=ico,
         name=name,
         dic=dic,
+        legal_form=legal_form,
         address=address,
+        street=street,
+        street_number=street_number,
+        orientation_number=orientation_number,
+        city=city,
+        zip_code=zip_code,
         is_vat_payer=is_vat_payer,
         ares_last_sync=ares_last_sync,
     )

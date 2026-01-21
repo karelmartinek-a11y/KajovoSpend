@@ -67,7 +67,7 @@ class Processor:
         if text_parts:
             txt = "\n".join(text_parts)
             # treat embedded text as high confidence
-            return txt, 0.95, len(text_parts)
+            return txt, 0.95, len(reader.pages)
         # fallback to image OCR
         if self.ocr_engine is None:
             return "", 0.0, 0
@@ -86,8 +86,8 @@ class Processor:
     def _ocr_image(self, path: Path) -> Tuple[str, float, int]:
         if self.ocr_engine is None:
             return "", 0.0, 1
-        img = Image.open(path)
-        t, c = self.ocr_engine.image_to_text(img)
+        with Image.open(path) as img:
+            t, c = self.ocr_engine.image_to_text(img)
         return t, c, 1
 
     def process_path(self, session, path: Path) -> Dict[str, Any]:
@@ -174,7 +174,21 @@ class Processor:
         if extracted.supplier_ico:
             try:
                 ares = fetch_by_ico(extracted.supplier_ico)
-                s = upsert_supplier(session, ares.ico, ares.name, ares.dic, ares.address, ares.is_vat_payer, ares.fetched_at)
+                s = upsert_supplier(
+                    session,
+                    ares.ico,
+                    name=ares.name,
+                    dic=ares.dic,
+                    address=ares.address,
+                    is_vat_payer=ares.is_vat_payer,
+                    ares_last_sync=ares.fetched_at,
+                    legal_form=ares.legal_form,
+                    street=ares.street,
+                    street_number=ares.street_number,
+                    orientation_number=ares.orientation_number,
+                    city=ares.city,
+                    zip_code=ares.zip_code,
+                )
                 supplier_id = s.id
             except Exception as e:
                 reasons.append(f"ARES selhal: {e}")

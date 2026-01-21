@@ -14,7 +14,13 @@ class Supplier(Base):
     ico: Mapped[str] = mapped_column(String(16), unique=True, index=True)
     dic: Mapped[str | None] = mapped_column(String(32), nullable=True)
     name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    legal_form: Mapped[str | None] = mapped_column(String(256), nullable=True)
     address: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    street: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    street_number: Mapped[str | None] = mapped_column(String(32), nullable=True)          # cislo popisne
+    orientation_number: Mapped[str | None] = mapped_column(String(32), nullable=True)     # cislo orientacni
+    city: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    zip_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
     is_vat_payer: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     ares_last_sync: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTabWidget, QTableView,
     QLineEdit, QFormLayout, QSplitter, QTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QFileDialog,
     QMessageBox, QDateEdit, QProgressBar, QDialog, QDialogButtonBox, QHeaderView, QAbstractItemView,
-    QCheckBox, QProgressDialog, QApplication,
+    QCheckBox, QProgressDialog, QApplication, QInputDialog,
 )
 
 from sqlalchemy.orm import Session
@@ -25,6 +25,7 @@ from kajovospend.utils.logging_setup import setup_logging
 from kajovospend.db.session import make_engine, make_session_factory
 from kajovospend.db.migrate import init_db
 from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem
+from kajovospend.db.queries import upsert_supplier
 from kajovospend.integrations.ares import fetch_by_ico
 from kajovospend.integrations.openai_fallback import list_models
 from kajovospend.service.control_client import send_cmd
@@ -75,6 +76,23 @@ def pil_to_qimage(img) -> QImage:
     return QImage(data, img.width, img.height, QImage.Format_RGB888)
 
 
+def _format_supplier_address(street: str | None, cp: str | None, co: str | None, city: str | None, zip_code: str | None) -> str | None:
+    parts: list[str] = []
+    s = (street or "").strip()
+    cpv = (cp or "").strip()
+    cov = (co or "").strip()
+    if s or cpv or cov:
+        num = cpv + (f"/{cov}" if cov else "")
+        first = (s + " " + num).strip()
+        if first:
+            parts.append(first)
+    if (city or "").strip():
+        parts.append(city.strip())
+    if (zip_code or "").strip():
+        parts.append(zip_code.strip())
+    return ", ".join(parts) if parts else None
+
+
 class _Worker(QObject):
     done = Signal(object)
     error = Signal(str)
@@ -121,6 +139,12 @@ class SupplierDialog(QDialog):
         self.ed_ico = QLineEdit(self._initial.get("ico", "") or "")
         self.ed_name = QLineEdit(self._initial.get("name", "") or "")
         self.ed_dic = QLineEdit(self._initial.get("dic", "") or "")
+        self.ed_legal_form = QLineEdit(self._initial.get("legal_form", "") or "")
+        self.ed_street = QLineEdit(self._initial.get("street", "") or "")
+        self.ed_street_number = QLineEdit(self._initial.get("street_number", "") or "")
+        self.ed_orientation_number = QLineEdit(self._initial.get("orientation_number", "") or "")
+        self.ed_city = QLineEdit(self._initial.get("city", "") or "")
+        self.ed_zip = QLineEdit(self._initial.get("zip_code", "") or "")
         self.ed_addr = QLineEdit(self._initial.get("address", "") or "")
         self.cb_vat = QCheckBox("Plátce DPH")
         self.cb_vat.setChecked(bool(self._initial.get("is_vat_payer") is True))
@@ -128,7 +152,13 @@ class SupplierDialog(QDialog):
         form.addRow("IČO", self.ed_ico)
         form.addRow("Název", self.ed_name)
         form.addRow("DIČ", self.ed_dic)
-        form.addRow("Adresa", self.ed_addr)
+        form.addRow("Právní forma", self.ed_legal_form)
+        form.addRow("Ulice", self.ed_street)
+        form.addRow("Číslo popisné", self.ed_street_number)
+        form.addRow("Číslo orientační", self.ed_orientation_number)
+        form.addRow("Město", self.ed_city)
+        form.addRow("PSČ", self.ed_zip)
+        form.addRow("Adresa (řetězec)", self.ed_addr)
         form.addRow("", self.cb_vat)
 
         lay.addLayout(form)
@@ -139,11 +169,22 @@ class SupplierDialog(QDialog):
         lay.addWidget(bb)
 
     def values(self) -> Dict[str, Any]:
+        street = self.ed_street.text().strip() or None
+        cp = self.ed_street_number.text().strip() or None
+        co = self.ed_orientation_number.text().strip() or None
+        city = self.ed_city.text().strip() or None
+        zipc = self.ed_zip.text().strip() or None
         return {
             "ico": self.ed_ico.text().strip(),
             "name": self.ed_name.text().strip() or None,
             "dic": self.ed_dic.text().strip() or None,
-            "address": self.ed_addr.text().strip() or None,
+            "legal_form": self.ed_legal_form.text().strip() or None,
+            "street": street,
+            "street_number": cp,
+            "orientation_number": co,
+            "city": city,
+            "zip_code": zipc,
+            "address": self.ed_addr.text().strip() or _format_supplier_address(street, cp, co, city, zipc),
             "is_vat_payer": True if self.cb_vat.isChecked() else False,
         }
 
@@ -417,24 +458,87 @@ class MainWindow(QMainWindow):
 
         # Dodavatelé
         self.tab_suppliers = QWidget()
-        spl = QVBoxLayout(self.tab_suppliers)
-        top = QWidget(); tl = QHBoxLayout(top); tl.setContentsMargins(0,0,0,0)
-        self.ed_sup_search = QLineEdit(); self.ed_sup_search.setPlaceholderText("Hledat IČO / název")
+        spl = QHBoxLayout(self.tab_suppliers)
+
+        # Left side: table and filter
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        top = QWidget()
+        tl = QHBoxLayout(top)
+        tl.setContentsMargins(0, 0, 0, 0)
+        self.sup_filter = QLineEdit()
+        self.sup_filter.setPlaceholderText("Hledat (název, IČO, DIČ, město)...")
         self.btn_sup_refresh = QPushButton("Obnovit")
         self.btn_sup_add = QPushButton("Přidat")
-        self.btn_sup_delete = QPushButton("Smazat")
-        self.btn_sup_ares = QPushButton("ARES-AKTUALIZACE")
-        tl.addWidget(self.ed_sup_search, 1)
-        for b in [self.btn_sup_refresh, self.btn_sup_add, self.btn_sup_delete, self.btn_sup_ares]:
-            tl.addWidget(b)
-        spl.addWidget(top)
+        self.btn_sup_merge = QPushButton("Sloučit")
+        self.btn_sup_merge.setEnabled(False)
+        tl.addWidget(self.sup_filter, 1)
+        tl.addWidget(self.btn_sup_refresh)
+        tl.addWidget(self.btn_sup_add)
+        tl.addWidget(self.btn_sup_merge)
+        ll.addWidget(top)
+
         self.sup_table = QTableView()
         self.sup_table.setAlternatingRowColors(True)
         self.sup_table.setShowGrid(True)
         self.sup_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.sup_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.sup_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.sup_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        spl.addWidget(self.sup_table, 1)
+        ll.addWidget(self.sup_table, 1)
+
+        # Right side: detail form
+        right = QWidget()
+        rl = QVBoxLayout(right)
+
+        hdr = QWidget()
+        hl = QHBoxLayout(hdr)
+        hl.setContentsMargins(0, 0, 0, 0)
+        self.lbl_sup_detail = QLabel("Detail dodavatele")
+        self.btn_sup_edit = QPushButton("Editovat")
+        self.btn_sup_save = QPushButton("Uložit")
+        self.btn_sup_save.setEnabled(False)
+        hl.addWidget(self.lbl_sup_detail, 1)
+        hl.addWidget(self.btn_sup_edit)
+        hl.addWidget(self.btn_sup_save)
+        rl.addWidget(hdr)
+
+        formw = QWidget()
+        form = QFormLayout(formw)
+        self.sup_id = QLineEdit(); self.sup_id.setReadOnly(True)
+        self.sup_ico = QLineEdit(); self.sup_ico.setReadOnly(True)
+        self.btn_sup_ares_detail = QPushButton("ARES")
+        ico_row = QWidget()
+        ico_l = QHBoxLayout(ico_row); ico_l.setContentsMargins(0,0,0,0)
+        ico_l.addWidget(self.sup_ico, 1)
+        ico_l.addWidget(self.btn_sup_ares_detail)
+
+        self.sup_name = QLineEdit(); self.sup_name.setReadOnly(True)
+        self.sup_legal_form = QLineEdit(); self.sup_legal_form.setReadOnly(True)
+        self.sup_dic = QLineEdit(); self.sup_dic.setReadOnly(True)
+        self.sup_vat = QCheckBox("Plátce DPH"); self.sup_vat.setEnabled(False)
+
+        self.sup_street = QLineEdit(); self.sup_street.setReadOnly(True)
+        self.sup_street_number = QLineEdit(); self.sup_street_number.setReadOnly(True)
+        self.sup_orientation_number = QLineEdit(); self.sup_orientation_number.setReadOnly(True)
+        self.sup_city = QLineEdit(); self.sup_city.setReadOnly(True)
+        self.sup_zip = QLineEdit(); self.sup_zip.setReadOnly(True)
+
+        form.addRow("ID (KajovoSpend)", self.sup_id)
+        form.addRow("IČO", ico_row)
+        form.addRow("Název subjektu", self.sup_name)
+        form.addRow("Právní forma podnikání", self.sup_legal_form)
+        form.addRow("DIČ", self.sup_dic)
+        form.addRow("", self.sup_vat)
+        form.addRow("Ulice sídla", self.sup_street)
+        form.addRow("Číslo popisné sídla", self.sup_street_number)
+        form.addRow("Číslo orientační sídla", self.sup_orientation_number)
+        form.addRow("Město sídla", self.sup_city)
+        form.addRow("PSČ sídla", self.sup_zip)
+
+        rl.addWidget(formw, 1)
+
+        spl.addWidget(left, 1)
+        spl.addWidget(right, 1)
         self.tabs.addTab(self.tab_suppliers, "DODAVATELÉ")
 
         # Účty
@@ -531,10 +635,13 @@ class MainWindow(QMainWindow):
         self.btn_load_models.clicked.connect(self.on_load_models)
 
         self.btn_sup_refresh.clicked.connect(self.refresh_suppliers)
-        self.ed_sup_search.returnPressed.connect(self.refresh_suppliers)
+        self.sup_filter.textChanged.connect(lambda _=None: self.refresh_suppliers())
         self.btn_sup_add.clicked.connect(self.on_add_supplier)
-        self.btn_sup_delete.clicked.connect(self.on_delete_supplier)
-        self.btn_sup_ares.clicked.connect(self.on_supplier_ares)
+        self.btn_sup_merge.clicked.connect(self.on_merge_suppliers)
+        self.btn_sup_edit.clicked.connect(self.on_edit_supplier)
+        self.btn_sup_save.clicked.connect(self.on_save_supplier)
+        self.btn_sup_ares_detail.clicked.connect(self.on_supplier_ares)
+        self.sup_table.clicked.connect(self.on_supplier_selected)
 
         self.btn_doc_search.clicked.connect(self.refresh_documents)
         self.ed_doc_search.returnPressed.connect(self.refresh_documents)
@@ -690,30 +797,75 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0 if qsz == 0 else min(95, int(100 / (qsz + 1))))
 
     def refresh_suppliers(self):
-        q = self.ed_sup_search.text().strip()
+        q = self.sup_filter.text()
         try:
             with self.sf() as session:
                 sups = db_api.list_suppliers(session, q=q)
-                rows = [[
-                    s.ico,
-                    s.name,
-                    s.dic,
-                    s.address,
-                    "ANO" if s.is_vat_payer else ("NE" if s.is_vat_payer is False else "?"),
-                    s.ares_last_sync.strftime("%Y-%m-%d %H:%M") if getattr(s, "ares_last_sync", None) else "",
-                ] for s in sups]
         except Exception as e:
             QMessageBox.critical(self, "Dodavatelé", f"Nepodařilo se načíst seznam dodavatelů: {e}")
             return
-        m = TableModel(["IČO", "Název", "DIČ", "Adresa", "Plátce DPH", "ARES sync"], rows)
-        self.sup_table.setModel(m)
 
-    def _selected_supplier_ico(self) -> Optional[str]:
-        idx = self.sup_table.currentIndex()
-        if not idx.isValid():
-            return None
-        model = self.sup_table.model()
-        return str(model.data(model.index(idx.row(), 0), Qt.DisplayRole) or "")
+        keep_id = self._selected_supplier_id()
+        rows: List[List[str]] = []
+        for s in sups:
+            rows.append([
+                str(s.id),
+                s.name or "",
+                s.ico,
+                s.dic or "",
+                s.city or "",
+            ])
+        self.sup_model = TableModel(["ID", "Název", "IČO", "DIČ", "Místo sídla"], rows)
+        self.sup_table.setModel(self.sup_model)
+        self.sup_table.setColumnHidden(0, True)
+
+        try:
+            self.sup_table.selectionModel().selectionChanged.disconnect(self._on_sup_selection_changed)
+        except Exception:
+            pass
+        self.sup_table.selectionModel().selectionChanged.connect(self._on_sup_selection_changed)
+
+        if keep_id is not None:
+            self._select_supplier_in_table(keep_id)
+        else:
+            self._on_sup_selection_changed()
+
+    def _selected_supplier_ids(self) -> List[int]:
+        sm = self.sup_table.selectionModel()
+        if sm is None:
+            return []
+        ids: List[int] = []
+        for r in sm.selectedRows():
+            try:
+                ids.append(int(self.sup_model.rows[r.row()][0]))
+            except Exception:
+                pass
+        return sorted(set(ids))
+
+    def _selected_supplier_id(self) -> Optional[int]:
+        ids = self._selected_supplier_ids()
+        return ids[0] if len(ids) == 1 else None
+
+    def _select_supplier_in_table(self, supplier_id: int) -> None:
+        for i, row in enumerate(self.sup_model.rows):
+            if str(supplier_id) == str(row[0]):
+                idx = self.sup_model.index(i, 1)
+                self.sup_table.setCurrentIndex(idx)
+                self.sup_table.selectRow(i)
+                break
+
+    def _on_sup_selection_changed(self, *args, **kwargs):
+        self.on_supplier_selected()
+
+    def on_supplier_selected(self):
+        ids = self._selected_supplier_ids()
+        self.btn_sup_merge.setEnabled(len(ids) >= 2)
+        if len(ids) != 1:
+            self._clear_supplier_detail(
+                note=("Nevybrán žádný dodavatel." if not ids else f"Vybráno {len(ids)} dodavatelů (pro detail vyber přesně 1).")
+            )
+            return
+        self._load_supplier_detail(ids[0])
 
     def on_add_supplier(self):
         dlg = SupplierDialog(self)
@@ -724,54 +876,193 @@ class MainWindow(QMainWindow):
         if not ico:
             QMessageBox.warning(self, "Dodavatelé", "IČO je povinné.")
             return
-        with self.sf() as session:
-            s = session.execute(select(Supplier).where(Supplier.ico == ico)).scalar_one_or_none()
-            if not s:
-                s = Supplier(ico=ico)
-            s.name = vals.get("name")
-            s.dic = vals.get("dic")
-            s.address = vals.get("address")
-            # allow None (unknown) by storing NULL if user doesn't want to decide:
-            # checkbox implies explicit True/False; keep False if unchecked
-            s.is_vat_payer = bool(vals.get("is_vat_payer"))
-            session.add(s)
-            session.commit()
-        self.refresh_suppliers()
-
-    def on_delete_supplier(self):
-        ico = self._selected_supplier_ico()
-        if not ico:
-            return
-        if QMessageBox.question(self, "Smazat", f"Smazat dodavatele {ico}?") != QMessageBox.Yes:
-            return
-        with self.sf() as session:
-            s = session.execute(select(Supplier).where(Supplier.ico == ico)).scalar_one_or_none()
-            if s:
-                session.delete(s)
-                session.commit()
-        self.refresh_suppliers()
-
-    def on_supplier_ares(self):
-        ico = self._selected_supplier_ico()
-        if not ico:
-            QMessageBox.warning(self, "ARES", "Vyber dodavatele v tabulce.")
-            return
-        def work():
-            return fetch_by_ico(ico)
-        def done(rec):
+        try:
             with self.sf() as session:
                 s = session.execute(select(Supplier).where(Supplier.ico == ico)).scalar_one_or_none()
                 if not s:
                     s = Supplier(ico=ico)
-                s.name = rec.name
-                s.dic = rec.dic
-                s.address = rec.address
-                s.is_vat_payer = rec.is_vat_payer
-                s.ares_last_sync = rec.fetched_at
+                s.name = vals.get("name")
+                s.dic = vals.get("dic")
+                s.legal_form = vals.get("legal_form")
+                s.street = vals.get("street")
+                s.street_number = vals.get("street_number")
+                s.orientation_number = vals.get("orientation_number")
+                s.city = vals.get("city")
+                s.zip_code = vals.get("zip_code")
+                s.address = vals.get("address")
+                s.is_vat_payer = bool(vals.get("is_vat_payer"))
                 session.add(s)
                 session.commit()
+                new_id = int(s.id)
+        except Exception as e:
+            QMessageBox.critical(self, "Dodavatelé", f"Nelze uložit: {e}")
+            return
+        self.refresh_suppliers()
+        try:
+            self._select_supplier_in_table(new_id)
+        except Exception:
+            pass
+
+    def _set_supplier_editing(self, enabled: bool) -> None:
+        for w in [
+            self.sup_name,
+            self.sup_dic,
+            self.sup_legal_form,
+            self.sup_street,
+            self.sup_street_number,
+            self.sup_orientation_number,
+            self.sup_city,
+            self.sup_zip,
+        ]:
+            w.setReadOnly(not enabled)
+        self.sup_vat.setEnabled(enabled)
+        self.btn_sup_save.setEnabled(enabled)
+
+    def on_supplier_ares(self):
+        sid = self._selected_supplier_id()
+        if sid is None:
+            QMessageBox.warning(self, "ARES", "Vyber přesně jednoho dodavatele v tabulce.")
+            return
+        ico = self.sup_ico.text().strip()
+        if not ico:
+            QMessageBox.warning(self, "ARES", "Dodavatel nemá IČO.")
+            return
+
+        def work():
+            return fetch_by_ico(ico)
+
+        def done(rec):
+            with self.sf() as session:
+                s = upsert_supplier(
+                    session,
+                    rec.ico,
+                    name=rec.name,
+                    dic=rec.dic,
+                    address=rec.address,
+                    is_vat_payer=rec.is_vat_payer,
+                    ares_last_sync=rec.fetched_at,
+                    legal_form=rec.legal_form,
+                    street=rec.street,
+                    street_number=rec.street_number,
+                    orientation_number=rec.orientation_number,
+                    city=rec.city,
+                    zip_code=rec.zip_code,
+                )
+                session.commit()
+                sid_loc = int(s.id)
             self.refresh_suppliers()
+            self._select_supplier_in_table(sid_loc)
+
         self._run_with_busy("ARES", "Načítám data z ARES…", work, done)
+
+    def on_edit_supplier(self):
+        sid = self._selected_supplier_id()
+        if sid is None:
+            QMessageBox.information(self, "Dodavatelé", "Vyber přesně jednoho dodavatele.")
+            return
+        self._set_supplier_editing(True)
+
+    def on_save_supplier(self):
+        sid = self._selected_supplier_id()
+        if sid is None:
+            QMessageBox.information(self, "Dodavatelé", "Vyber přesně jednoho dodavatele.")
+            return
+        try:
+            with self.sf() as session:
+                s = session.get(Supplier, sid)
+                if not s:
+                    raise KeyError(sid)
+                s.name = self.sup_name.text().strip() or None
+                s.dic = self.sup_dic.text().strip() or None
+                s.legal_form = self.sup_legal_form.text().strip() or None
+                s.street = self.sup_street.text().strip() or None
+                s.street_number = self.sup_street_number.text().strip() or None
+                s.orientation_number = self.sup_orientation_number.text().strip() or None
+                s.city = self.sup_city.text().strip() or None
+                s.zip_code = self.sup_zip.text().strip() or None
+                s.is_vat_payer = bool(self.sup_vat.isChecked())
+                s.address = _format_supplier_address(s.street, s.street_number, s.orientation_number, s.city, s.zip_code)
+                session.add(s)
+                session.commit()
+            self._set_supplier_editing(False)
+            self.refresh_suppliers()
+            self._select_supplier_in_table(int(sid))
+        except Exception as e:
+            QMessageBox.critical(self, "Dodavatelé", f"Nelze uložit: {e}")
+
+    def on_merge_suppliers(self):
+        ids = self._selected_supplier_ids()
+        if len(ids) < 2:
+            QMessageBox.information(self, "Sloučit", "Vyber alespoň dva dodavatele.")
+            return
+        try:
+            with self.sf() as session:
+                sups = session.execute(select(Supplier).where(Supplier.id.in_(ids))).scalars().all()
+                by_id = {int(s.id): s for s in sups}
+                items = [f"{by_id[i].name or ''} ({by_id[i].ico}) [ID {i}]" for i in ids if i in by_id]
+            choice, ok = QInputDialog.getItem(
+                self,
+                "Sloučit dodavatele",
+                "Vyber cílového dodavatele (na něj se přesunou všechny doklady):",
+                items,
+                0,
+                False,
+            )
+            if not ok or not choice:
+                return
+            keep_id = int(choice.split("[ID", 1)[1].split("]", 1)[0].strip())
+            other_ids = [i for i in ids if i != keep_id]
+            if QMessageBox.question(
+                self,
+                "Potvrdit sloučení",
+                f"Přesunout doklady na ID {keep_id} a smazat {len(other_ids)} dodavatele?",
+            ) != QMessageBox.Yes:
+                return
+            with self.sf() as session:
+                db_api.merge_suppliers(session, keep_id=keep_id, merge_ids=ids)
+                session.commit()
+            self.refresh_suppliers()
+            self._select_supplier_in_table(keep_id)
+        except Exception as e:
+            QMessageBox.critical(self, "Sloučit", f"Sloučení selhalo: {e}")
+
+    def _load_supplier_detail(self, supplier_id: int) -> None:
+        with self.sf() as session:
+            s = session.get(Supplier, supplier_id)
+            if not s:
+                self._clear_supplier_detail(note="Dodavatel nenalezen.")
+                return
+            self.lbl_sup_detail.setText(f"Detail dodavatele (ID {s.id})")
+            self.sup_id.setText(str(s.id))
+            self.sup_ico.setText(s.ico or "")
+            self.sup_name.setText(s.name or "")
+            self.sup_dic.setText(s.dic or "")
+            self.sup_legal_form.setText(s.legal_form or "")
+            self.sup_vat.setChecked(bool(s.is_vat_payer))
+            self.sup_street.setText(s.street or "")
+            self.sup_street_number.setText(s.street_number or "")
+            self.sup_orientation_number.setText(s.orientation_number or "")
+            self.sup_city.setText(s.city or "")
+            self.sup_zip.setText(s.zip_code or "")
+        self._set_supplier_editing(False)
+
+    def _clear_supplier_detail(self, note: str = "") -> None:
+        self.lbl_sup_detail.setText(note or "Detail dodavatele")
+        for w in [
+            self.sup_id,
+            self.sup_ico,
+            self.sup_name,
+            self.sup_dic,
+            self.sup_legal_form,
+            self.sup_street,
+            self.sup_street_number,
+            self.sup_orientation_number,
+            self.sup_city,
+            self.sup_zip,
+        ]:
+            w.setText("")
+        self.sup_vat.setChecked(False)
+        self._set_supplier_editing(False)
 
     def refresh_documents(self):
         q = self.ed_doc_search.text().strip()
@@ -817,7 +1108,9 @@ class MainWindow(QMainWindow):
                     return None
                 return pil_to_qimage(imgs[0])
             from PIL import Image
-            return pil_to_qimage(Image.open(p))
+            with Image.open(p) as img:
+                # ensure underlying file handle is released (Windows)
+                return pil_to_qimage(img.copy())
 
         def done(qimg):
             if qimg is None:
