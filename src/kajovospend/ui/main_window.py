@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import os
 import subprocess
 import sys
@@ -294,6 +295,102 @@ class _Worker(QObject):
         self.done.emit(res)
 
 
+class _SilentRunner:
+    """
+    Lightweight background runner (no modal progress).
+    Keeps thread/worker objects alive via MainWindow lists to avoid Qt GC issues.
+    """
+
+    @staticmethod
+    def run(window: "MainWindow", fn, on_done, on_error=None, *, timeout_ms: int | None = None):
+        th = QThread(window)
+        wk = _Worker(fn)
+        wk.moveToThread(th)
+        th.started.connect(wk.run)
+
+        completed = False
+        timer: QTimer | None = None
+
+        window._workers.append(wk)
+        window._threads.append(th)
+
+        def _dispatch_ui(cb) -> None:
+            if QThread.currentThread() != window.thread():
+                QTimer.singleShot(0, window, cb)
+                return
+            cb()
+
+        def _finish_once() -> bool:
+            nonlocal completed
+            if completed:
+                return False
+            completed = True
+            return True
+
+        def _cleanup():
+            try:
+                if timer is not None:
+                    timer.stop()
+            except Exception:
+                pass
+            try:
+                th.quit()
+                th.wait(2000)
+            except Exception:
+                pass
+            try:
+                window._threads.remove(th)
+            except Exception:
+                pass
+            try:
+                window._workers.remove(wk)
+            except Exception:
+                pass
+            try:
+                if timer is not None:
+                    window._timers.remove(timer)
+            except Exception:
+                pass
+
+        def _ok(res):
+            def _impl():
+                if not _finish_once():
+                    return
+                _cleanup()
+                try:
+                    on_done(res)
+                except Exception:
+                    window.log.exception("SilentRunner on_done failed")
+            _dispatch_ui(_impl)
+
+        def _err(msg: str):
+            def _impl():
+                if not _finish_once():
+                    return
+                _cleanup()
+                if on_error:
+                    try:
+                        on_error(msg)
+                        return
+                    except Exception:
+                        window.log.exception("SilentRunner on_error failed")
+                # default: do not spam modal errors in background refresh
+                window.log.warning("SilentRunner error: %s", msg)
+            _dispatch_ui(_impl)
+
+        wk.done.connect(_ok)
+        wk.error.connect(_err)
+
+        th.start()
+
+        if timeout_ms is not None:
+            timer = QTimer(window)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: _err("Operace překročila časový limit."))
+            timer.start(int(timeout_ms))
+            window._timers.append(timer)
+
+
 class StatusDialog(QDialog):
     def __init__(self, status: Dict[str, Any], parent=None):
         super().__init__(parent)
@@ -393,6 +490,15 @@ class MainWindow(QMainWindow):
         self._doc_total = 0
         self._preview_cache: Dict[Tuple[str, int], QPixmap] = {}
         self._preview_dpi = int(self.cfg.get("performance", {}).get("preview_dpi", 120) or 120)
+
+        # background dashboard refresh (avoid UI freezes when service is down)
+        self._dash_refresh_inflight = False
+        self._dash_last_counts: Dict[str, Any] | None = None
+        self._dash_last_status: Dict[str, Any] | None = None
+
+        # selection model guards to prevent duplicate signal connections after model resets
+        self._docs_sel_model = None
+        self._unrec_sel_model = None
 
         # paging for per-item search tab
         self._items_page_size = int(self.cfg.get("performance", {}).get("items_page_size", 1000) or 1000)
@@ -1069,15 +1175,42 @@ class MainWindow(QMainWindow):
         self.btn_u_item_add.clicked.connect(self._unrec_item_add_v2)
         self.btn_u_item_del.clicked.connect(self._unrec_item_del_v2)
 
+    def _docs_selection_changed_v2(self, *_args) -> None:
+        try:
+            sm = self.docs_table.selectionModel()
+            if not sm:
+                return
+            idx = sm.currentIndex()
+            if idx and idx.isValid():
+                self._on_doc_selected_v2(idx)
+        except Exception:
+            pass
+
+    def _unrec_selection_changed_v2(self, *_args) -> None:
+        try:
+            sm = self.unrec_table.selectionModel()
+            if not sm:
+                return
+            idx = sm.currentIndex()
+            if idx and idx.isValid():
+                self._on_unrec_selected_v2(idx)
+        except Exception:
+            pass
+
     def _wire_timers(self):
         self.timer = QTimer(self)
-        self.timer.setInterval(int(self.cfg.get("performance", {}).get("ui_refresh_ms") or 1000))
+        # Do not refresh too often; otherwise a slow service status poll can starve UI.
+        interval = int(self.cfg.get("performance", {}).get("ui_refresh_ms") or 1000)
+        # keep it reasonable even if config is too aggressive
+        interval = max(2000, interval)
+        self.timer.setInterval(interval)
         self.timer.timeout.connect(self._refresh_from_queue)
         self.timer.start()
 
     def _refresh_from_queue(self):
         try:
-            self.refresh_dashboard()
+            # never block UI thread here
+            self._refresh_dashboard_async()
         except Exception:
             pass
 
@@ -1223,7 +1356,7 @@ class MainWindow(QMainWindow):
     def refresh_all_v2(self) -> None:
         # zachovej dashboard a dodavatele (pokud existují původní metody), ale listy účtů řídí V2
         try:
-            self.refresh_dashboard()
+            self._refresh_dashboard_async()
         except Exception:
             pass
         try:
@@ -1367,7 +1500,18 @@ class MainWindow(QMainWindow):
         try:
             sm = self.docs_table.selectionModel()
             if sm:
-                sm.selectionChanged.connect(lambda *_: self._on_doc_selected_v2(sm.currentIndex()))
+                # disconnect previous selection model (model resets create a new selection model)
+                if self._docs_sel_model is not None and self._docs_sel_model is not sm:
+                    try:
+                        self._docs_sel_model.selectionChanged.disconnect(self._docs_selection_changed_v2)
+                    except Exception:
+                        pass
+                self._docs_sel_model = sm
+                try:
+                    sm.selectionChanged.disconnect(self._docs_selection_changed_v2)
+                except Exception:
+                    pass
+                sm.selectionChanged.connect(self._docs_selection_changed_v2)
             if reset and self._docs_listing:
                 idx = self.docs_table.model().index(0, 0)
                 self.docs_table.setCurrentIndex(idx)
@@ -1577,7 +1721,17 @@ class MainWindow(QMainWindow):
         try:
             sm = self.unrec_table.selectionModel()
             if sm:
-                sm.selectionChanged.connect(lambda *_: self._on_unrec_selected_v2(sm.currentIndex()))
+                if self._unrec_sel_model is not None and self._unrec_sel_model is not sm:
+                    try:
+                        self._unrec_sel_model.selectionChanged.disconnect(self._unrec_selection_changed_v2)
+                    except Exception:
+                        pass
+                self._unrec_sel_model = sm
+                try:
+                    sm.selectionChanged.disconnect(self._unrec_selection_changed_v2)
+                except Exception:
+                    pass
+                sm.selectionChanged.connect(self._unrec_selection_changed_v2)
             if self._unrec_listing:
                 idx = self.unrec_table.model().index(0, 0)
                 self.unrec_table.setCurrentIndex(idx)
@@ -1925,9 +2079,13 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(800, self.on_run_service)
 
     def on_show_status(self):
-        st = self._service_status()
-        d = StatusDialog(st, self)
-        d.exec()
+        # avoid blocking UI if service is down (socket timeout)
+        def work():
+            return self._service_status()
+        def done(st):
+            d = StatusDialog(st, self)
+            d.exec()
+        self._run_with_busy("STAV", "Načítám stav služby…", work, done, timeout_ms=8000)
 
     def on_save_settings(self):
         deep_set(self.cfg, ["paths", "input_dir"], self.ed_input_dir.text().strip())
@@ -1962,20 +2120,68 @@ class MainWindow(QMainWindow):
         self.refresh_money()
 
     def refresh_dashboard(self):
-        try:
-            with self.sf() as session:
-                c = db_api.counts(session)
-            self.lbl_unprocessed.setText(f"Nezpracované: {c['unprocessed']}")
-            self.lbl_processed.setText(f"Zpracované: {c['processed']}")
-            self.lbl_docs.setText(f"Účty: {c['documents']}")
-            self.lbl_suppliers.setText(f"Dodavatelé: {c['suppliers']}")
-        except Exception:
-            self.log.exception("refresh_dashboard counts failed")
-        st = self._service_status()
-        running = bool(st.get("running"))
-        self.lbl_service.setText(f"Služba: {'běží' if running else 'neběží'} | fronta: {st.get('queue_size')}")
-        qsz = st.get("queue_size") or 0
-        self.progress.setValue(0 if qsz == 0 else min(95, int(100 / (qsz + 1))))
+        # Keep API compatibility, but do not block UI thread.
+        self._refresh_dashboard_async()
+
+    def _apply_dashboard(self, c: Dict[str, Any] | None, st: Dict[str, Any] | None) -> None:
+        if c:
+            try:
+                self.lbl_unprocessed.setText(f"Nezpracované: {c.get('unprocessed', 0)}")
+                self.lbl_processed.setText(f"Zpracované: {c.get('processed', 0)}")
+                self.lbl_docs.setText(f"Účty: {c.get('documents', 0)}")
+                self.lbl_suppliers.setText(f"Dodavatelé: {c.get('suppliers', 0)}")
+            except Exception:
+                pass
+        if st:
+            try:
+                running = bool(st.get("running"))
+                self.lbl_service.setText(
+                    f"Služba: {'běží' if running else 'neběží'} | fronta: {st.get('queue_size')}"
+                )
+                qsz = st.get("queue_size") or 0
+                self.progress.setValue(0 if qsz == 0 else min(95, int(100 / (qsz + 1))))
+            except Exception:
+                pass
+
+    def _refresh_dashboard_async(self) -> None:
+        # prevent overlapping refreshes (important when service status is slow)
+        if self._dash_refresh_inflight:
+            return
+        self._dash_refresh_inflight = True
+
+        def work():
+            c = None
+            st = None
+            try:
+                with self.sf() as session:
+                    c = db_api.counts(session)
+            except Exception as e:
+                c = None
+                try:
+                    self.log.debug("dashboard counts failed: %s", e)
+                except Exception:
+                    pass
+            try:
+                # This may block up to socket timeout, but it's in background thread.
+                st = self._service_status()
+            except Exception as e:
+                st = {"ok": False, "running": False, "queue_size": None, "error": str(e)}
+            return (c, st)
+
+        def done(res):
+            try:
+                c, st = res
+                self._dash_last_counts = c
+                self._dash_last_status = st
+                self._apply_dashboard(c, st)
+            finally:
+                self._dash_refresh_inflight = False
+
+        def err(_msg: str):
+            # do not show modal dialog; just release inflight and keep last known state
+            self._dash_refresh_inflight = False
+
+        _SilentRunner.run(self, work, done, err, timeout_ms=12000)
 
     def refresh_suppliers(self):
         q = self.sup_filter.text()
