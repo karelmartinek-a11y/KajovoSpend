@@ -44,3 +44,5 @@
 - GitHub repozitář: karelmartinek-a11y/KajovoSpend (přístupový token drž mimo verzování)
 
 ## Security & Configuration Tips
+- Osobní tokeny (PAT) neukládej do repozitáře; používej git credential helper nebo `.env` (viz `.env.example`), který je ignorovaný.
+- Sdílené hodnoty dávej jen do šablon typu `config.example.yaml` nebo `.env.example`.
