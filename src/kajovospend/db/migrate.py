@@ -91,11 +91,6 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         # Line items foreign key / filtering
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_document_id ON items(document_id)"))
 
-        # FTS helpers (join keys)
-        con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_fts_document_id ON documents_fts(document_id)"))
-        con.execute(text("CREATE INDEX IF NOT EXISTS idx_items_fts_document_id ON items_fts(document_id)"))
-
-
 def init_db(engine: Engine) -> None:
     # ensure tables exist
     Base.metadata.create_all(engine)
