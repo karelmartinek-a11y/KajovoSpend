@@ -1,37 +1,212 @@
 from __future__ import annotations
 
 import logging
-from logging.handlers import RotatingFileHandler
+import os
+import threading
+from collections import deque
 from pathlib import Path
 
+if os.name == "nt":
+    import msvcrt  # type: ignore
+else:
+    import fcntl  # type: ignore
 
-def setup_logging(log_dir: Path, name: str = "kajovospend", level: int = logging.INFO) -> logging.Logger:
+
+class _InterProcessLock:
+    """
+    Cross-process file lock using a dedicated lock-file.
+    Keeps kajovospend.log safe when GUI + service write concurrently.
+    """
+
+    def __init__(self, lock_path: Path):
+        self._lock_path = lock_path
+        self._fh = None
+
+    def __enter__(self):
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self._lock_path, "a+b")
+        try:
+            if os.name == "nt":
+                # lock 1 byte at the beginning (ensure file is at least 1 byte)
+                if self._fh.tell() == 0 and self._fh.seek(0, os.SEEK_END) == 0:
+                    self._fh.write(b"\0")
+                    self._fh.flush()
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self._fh:
+            return
+        try:
+            if os.name == "nt":
+                try:
+                    self._fh.seek(0)
+                except Exception:
+                    pass
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+
+
+class LineCappedFileHandler(logging.Handler):
+    """
+    Single log file with "ring buffer" behavior:
+    - appends normally
+    - once it grows beyond max_lines (+ small chunk), it truncates to last max_lines
+
+    This keeps one file (kajovospend.log) and effectively overwrites old lines.
+    """
+
+    def __init__(
+        self,
+        filename: Path,
+        *,
+        max_lines: int = 5000,
+        encoding: str = "utf-8",
+    ):
+        super().__init__()
+        self._filename = Path(filename)
+        self._encoding = encoding
+        self.max_lines = int(max_lines)
+        # trim every N extra lines to avoid rewriting on every emit
+        self._trim_chunk = max(10, self.max_lines // 100)  # 5000 -> 50
+        self._lock_path = self._filename.parent / (self._filename.name + ".lock")
+        self._mtx = threading.RLock()
+        self._stream = None
+        self._line_count = 0
+        self._open_and_count()
+
+    def _open_and_count(self) -> None:
+        self._filename.parent.mkdir(parents=True, exist_ok=True)
+        # keep "errors" tolerant so no log write ever crashes the app
+        self._stream = open(self._filename, "a", encoding=self._encoding, errors="backslashreplace")
+        try:
+            if self._filename.exists():
+                with open(self._filename, "r", encoding=self._encoding, errors="ignore") as rf:
+                    self._line_count = sum(1 for _ in rf)
+            else:
+                self._line_count = 0
+        except Exception:
+            self._line_count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            if not msg.endswith("\n"):
+                msg += "\n"
+            with self._mtx:
+                with _InterProcessLock(self._lock_path):
+                    if self._stream is None:
+                        self._open_and_count()
+                    assert self._stream is not None
+                    self._stream.write(msg)
+                    self._stream.flush()
+                    self._line_count += 1
+                    if self._line_count >= (self.max_lines + self._trim_chunk):
+                        self._trim_to_last_max_lines()
+        except Exception:
+            self.handleError(record)
+
+    def _trim_to_last_max_lines(self) -> None:
+        # stream already locked by _InterProcessLock in emit()
+        try:
+            if self._stream is not None:
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+
+            tail = deque(maxlen=self.max_lines)
+            try:
+                with open(self._filename, "r", encoding=self._encoding, errors="ignore") as rf:
+                    for line in rf:
+                        tail.append(line)
+            except FileNotFoundError:
+                tail = deque(maxlen=self.max_lines)
+
+            with open(self._filename, "w", encoding=self._encoding, errors="backslashreplace") as wf:
+                wf.writelines(tail)
+
+            self._line_count = len(tail)
+        finally:
+            # reopen for append
+            self._stream = open(self._filename, "a", encoding=self._encoding, errors="backslashreplace")
+
+    def close(self) -> None:
+        with self._mtx:
+            try:
+                if self._stream is not None:
+                    self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        super().close()
+
+
+_ROOT_CONFIGURED = False
+_ROOT_CONFIG_LOCK = threading.Lock()
+
+
+def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
+    """
+    Configures one shared log file:
+      <log_dir>/kajovospend.log
+    capped to the last ~5000 lines in a "ring" (old lines are overwritten).
+
+    Console logging is OFF by default to keep "1 log". Enable via:
+      KAJOVOSPEND_LOG_CONSOLE=1
+    """
+    global _ROOT_CONFIGURED
+
     log_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(name)
-    logger.setLevel(level)
-    logger.propagate = False
 
-    # Clear existing handlers to avoid duplication in reloads.
-    if logger.handlers:
-        for h in list(logger.handlers):
-            logger.removeHandler(h)
+    with _ROOT_CONFIG_LOCK:
+        if not _ROOT_CONFIGURED:
+            max_lines = int(os.environ.get("KAJOVOSPEND_LOG_MAX_LINES", "5000"))
+            log_file = log_dir / "kajovospend.log"
 
-    fmt = logging.Formatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+            root = logging.getLogger()
+            root.setLevel(logging.DEBUG)
 
-    file_handler = RotatingFileHandler(
-        filename=str(log_dir / f"{name}.log"),
-        maxBytes=5 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(fmt)
+            fmt = logging.Formatter(
+                "%(asctime)s.%(msecs)03d %(levelname)s "
+                "pid=%(process)d tid=%(threadName)s "
+                "[%(name)s:%(funcName)s:%(lineno)d] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
 
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(fmt)
+            fh = LineCappedFileHandler(log_file, max_lines=max_lines, encoding="utf-8")
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+            if os.environ.get("KAJOVOSPEND_LOG_CONSOLE", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
+                ch = logging.StreamHandler()
+                ch.setLevel(logging.DEBUG)
+                ch.setFormatter(fmt)
+                root.addHandler(ch)
+
+            _ROOT_CONFIGURED = True
+
+    # let everything propagate into the single root handler
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = True
     return logger
