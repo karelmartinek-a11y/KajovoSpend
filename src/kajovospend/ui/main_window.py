@@ -1309,6 +1309,19 @@ class MainWindow(QMainWindow):
         self.docs_table.setModel(model)
         self.docs_table.resizeColumnsToContents()
 
+        # connect selection change for new model and optionally preselect first row on reset
+        try:
+            sm = self.docs_table.selectionModel()
+            if sm is not None:
+                sm.selectionChanged.connect(lambda *_: self._on_doc_selected_fast())
+            if reset and getattr(model, "rows", None):
+                idx = model.index(0, 0)
+                self.docs_table.setCurrentIndex(idx)
+                self.docs_table.selectRow(0)
+                self._on_doc_selected_fast()
+        except Exception:
+            pass
+
         self._doc_offset += len(docs)
 
     def refresh_documents(self):
@@ -1326,11 +1339,16 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(fp)))
 
     def _on_doc_selected_fast(self, *_):
-        idx = self.docs_table.currentIndex()
-        if not idx.isValid():
-            return
         model = self.docs_table.model()
         if model is None:
+            return
+        sm = self.docs_table.selectionModel()
+        idx = self.docs_table.currentIndex()
+        if (not idx.isValid()) and sm is not None:
+            rows = sm.selectedRows()
+            if rows:
+                idx = rows[0]
+        if not idx.isValid():
             return
         try:
             doc_id = int(model.rows[idx.row()][0])  # type: ignore[attr-defined]
