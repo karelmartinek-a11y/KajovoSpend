@@ -24,6 +24,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
 );
 """
 
+FTS_ITEMS2 = """
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts2 USING fts5(
+  item_id UNINDEXED,
+  document_id UNINDEXED,
+  item_name,
+  supplier_ico,
+  doc_number
+);
+"""
+
 _ICO_DIGITS_RE = re.compile(r"\D+")
 
 
@@ -47,6 +57,7 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         # Ensure FTS tables exist before indexing them.
         con.execute(text(FTS_DOCS))
         con.execute(text(FTS_ITEMS))
+        con.execute(text(FTS_ITEMS2))
 
         # --- columns ---
         cols = con.execute(text("PRAGMA table_info('suppliers')")).fetchall()

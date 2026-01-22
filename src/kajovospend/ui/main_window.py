@@ -394,6 +394,13 @@ class MainWindow(QMainWindow):
         self._preview_cache: Dict[Tuple[str, int], QPixmap] = {}
         self._preview_dpi = int(self.cfg.get("performance", {}).get("preview_dpi", 120) or 120)
 
+        # paging for per-item search tab
+        self._items_page_size = int(self.cfg.get("performance", {}).get("items_page_size", 1000) or 1000)
+        self._items_offset = 0
+        self._items_total = 0
+        self._items_rows: List[Dict[str, Any]] = []
+        self._items_current_path: str | None = None
+
         # current selections (ÚČTY / NEROZPOZNANÉ)
         self._current_doc_id: int | None = None
         self._current_doc_file_id: int | None = None
@@ -792,6 +799,64 @@ class MainWindow(QMainWindow):
         spl.addWidget(right, 1)
         self.tabs.addTab(self.tab_suppliers, "DODAVATELÉ")
 
+        # Položky (per-item search)
+        self.tab_items = QWidget()
+        items_layout = QVBoxLayout(self.tab_items)
+
+        items_top = QWidget()
+        items_top_l = QHBoxLayout(items_top)
+        items_top_l.setContentsMargins(0, 0, 0, 0)
+        self.items_filter = QLineEdit()
+        self.items_filter.setPlaceholderText("Vyhledat v položkách (název, IČO, číslo dokladu...)")
+        self.btn_items_search = QPushButton("Hledat")
+        self.btn_items_more = QPushButton("Načíst další")
+        self.lbl_items_page = QLabel("0 / 0")
+        items_top_l.addWidget(self.items_filter, 1)
+        items_top_l.addWidget(self.btn_items_search)
+        items_top_l.addWidget(self.btn_items_more)
+        items_top_l.addWidget(self.lbl_items_page)
+        items_layout.addWidget(items_top)
+
+        items_split = QSplitter()
+        items_split.setOrientation(Qt.Horizontal)
+        items_layout.addWidget(items_split, 1)
+
+        items_left = QWidget()
+        il = QVBoxLayout(items_left)
+        self.items_table = QTableView()
+        self.items_table.setAlternatingRowColors(True)
+        self.items_table.setShowGrid(True)
+        self.items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.items_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        il.addWidget(self.items_table, 1)
+        items_split.addWidget(items_left)
+
+        items_right = QWidget()
+        ir = QVBoxLayout(items_right)
+        src_row_items = QWidget()
+        sri = QHBoxLayout(src_row_items)
+        sri.setContentsMargins(0, 0, 0, 0)
+        self.items_src = QLineEdit()
+        self.items_src.setReadOnly(True)
+        self.btn_items_open = QPushButton("Otevřít doklad")
+        sri.addWidget(QLabel("Zdroj:"))
+        sri.addWidget(self.items_src, 1)
+        sri.addWidget(self.btn_items_open)
+        ir.addWidget(src_row_items)
+
+        self.lbl_items_doc = QLabel("")
+        ir.addWidget(self.lbl_items_doc)
+
+        self.items_preview = PdfPreviewView()
+        ir.addWidget(self.items_preview, 1)
+        items_split.addWidget(items_right)
+
+        items_split.setStretchFactor(0, 2)
+        items_split.setStretchFactor(1, 3)
+
+        self.tabs.addTab(self.tab_items, "POLOŽKY")
+
         # Účty
         self.tab_docs = QWidget()
         dl2 = QVBoxLayout(self.tab_docs)
@@ -843,12 +908,12 @@ class MainWindow(QMainWindow):
         self.preview_view = PdfPreviewView()
         rl.addWidget(self.preview_view, 3)
 
-        self.items_table = QTableView()
-        self.items_table.setAlternatingRowColors(True)
-        self.items_table.setShowGrid(True)
-        self.items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        rl.addWidget(self.items_table, 2)
+        self.doc_items_table = QTableView()
+        self.doc_items_table.setAlternatingRowColors(True)
+        self.doc_items_table.setShowGrid(True)
+        self.doc_items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.doc_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        rl.addWidget(self.doc_items_table, 2)
 
         items_bar = QWidget()
         ib = QHBoxLayout(items_bar); ib.setContentsMargins(0, 0, 0, 0)
@@ -971,6 +1036,13 @@ class MainWindow(QMainWindow):
         self.btn_sup_ares_detail.clicked.connect(self.on_supplier_ares)
         self.sup_table.clicked.connect(self.on_supplier_selected)
 
+        # POLOŽKY (per-item search)
+        self.btn_items_search.clicked.connect(self._items_new_search_v2)
+        self.items_filter.returnPressed.connect(self._items_new_search_v2)
+        self.btn_items_more.clicked.connect(self._items_load_more_v2)
+        self.btn_items_open.clicked.connect(self._items_open_selected_v2)
+        self.items_table.doubleClicked.connect(self._items_open_from_doubleclick_v2)
+
         # ÚČTY – nová logika (plně editovatelný detail položek)
         self.doc_filter.returnPressed.connect(self._docs_new_search_v2)
         self.btn_docs_search.clicked.connect(self._docs_new_search_v2)
@@ -1023,6 +1095,128 @@ class MainWindow(QMainWindow):
             pass
 
     # ---------------------------
+    # POLOŽKY (per-item search)
+    # ---------------------------
+
+    def _items_new_search_v2(self) -> None:
+        self._items_offset = 0
+        self._items_rows = []
+        self._items_current_path = None
+        self._load_items_page_v2(reset=True)
+
+    def _items_load_more_v2(self) -> None:
+        if self._items_offset >= (self._items_total or 0):
+            return
+        self._load_items_page_v2(reset=False)
+
+    def _load_items_page_v2(self, *, reset: bool) -> None:
+        q = (self.items_filter.text() or "").strip()
+        limit = int(self._items_page_size)
+        offset = int(self._items_offset or 0)
+
+        with self.sf() as session:
+            total = db_api.count_items(session, q=q)
+            rows = db_api.list_items(session, q=q, limit=limit, offset=offset)
+
+        if reset:
+            self._items_rows = []
+        self._items_rows.extend(rows)
+        self._items_total = int(total or 0)
+        self._items_offset = len(self._items_rows)
+
+        headers = ["Datum", "Dodavatel", "Položka", "Množství", "DPH %", "Celkem", "Doklad", "IČO"]
+        trows = []
+        for r in self._items_rows:
+            issue = r.get("issue_date")
+            if hasattr(issue, "strftime"):
+                issue_s = issue.strftime("%Y-%m-%d")
+            else:
+                issue_s = str(issue or "")
+            supplier = (r.get("supplier_name") or "").strip() or "(neznámý)"
+            item_name = (r.get("item_name") or "").strip()
+            qty = r.get("quantity")
+            vat = r.get("vat_rate")
+            total_ln = r.get("line_total")
+            dn = (r.get("doc_number") or "").strip()
+            ico = (r.get("supplier_ico") or "").strip()
+            trows.append([issue_s, supplier, item_name, qty, vat, total_ln, dn, ico])
+
+        self.items_table.setModel(TableModel(headers, trows))
+        self.items_table.resizeColumnsToContents()
+        self.lbl_items_page.setText(f"{self._items_offset} / {self._items_total}")
+        self.btn_items_more.setEnabled(self._items_offset < self._items_total)
+
+        try:
+            sel_model = self.items_table.selectionModel()
+            if sel_model:
+                try:
+                    sel_model.selectionChanged.connect(
+                        self._items_selection_changed_v2,
+                        Qt.ConnectionType.UniqueConnection,  # prevent duplicate connections when model resets
+                    )
+                except Exception:
+                    # Some Qt bindings raise if already connected; ignore.
+                    pass
+        except Exception:
+            pass
+
+        if reset and self._items_rows:
+            try:
+                idx = self.items_table.model().index(0, 0)
+                self.items_table.setCurrentIndex(idx)
+                self.items_table.selectRow(0)
+            except Exception:
+                pass
+        self._items_selection_changed_v2(None, None)
+
+    def _items_selection_changed_v2(self, selected, deselected) -> None:
+        try:
+            sm = self.items_table.selectionModel()
+            if not sm:
+                return
+            idxs = sm.selectedRows()
+            if not idxs:
+                self.items_preview.clear()
+                self.items_src.setText("")
+                self.lbl_items_doc.setText("")
+                return
+            row = int(idxs[0].row())
+            meta = self._items_rows[row]
+        except Exception:
+            return
+
+        path = meta.get("current_path")
+        self._items_current_path = path
+        self.items_src.setText(path or "")
+
+        issue = meta.get("issue_date")
+        if hasattr(issue, "strftime"):
+            issue_s = issue.strftime("%Y-%m-%d")
+        else:
+            issue_s = str(issue or "")
+        supplier = (meta.get("supplier_name") or "").strip() or "(neznámý)"
+        ico = (meta.get("supplier_ico") or "").strip()
+        dn = (meta.get("doc_number") or "").strip()
+        doc_total = meta.get("doc_total_with_vat")
+        self.lbl_items_doc.setText(f"{issue_s} | {supplier} | IČO {ico} | Doklad {dn} | Celkem {doc_total}")
+
+        if path:
+            QTimer.singleShot(0, lambda: self._load_preview(self.items_preview, path))
+        else:
+            self.items_preview.clear()
+
+    def _items_open_selected_v2(self) -> None:
+        self._open_file_path(self._items_current_path)
+
+    def _items_open_from_doubleclick_v2(self, index) -> None:
+        try:
+            row = int(index.row())
+            meta = self._items_rows[row]
+        except Exception:
+            return
+        self._open_file_path(meta.get("current_path"))
+
+    # ---------------------------
     # V2: ÚČTY + NEROZPOZNANÉ
     # ---------------------------
 
@@ -1034,6 +1228,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.refresh_suppliers()
+        except Exception:
+            pass
+        try:
+            self._items_new_search_v2()
         except Exception:
             pass
         self._docs_new_search_v2()
@@ -1220,8 +1418,8 @@ class MainWindow(QMainWindow):
             )
         model = EditableItemsModel(rows)
         self._current_doc_items_model = model
-        self.items_table.setModel(model)
-        self.items_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.doc_items_table.setModel(model)
+        self.doc_items_table.setSelectionMode(QAbstractItemView.SingleSelection)
 
         for b in (self.btn_items_add, self.btn_items_del, self.btn_items_save):
             b.setEnabled(True)
@@ -1240,7 +1438,7 @@ class MainWindow(QMainWindow):
     def _docs_item_del_v2(self) -> None:
         if not self._current_doc_items_model:
             return
-        sel = self.items_table.selectionModel()
+        sel = self.doc_items_table.selectionModel()
         if not sel or not sel.hasSelection():
             return
         row = int(sel.selectedRows()[0].row())
@@ -1325,6 +1523,10 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(self, "Účty", "Položky byly uloženy.")
         self._docs_new_search_v2()
+        try:
+            self._items_new_search_v2()
+        except Exception:
+            pass
 
     # ---- NEROZPOZNANÉ ----
 
@@ -1630,6 +1832,10 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Karanténa", "Doklad byl uložen jako hotový a přesunut z karantény.")
         self._refresh_unrec_v2()
         self._docs_new_search_v2()
+        try:
+            self._items_new_search_v2()
+        except Exception:
+            pass
 
     def _render_pdf_preview_bytes(self, path: Path, dpi: int = 160) -> bytes | None:
         """
@@ -2180,8 +2386,8 @@ class MainWindow(QMainWindow):
         item_rows: List[List[Any]] = []
         for it in items:
             item_rows.append([it.line_no, it.name, it.quantity, it.vat_rate, it.line_total])
-        self.items_table.setModel(TableModel(item_headers, item_rows))
-        self.items_table.resizeColumnsToContents()
+        self.doc_items_table.setModel(TableModel(item_headers, item_rows))
+        self.doc_items_table.resizeColumnsToContents()
 
         self.preview_view.clear()
         if src and src.lower().endswith(".pdf") and Path(src).exists():

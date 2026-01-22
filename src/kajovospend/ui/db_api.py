@@ -4,6 +4,7 @@ import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import select, text, func
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem, ImportJob
@@ -233,6 +234,213 @@ def list_quarantine(session: Session) -> List[Tuple[Document, DocumentFile]]:
     stmt = select(Document, DocumentFile).join(DocumentFile, DocumentFile.id == Document.file_id).where(DocumentFile.status == "QUARANTINE")
     stmt = stmt.order_by(Document.created_at.desc())
     return list(session.execute(stmt).all())
+
+
+def _ensure_items_fts2_populated(session: Session) -> None:
+    """
+    items_fts2 is used for fast per-item fulltext search in UI tab "POLOŽKY".
+    This function is intentionally idempotent and safe to call from read paths.
+    """
+    try:
+        exists = session.execute(
+            text("SELECT 1 FROM sqlite_master WHERE type='table' AND name='items_fts2' LIMIT 1")
+        ).scalar()
+        if not exists:
+            return
+        c = int(session.execute(text("SELECT COUNT(*) FROM items_fts2")).scalar_one() or 0)
+        if c > 0:
+            return
+
+        # Backfill in one statement (fast enough for tens of thousands of rows).
+        session.execute(
+            text(
+                """
+                INSERT INTO items_fts2(item_id, document_id, item_name, supplier_ico, doc_number)
+                SELECT i.id, i.document_id, COALESCE(i.name,''), COALESCE(d.supplier_ico,''), COALESCE(d.doc_number,'')
+                FROM items i
+                JOIN documents d ON d.id = i.document_id
+                """
+            )
+        )
+        session.commit()
+    except Exception:
+        # If anything goes wrong, the UI will still work (fallback will be used).
+        try:
+            session.rollback()
+        except Exception:
+            pass
+
+
+def count_items(session: Session, q: str = "") -> int:
+    """
+    Count of line items (excluding quarantine files).
+    Supports fulltext search via items_fts2 if available.
+    """
+    try:
+        q = (q or "").strip()
+        if q:
+            _ensure_items_fts2_populated(session)
+            try:
+                sql = """
+                SELECT COUNT(*) AS c
+                FROM items_fts2
+                JOIN items i ON i.id = items_fts2.item_id
+                JOIN documents d ON d.id = i.document_id
+                JOIN files f ON f.id = d.file_id
+                WHERE items_fts2 MATCH :q
+                  AND f.status != 'QUARANTINE'
+                """
+                return int(session.execute(text(sql), {"q": q}).scalar_one() or 0)
+            except Exception:
+                # Fallback: LIKE scan (still acceptable for ~10k-100k rows)
+                qq = f"%{q}%"
+                sql = """
+                SELECT COUNT(*) AS c
+                FROM items i
+                JOIN documents d ON d.id = i.document_id
+                JOIN files f ON f.id = d.file_id
+                WHERE f.status != 'QUARANTINE'
+                  AND (i.name LIKE :qq OR d.supplier_ico LIKE :qq OR d.doc_number LIKE :qq)
+                """
+                return int(session.execute(text(sql), {"qq": qq}).scalar_one() or 0)
+
+        sql = """
+        SELECT COUNT(*) AS c
+        FROM items i
+        JOIN documents d ON d.id = i.document_id
+        JOIN files f ON f.id = d.file_id
+        WHERE f.status != 'QUARANTINE'
+        """
+        return int(session.execute(text(sql)).scalar_one() or 0)
+    except OperationalError:
+        # DB not initialized yet; avoid breaking GUI.
+        return 0
+
+
+def list_items(
+    session: Session,
+    q: str = "",
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Paginated list of line items for UI tab "POLOŽKY".
+    Returns dict rows with doc context + file path (for preview/open).
+    """
+    try:
+        q = (q or "").strip()
+        params: Dict[str, Any] = {}
+        lim_sql = ""
+        if limit is not None:
+            lim_sql = " LIMIT :lim OFFSET :off"
+            params["lim"] = int(limit)
+            params["off"] = int(offset or 0)
+
+        if q:
+            _ensure_items_fts2_populated(session)
+            try:
+                sql_ids = f"""
+                WITH hits AS (
+                  SELECT item_id, bm25(items_fts2) AS rank
+                  FROM items_fts2
+                  WHERE items_fts2 MATCH :q
+                )
+                SELECT item_id
+                FROM hits
+                ORDER BY rank ASC
+                {lim_sql}
+                """
+                params2 = dict(params)
+                params2["q"] = q
+                rows = session.execute(text(sql_ids), params2).fetchall()
+                ids = [int(r.item_id) for r in rows]
+                if not ids:
+                    return []
+
+                sql = """
+                SELECT
+                  i.id            AS item_id,
+                  i.document_id   AS document_id,
+                  i.line_no       AS line_no,
+                  i.name          AS item_name,
+                  i.quantity      AS quantity,
+                  i.vat_rate      AS vat_rate,
+                  i.line_total    AS line_total,
+                  d.issue_date    AS issue_date,
+                  d.total_with_vat AS doc_total_with_vat,
+                  d.doc_number    AS doc_number,
+                  d.supplier_ico  AS supplier_ico,
+                  s.name          AS supplier_name,
+                  f.current_path  AS current_path
+                FROM items i
+                JOIN documents d ON d.id = i.document_id
+                JOIN files f ON f.id = d.file_id
+                LEFT JOIN suppliers s ON s.id = d.supplier_id
+                WHERE i.id IN :ids
+                  AND f.status != 'QUARANTINE'
+                """
+                rows2 = session.execute(text(sql), {"ids": tuple(ids)}).mappings().all()
+                by_id = {int(r["item_id"]): dict(r) for r in rows2}
+                return [by_id[i] for i in ids if i in by_id]
+            except Exception:
+                # Fallback to LIKE search
+                qq = f"%{q}%"
+                sql = f"""
+                SELECT
+                  i.id            AS item_id,
+                  i.document_id   AS document_id,
+                  i.line_no       AS line_no,
+                  i.name          AS item_name,
+                  i.quantity      AS quantity,
+                  i.vat_rate      AS vat_rate,
+                  i.line_total    AS line_total,
+                  d.issue_date    AS issue_date,
+                  d.total_with_vat AS doc_total_with_vat,
+                  d.doc_number    AS doc_number,
+                  d.supplier_ico  AS supplier_ico,
+                  s.name          AS supplier_name,
+                  f.current_path  AS current_path
+                FROM items i
+                JOIN documents d ON d.id = i.document_id
+                JOIN files f ON f.id = d.file_id
+                LEFT JOIN suppliers s ON s.id = d.supplier_id
+                WHERE f.status != 'QUARANTINE'
+                  AND (i.name LIKE :qq OR d.supplier_ico LIKE :qq OR d.doc_number LIKE :qq)
+                ORDER BY d.issue_date DESC NULLS LAST, d.id DESC, i.line_no ASC
+                {lim_sql}
+                """
+                params2 = dict(params)
+                params2["qq"] = qq
+                return [dict(r) for r in session.execute(text(sql), params2).mappings().all()]
+
+        sql = f"""
+        SELECT
+          i.id            AS item_id,
+          i.document_id   AS document_id,
+          i.line_no       AS line_no,
+          i.name          AS item_name,
+          i.quantity      AS quantity,
+          i.vat_rate      AS vat_rate,
+          i.line_total    AS line_total,
+          d.issue_date    AS issue_date,
+          d.total_with_vat AS doc_total_with_vat,
+          d.doc_number    AS doc_number,
+          d.supplier_ico  AS supplier_ico,
+          s.name          AS supplier_name,
+          f.current_path  AS current_path
+        FROM items i
+        JOIN documents d ON d.id = i.document_id
+        JOIN files f ON f.id = d.file_id
+        LEFT JOIN suppliers s ON s.id = d.supplier_id
+        WHERE f.status != 'QUARANTINE'
+        ORDER BY d.issue_date DESC NULLS LAST, d.id DESC, i.line_no ASC
+        {lim_sql}
+        """
+        return [dict(r) for r in session.execute(text(sql), params).mappings().all()]
+    except OperationalError:
+        # DB not initialized yet; avoid breaking GUI.
+        return []
 
 
 def service_jobs(session: Session, limit: int = 200) -> List[ImportJob]:

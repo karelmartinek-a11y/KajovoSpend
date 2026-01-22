@@ -157,6 +157,27 @@ def rebuild_fts_for_document(session: Session, doc_id: int, full_text: str) -> N
     for it in items:
         session.execute(text("INSERT INTO items_fts(document_id, item_name) VALUES(:id,:name)"), {"id": doc_id, "name": it.name})
 
+    # Optional richer FTS for per-item search (used by UI tab "POLOŽKY").
+    # Keep backward compatibility with DBs that don't have items_fts2.
+    try:
+        session.execute(text("DELETE FROM items_fts2 WHERE document_id = :id"), {"id": doc_id})
+        for it in items:
+            session.execute(
+                text(
+                    "INSERT INTO items_fts2(item_id, document_id, item_name, supplier_ico, doc_number) "
+                    "VALUES(:iid,:did,:name,:ico,:dn)"
+                ),
+                {
+                    "iid": int(it.id),
+                    "did": int(doc_id),
+                    "name": it.name or "",
+                    "ico": row.supplier_ico or "",
+                    "dn": row.doc_number or "",
+                },
+            )
+    except Exception:
+        pass
+
 
 def update_service_state(session: Session, **kwargs) -> None:
     s = session.get(ServiceState, 1)
