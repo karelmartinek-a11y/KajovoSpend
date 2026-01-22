@@ -88,6 +88,14 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
                     {"n": norm, "id": rid},
                 )
 
+        # documents: newly added paging metadata
+        cols_docs = con.execute(text("PRAGMA table_info('documents')")).fetchall()
+        doc_col_names = {row[1] for row in cols_docs}
+        if "page_from" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN page_from INTEGER DEFAULT 1"))
+        if "page_to" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN page_to INTEGER"))
+
         # --- indexes (IF NOT EXISTS is safe) ---
         # Supplier fast lookups / joins
         con.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_suppliers_ico_norm ON suppliers(ico_norm)"))
@@ -98,6 +106,7 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_doc_number ON documents(doc_number)"))
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_bank_account ON documents(bank_account)"))
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_requires_review ON documents(requires_review)"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_file_page ON documents(file_id, page_from, page_to)"))
         # Kompozitní index pro business duplicity (IČO + číslo dokladu + datum).
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_dup_key ON documents(supplier_ico, doc_number, issue_date)"))
 
