@@ -1338,11 +1338,13 @@ class MainWindow(QMainWindow):
             return
 
         with self.sf() as session:
-            d = session.get(Document, doc_id)
-            if not d:
+            try:
+                detail = db_api.get_document_detail(session, doc_id)
+                d: Document = detail["doc"]
+                f: DocumentFile = detail["file"]
+                items: List[LineItem] = detail["items"]
+            except Exception:
                 return
-            f = session.get(DocumentFile, d.file_id)
-            items = session.execute(select(LineItem).where(LineItem.document_id == doc_id).order_by(LineItem.line_no.asc())).scalars().all()
 
         src = f.current_path if f else ""
         self.doc_src_line.setText(src or "")
