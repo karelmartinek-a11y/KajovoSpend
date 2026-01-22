@@ -237,7 +237,7 @@ class MainWindow(QMainWindow):
         cfg.setdefault("performance", {})
         return cfg
 
-    def _run_with_busy(self, title: str, message: str, fn, on_done, on_error=None):
+    def _run_with_busy(self, title: str, message: str, fn, on_done, on_error=None, timeout_ms: int | None = None):
         """
         Run fn() in background thread with a modal indeterminate progress dialog.
         """
@@ -255,8 +255,22 @@ class MainWindow(QMainWindow):
         wk = _Worker(fn)
         wk.moveToThread(th)
         th.started.connect(wk.run)
+        completed = False
+        timer = None
+
+        def _finish_once() -> bool:
+            nonlocal completed
+            if completed:
+                return False
+            completed = True
+            return True
 
         def _cleanup():
+            try:
+                if timer is not None:
+                    timer.stop()
+            except Exception:
+                pass
             try:
                 dlg.close()
             except Exception:
@@ -276,6 +290,8 @@ class MainWindow(QMainWindow):
                 pass
 
         def _ok(res):
+            if not _finish_once():
+                return
             _cleanup()
             try:
                 on_done(res)
@@ -283,6 +299,8 @@ class MainWindow(QMainWindow):
                 self.log.exception("UI on_done handler failed")
 
         def _err(msg: str):
+            if not _finish_once():
+                return
             _cleanup()
             if on_error:
                 try:
@@ -297,6 +315,12 @@ class MainWindow(QMainWindow):
 
         self._threads.append(th)
         th.start()
+
+        if timeout_ms is not None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: _err("Operace překročila časový limit."))
+            timer.start(int(timeout_ms))
 
     def _load_logo_pixmap(self) -> Optional[QPixmap]:
         # Prefer a dedicated logo if present, fallback to app.ico.
@@ -965,7 +989,7 @@ class MainWindow(QMainWindow):
             self.refresh_suppliers()
             self._select_supplier_in_table(sid_loc)
 
-        self._run_with_busy("ARES", "Načítám data z ARES…", work, done)
+        self._run_with_busy("ARES", "Načítám data z ARES…", work, done, timeout_ms=20000)
 
     def on_edit_supplier(self):
         sid = self._selected_supplier_id()

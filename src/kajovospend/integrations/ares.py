@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import logging
+import socket
 from dataclasses import dataclass, field
 import re
 from typing import Optional
@@ -63,6 +63,18 @@ def _compose_address(
     return ", ".join(parts) if parts else None
 
 
+def _compose_delivery_address(addr: Optional[dict]) -> Optional[str]:
+    if not isinstance(addr, dict):
+        return None
+    lines = [
+        (addr.get("radekAdresy1") or "").strip(),
+        (addr.get("radekAdresy2") or "").strip(),
+        (addr.get("radekAdresy3") or "").strip(),
+    ]
+    lines = [l for l in lines if l]
+    return ", ".join(lines) if lines else None
+
+
 def normalize_ico(ico: str) -> str:
     """
     Normalizuje IČO do kanonického tvaru:
@@ -99,9 +111,12 @@ def fetch_by_ico(
 
     url = f"{_ARES_BASE_URL}/ekonomicke-subjekty/{ico_norm}"
     try:
+        start = dt.datetime.utcnow()
+        prev_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(timeout)
         resp = requests.get(
             url,
-            timeout=timeout,
+            timeout=(min(timeout, 5), timeout),
             headers={
                 "Accept": "application/json",
                 "User-Agent": "KajovoSpend/0.1 (ARES client)",
@@ -111,6 +126,16 @@ def fetch_by_ico(
         obj = resp.json()
     except Exception as e:
         raise AresError(f"Nepodařilo se načíst ARES pro IČO {ico_norm}: {e}") from e
+    finally:
+        try:
+            socket.setdefaulttimeout(prev_timeout)
+        except Exception:
+            pass
+        try:
+            elapsed = (dt.datetime.utcnow() - start).total_seconds()
+            log.debug("ares-fetch", extra={"ico": ico_norm, "seconds": elapsed})
+        except Exception:
+            pass
 
     # name & identifiers
     name = obj.get("obchodniJmeno") or obj.get("nazev")
@@ -162,8 +187,8 @@ def fetch_by_ico(
     city = adr.get("nazevObce") or adr.get("obec") or None
     zip_code = str(adr.get("psc") or "") or None
 
-    address = None
-    if isinstance(adr.get("textovaAdresa"), str) and adr.get("textovaAdresa").strip():
+    address = _compose_delivery_address(obj.get("adresaDorucovaci"))
+    if not address and isinstance(adr.get("textovaAdresa"), str) and adr.get("textovaAdresa").strip():
         address = adr.get("textovaAdresa").strip()
     if not address:
         address = _compose_address(street, street_number, orientation_number, city, zip_code)
