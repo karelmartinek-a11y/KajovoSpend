@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import datetime as dt
 import os
-import queue
 import subprocess
 import sys
-import multiprocessing as mp
 from io import BytesIO
 from pathlib import Path
+import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl
@@ -29,7 +28,7 @@ from kajovospend.utils.logging_setup import setup_logging
 from kajovospend.db.session import make_engine, make_session_factory
 from kajovospend.db.migrate import init_db
 from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem
-from kajovospend.db.queries import upsert_supplier
+from kajovospend.db.queries import upsert_supplier, rebuild_fts_for_document
 from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
 from kajovospend.integrations.openai_fallback import list_models
 from kajovospend.service.control_client import send_cmd
@@ -93,6 +92,11 @@ class TableModel(QAbstractTableModel):
         self.headers = headers
         self.rows = rows
 
+    def flags(self, index: QModelIndex):
+        if not index.isValid():
+            return Qt.NoItemFlags
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return len(self.rows)
 
@@ -116,6 +120,133 @@ class TableModel(QAbstractTableModel):
             if 0 <= section < len(self.headers):
                 return self.headers[section]
         return str(section + 1)
+
+
+class EditableItemsModel(QAbstractTableModel):
+    """
+    Editovatelný model položek (LineItem) – používá se pro ÚČTY i NEROZPOZNANÉ.
+    Udržuje i interní ID položky, aby šlo ukládat změny zpět do DB.
+    """
+
+    COLS = [
+        ("name", "Položka"),
+        ("quantity", "Množství"),
+        ("unit_price", "Jedn. cena"),
+        ("line_total", "Celkem"),
+        ("vat_rate", "DPH %"),
+        ("ean", "EAN"),
+        ("item_code", "Kód položky"),
+    ]
+
+    def __init__(self, rows: List[Dict[str, Any]] | None = None):
+        super().__init__()
+        self._rows: List[Dict[str, Any]] = rows or []
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return len(self._rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return len(self.COLS)
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            if 0 <= section < len(self.COLS):
+                return self.COLS[section][1]
+        return str(section + 1)
+
+    def flags(self, index: QModelIndex):
+        if not index.isValid():
+            return Qt.ItemIsEnabled
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+
+    def _fmt(self, v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float):
+            return f"{v:,.2f}".replace(",", " ")
+        return str(v)
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        key = self.COLS[index.column()][0]
+        row = self._rows[index.row()]
+        v = row.get(key)
+        if role == Qt.DisplayRole:
+            return self._fmt(v)
+        if role == Qt.EditRole:
+            # pro editování vrať raw hodnotu (bez formátování)
+            return "" if v is None else v
+        return None
+
+    def setData(self, index: QModelIndex, value: Any, role: int = Qt.EditRole) -> bool:
+        if role != Qt.EditRole or not index.isValid():
+            return False
+        key = self.COLS[index.column()][0]
+        row = self._rows[index.row()]
+
+        def _to_float(x):
+            if x is None:
+                return 0.0
+            if isinstance(x, (int, float)):
+                return float(x)
+            s = str(x).strip().replace(" ", "").replace(",", ".")
+            if not s:
+                return 0.0
+            try:
+                return float(s)
+            except Exception:
+                return 0.0
+
+        if key in ("quantity", "unit_price", "line_total", "vat_rate"):
+            row[key] = _to_float(value)
+            # pokud uživatel mění qty nebo unit_price a line_total je 0, dopočti
+            if key in ("quantity", "unit_price"):
+                q = float(row.get("quantity") or 0.0)
+                up = float(row.get("unit_price") or 0.0)
+                if (row.get("line_total") in (None, 0, 0.0)) and (q or up):
+                    row["line_total"] = q * up
+        else:
+            row[key] = ("" if value is None else str(value)).strip()
+
+        self._rows[index.row()] = row
+        self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
+        return True
+
+    def insertRows(self, row: int, count: int, parent: QModelIndex = QModelIndex()) -> bool:
+        if count <= 0:
+            return False
+        self.beginInsertRows(QModelIndex(), row, row + count - 1)
+        for _ in range(count):
+            self._rows.insert(
+                row,
+                {
+                    "id": None,
+                    "name": "",
+                    "quantity": 1.0,
+                    "unit_price": 0.0,
+                    "line_total": 0.0,
+                    "vat_rate": 0.0,
+                    "ean": "",
+                    "item_code": "",
+                },
+            )
+        self.endInsertRows()
+        return True
+
+    def removeRows(self, row: int, count: int, parent: QModelIndex = QModelIndex()) -> bool:
+        if count <= 0 or row < 0 or row >= len(self._rows):
+            return False
+        last = min(row + count - 1, len(self._rows) - 1)
+        self.beginRemoveRows(QModelIndex(), row, last)
+        del self._rows[row:last + 1]
+        self.endRemoveRows()
+        return True
+
+    def rows(self) -> List[Dict[str, Any]]:
+        return list(self._rows)
 
 
 def pil_to_pixmap(img) -> QPixmap:
@@ -263,6 +394,16 @@ class MainWindow(QMainWindow):
         self._preview_cache: Dict[Tuple[str, int], QPixmap] = {}
         self._preview_dpi = int(self.cfg.get("performance", {}).get("preview_dpi", 120) or 120)
 
+        # current selections (ÚČTY / NEROZPOZNANÉ)
+        self._current_doc_id: int | None = None
+        self._current_doc_file_id: int | None = None
+        self._current_doc_path: str | None = None
+        self._current_doc_items_model: EditableItemsModel | None = None
+        self._current_unrec_doc_id: int | None = None
+        self._current_unrec_file_id: int | None = None
+        self._current_unrec_path: str | None = None
+        self._current_unrec_items_model: EditableItemsModel | None = None
+
         self.paths = resolve_app_paths(
             self.cfg["app"].get("data_dir"),
             self.cfg["app"].get("db_path"),
@@ -284,7 +425,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._wire_timers()
-        self.refresh_all()
+        self.refresh_all_v2()
 
     def _load_or_create_config(self) -> Dict[str, Any]:
         if self.config_path.exists():
@@ -709,6 +850,19 @@ class MainWindow(QMainWindow):
         self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         rl.addWidget(self.items_table, 2)
 
+        items_bar = QWidget()
+        ib = QHBoxLayout(items_bar); ib.setContentsMargins(0, 0, 0, 0)
+        self.btn_items_add = QPushButton("Přidat položku")
+        self.btn_items_del = QPushButton("Smazat položku")
+        self.btn_items_save = QPushButton("Uložit změny")
+        for b in (self.btn_items_add, self.btn_items_del, self.btn_items_save):
+            b.setEnabled(False)
+        ib.addWidget(self.btn_items_add)
+        ib.addWidget(self.btn_items_del)
+        ib.addStretch(1)
+        ib.addWidget(self.btn_items_save)
+        rl.addWidget(items_bar)
+
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
@@ -718,27 +872,79 @@ class MainWindow(QMainWindow):
         # Nerozpoznané
         self.tab_unrec = QWidget()
         ul = QVBoxLayout(self.tab_unrec)
+
+        split_u = QSplitter()
+        split_u.setOrientation(Qt.Horizontal)
+
+        # Left: seznam + editace hlavičky (IČO/…)
+        left_u = QWidget(); lul = QVBoxLayout(left_u)
         self.unrec_table = QTableView()
         self.unrec_table.setAlternatingRowColors(True)
         self.unrec_table.setShowGrid(True)
         self.unrec_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.unrec_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.unrec_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        ul.addWidget(self.unrec_table, 2)
+        lul.addWidget(self.unrec_table, 2)
 
         editor = QWidget(); el = QFormLayout(editor)
-        self.ed_u_ico = QLineEdit(); self.ed_u_docno = QLineEdit(); self.ed_u_bank = QLineEdit()
+        self.ed_u_ico = QLineEdit()
+        self.btn_u_apply_ico = QPushButton("Načíst z ARES")
+        ico_row_u = QWidget(); ico_l = QHBoxLayout(ico_row_u); ico_l.setContentsMargins(0, 0, 0, 0)
+        ico_l.addWidget(self.ed_u_ico, 1)
+        ico_l.addWidget(self.btn_u_apply_ico)
+
+        self.ed_u_docno = QLineEdit()
+        self.ed_u_bank = QLineEdit()
         self.ed_u_date = QDateEdit(); self.ed_u_date.setCalendarPopup(True); self.ed_u_date.setDisplayFormat("dd.MM.yyyy")
         self.ed_u_total = QDoubleSpinBox(); self.ed_u_total.setMaximum(1e12); self.ed_u_total.setDecimals(2)
-        self.btn_u_save = QPushButton("Uložit a vyjmout z karantény")
-        el.addRow("IČO", self.ed_u_ico)
+        self.btn_u_save = QPushButton("Uložit jako hotové (vyjmout z karantény)")
+        self.btn_u_save.setEnabled(False)
+
+        el.addRow("IČO", ico_row_u)
         el.addRow("Číslo dokladu", self.ed_u_docno)
         el.addRow("Číslo účtu", self.ed_u_bank)
         el.addRow("Datum vystavení", self.ed_u_date)
         el.addRow("Cena celkem vč. DPH", self.ed_u_total)
         el.addRow(self.btn_u_save)
+        lul.addWidget(editor, 1)
 
-        ul.addWidget(editor, 1)
+        split_u.addWidget(left_u)
+
+        # Right: náhled + položky
+        right_u = QWidget(); rul = QVBoxLayout(right_u)
+        srcrow_u = QWidget(); sur = QHBoxLayout(srcrow_u); sur.setContentsMargins(0, 0, 0, 0)
+        self.doc_src_line_u = QLineEdit(); self.doc_src_line_u.setReadOnly(True)
+        self.btn_open_source_u = QPushButton("Otevřít soubor")
+        self.btn_zoom_in_u = QPushButton("+"); self.btn_zoom_out_u = QPushButton("-"); self.btn_zoom_reset_u = QPushButton("Fit")
+        sur.addWidget(QLabel("Zdroj:")); sur.addWidget(self.doc_src_line_u, 1); sur.addWidget(self.btn_open_source_u)
+        sur.addWidget(self.btn_zoom_in_u); sur.addWidget(self.btn_zoom_out_u); sur.addWidget(self.btn_zoom_reset_u)
+        rul.addWidget(srcrow_u)
+
+        self.preview_view_u = PdfPreviewView()
+        rul.addWidget(self.preview_view_u, 3)
+
+        self.items_table_u = QTableView()
+        self.items_table_u.setAlternatingRowColors(True)
+        self.items_table_u.setShowGrid(True)
+        self.items_table_u.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.items_table_u.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        rul.addWidget(self.items_table_u, 2)
+
+        items_bar_u = QWidget()
+        iub = QHBoxLayout(items_bar_u); iub.setContentsMargins(0, 0, 0, 0)
+        self.btn_u_item_add = QPushButton("Přidat položku")
+        self.btn_u_item_del = QPushButton("Smazat položku")
+        for b in (self.btn_u_item_add, self.btn_u_item_del):
+            b.setEnabled(False)
+        iub.addWidget(self.btn_u_item_add)
+        iub.addWidget(self.btn_u_item_del)
+        iub.addStretch(1)
+        rul.addWidget(items_bar_u)
+
+        split_u.addWidget(right_u)
+        split_u.setStretchFactor(0, 2)
+        split_u.setStretchFactor(1, 3)
+        ul.addWidget(split_u, 1)
         self.tabs.addTab(self.tab_unrec, "NEROZPOZNANÉ")
 
         self.setCentralWidget(root)
@@ -765,24 +971,43 @@ class MainWindow(QMainWindow):
         self.btn_sup_ares_detail.clicked.connect(self.on_supplier_ares)
         self.sup_table.clicked.connect(self.on_supplier_selected)
 
-        self.doc_filter.returnPressed.connect(self._docs_new_search)
-        self.btn_docs_search.clicked.connect(self._docs_new_search)
-        self.btn_docs_more.clicked.connect(self._docs_load_more)
-        self.cb_all_dates.stateChanged.connect(self._docs_new_search)
-        self.docs_table.clicked.connect(self._on_doc_selected_fast)
-        self.btn_open_source.clicked.connect(self._open_selected_source)
+        # ÚČTY – nová logika (plně editovatelný detail položek)
+        self.doc_filter.returnPressed.connect(self._docs_new_search_v2)
+        self.btn_docs_search.clicked.connect(self._docs_new_search_v2)
+        self.btn_docs_more.clicked.connect(self._docs_load_more_v2)
+        self.cb_all_dates.stateChanged.connect(self._docs_new_search_v2)
+        self.docs_table.clicked.connect(self._on_doc_selected_v2)
+        self.btn_open_source.clicked.connect(self._open_selected_source_v2)
         self.btn_zoom_in.clicked.connect(self.preview_view.zoom_in)
         self.btn_zoom_out.clicked.connect(self.preview_view.zoom_out)
         self.btn_zoom_reset.clicked.connect(self.preview_view.reset_zoom)
 
-        self.unrec_table.clicked.connect(self.on_unrec_selected)
-        self.btn_u_save.clicked.connect(self.on_unrec_save)
+        self.btn_items_add.clicked.connect(self._docs_item_add_v2)
+        self.btn_items_del.clicked.connect(self._docs_item_del_v2)
+        self.btn_items_save.clicked.connect(self._docs_items_save_v2)
+
+        # NEROZPOZNANÉ – stejná struktura + ruční dopisování položek + dodavatel podle IČO
+        self.unrec_table.clicked.connect(self._on_unrec_selected_v2)
+        self.btn_u_apply_ico.clicked.connect(self._unrec_apply_ico_v2)
+        self.btn_u_save.clicked.connect(self._unrec_save_done_v2)
+        self.btn_open_source_u.clicked.connect(self._open_selected_unrec_source_v2)
+        self.btn_zoom_in_u.clicked.connect(self.preview_view_u.zoom_in)
+        self.btn_zoom_out_u.clicked.connect(self.preview_view_u.zoom_out)
+        self.btn_zoom_reset_u.clicked.connect(self.preview_view_u.reset_zoom)
+        self.btn_u_item_add.clicked.connect(self._unrec_item_add_v2)
+        self.btn_u_item_del.clicked.connect(self._unrec_item_del_v2)
 
     def _wire_timers(self):
         self.timer = QTimer(self)
-        self.timer.setInterval(1500)
-        self.timer.timeout.connect(self.refresh_dashboard)
+        self.timer.setInterval(int(self.cfg.get("performance", {}).get("ui_refresh_ms") or 1000))
+        self.timer.timeout.connect(self._refresh_from_queue)
         self.timer.start()
+
+    def _refresh_from_queue(self):
+        try:
+            self.refresh_dashboard()
+        except Exception:
+            pass
 
     def _pick_dir(self, line_edit: QLineEdit):
         d = QFileDialog.getExistingDirectory(self, "Vyber adresář", line_edit.text() or str(Path.home()))
@@ -797,47 +1022,631 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    # ---------------------------
+    # V2: ÚČTY + NEROZPOZNANÉ
+    # ---------------------------
+
+    def refresh_all_v2(self) -> None:
+        # zachovej dashboard a dodavatele (pokud existují původní metody), ale listy účtů řídí V2
+        try:
+            self.refresh_dashboard()
+        except Exception:
+            pass
+        try:
+            self.refresh_suppliers()
+        except Exception:
+            pass
+        self._docs_new_search_v2()
+        self._refresh_unrec_v2()
+
+    def _safe_unique_path(self, target: Path) -> Path:
+        if not target.exists():
+            return target
+        stem = target.stem
+        suf = target.suffix
+        parent = target.parent
+        for i in range(1, 10_000):
+            cand = parent / f"{stem}_{i}{suf}"
+            if not cand.exists():
+                return cand
+        return parent / f"{stem}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}{suf}"
+
+    def _load_preview(self, view: PdfPreviewView, path_str: str | None) -> None:
+        view.clear()
+        if not path_str:
+            return
+        p = Path(path_str)
+        if not p.exists():
+            return
+        try:
+            if p.suffix.lower() == ".pdf":
+                key = (str(p), int(self._preview_dpi))
+                px = self._preview_cache.get(key)
+                if px is None:
+                    raw = self._render_pdf_preview_bytes(p, dpi=int(self._preview_dpi))
+                    if not raw:
+                        return
+                    img = QImage.fromData(raw, "PNG")
+                    px = QPixmap.fromImage(img)
+                    self._preview_cache[key] = px
+                view.set_pixmap(px)
+            else:
+                px = QPixmap(str(p))
+                if not px.isNull():
+                    view.set_pixmap(px)
+        except Exception:
+            # preview error: do not crash GUI
+            self.log.exception("Preview load failed for %s", p)
+
+    def _open_file_path(self, path_str: str | None) -> None:
+        if not path_str:
+            return
+        p = Path(path_str)
+        if not p.exists():
+            QMessageBox.warning(self, "Soubor", "Soubor neexistuje.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+
+    # ---- ÚČTY (listing + detail) ----
+
+    def _docs_new_search_v2(self) -> None:
+        self._doc_offset = 0
+        self._toggle_doc_dates(bool(self.cb_all_dates.isChecked()))
+        self._load_docs_page_v2(reset=True)
+
+    def _docs_load_more_v2(self) -> None:
+        self._load_docs_page_v2(reset=False)
+
+    def _load_docs_page_v2(self, *, reset: bool) -> None:
+        q = (self.doc_filter.text() or "").strip()
+        date_from = None
+        date_to = None
+        if not self.cb_all_dates.isChecked():
+            try:
+                date_from = self.doc_date_from.date().toPython()
+                date_to = self.doc_date_to.date().toPython()
+            except Exception:
+                date_from = None
+                date_to = None
+
+        with self.sf() as session:
+            self._doc_total = db_api.count_documents(session, q=q, date_from=date_from, date_to=date_to)
+            rows = db_api.list_documents(
+                session,
+                q=q,
+                date_from=date_from,
+                date_to=date_to,
+                limit=int(self._doc_page_size),
+                offset=int(self._doc_offset),
+            )
+
+            if reset:
+                self._docs_listing: List[Dict[str, Any]] = []
+            if not hasattr(self, "_docs_listing"):
+                self._docs_listing = []
+
+            doc_ids = [int(d.id) for d, _f in rows]
+            # counts items per doc
+            counts = {}
+            if doc_ids:
+                for did, c in session.execute(
+                    select(LineItem.document_id, text("COUNT(*)")).where(LineItem.document_id.in_(doc_ids)).group_by(LineItem.document_id)
+                ).all():
+                    counts[int(did)] = int(c)
+            # supplier names
+            sup_ids = list({int(d.supplier_id) for d, _f in rows if d.supplier_id})
+            sup_names: Dict[int, str] = {}
+            if sup_ids:
+                for s in session.execute(select(Supplier).where(Supplier.id.in_(sup_ids))).scalars().all():
+                    sup_names[int(s.id)] = (s.name or s.ico or "").strip()
+
+            for d, f in rows:
+                did = int(d.id)
+                self._docs_listing.append(
+                    {
+                        "doc_id": did,
+                        "file_id": int(f.id),
+                        "path": f.current_path,
+                        "date": d.issue_date.isoformat() if d.issue_date else "",
+                        "total": float(d.total_with_vat or 0.0) if d.total_with_vat is not None else 0.0,
+                        "supplier": (sup_names.get(int(d.supplier_id)) if d.supplier_id else "") or (d.supplier_ico or "") or "",
+                        "items_count": counts.get(did, 0),
+                        "status": f.status or "",
+                    }
+                )
+
+        # render table
+        headers = ["Datum", "Celkem vč. DPH", "Dodavatel", "Počet položek", "Stav"]
+        trows = [[r["date"], r["total"], r["supplier"], r["items_count"], r["status"]] for r in self._docs_listing]
+        self.docs_table.setModel(TableModel(headers, trows))
+        self._doc_offset = len(self._docs_listing)
+        self.lbl_docs_page.setText(f"{self._doc_offset} / {self._doc_total}")
+
+        # enable/disable "more"
+        self.btn_docs_more.setEnabled(self._doc_offset < self._doc_total)
+
+        # auto-select first row on reset and hook selection change
+        try:
+            sm = self.docs_table.selectionModel()
+            if sm:
+                sm.selectionChanged.connect(lambda *_: self._on_doc_selected_v2(sm.currentIndex()))
+            if reset and self._docs_listing:
+                idx = self.docs_table.model().index(0, 0)
+                self.docs_table.setCurrentIndex(idx)
+                self.docs_table.selectRow(0)
+                self._on_doc_selected_v2(idx)
+        except Exception:
+            pass
+
+    def _on_doc_selected_v2(self, index: QModelIndex) -> None:
+        try:
+            row = int(index.row())
+        except Exception:
+            return
+        if not hasattr(self, "_docs_listing") or row < 0 or row >= len(self._docs_listing):
+            return
+        meta = self._docs_listing[row]
+        doc_id = int(meta["doc_id"])
+        with self.sf() as session:
+            det = db_api.get_document_detail(session, doc_id)
+            doc: Document = det["doc"]
+            f: DocumentFile = det["file"]
+            items: List[LineItem] = det["items"]
+
+        self._current_doc_id = int(doc.id)
+        self._current_doc_file_id = int(f.id) if f else None
+        self._current_doc_path = f.current_path if f else None
+        self.doc_src_line.setText(self._current_doc_path or "")
+
+        rows = []
+        for it in items:
+            qty_val = float(it.quantity or 0.0)
+            denom = qty_val if qty_val else 1.0
+            try:
+                unit_price_val = float(getattr(it, "unit_price", None) or (float(it.line_total or 0.0) / denom))
+            except Exception:
+                unit_price_val = 0.0
+            rows.append(
+                {
+                    "id": int(it.id),
+                    "name": it.name or "",
+                    "quantity": float(it.quantity or 0.0),
+                    "unit_price": unit_price_val,
+                    "line_total": float(it.line_total or 0.0),
+                    "vat_rate": float(it.vat_rate or 0.0),
+                    "ean": getattr(it, "ean", "") or "",
+                    "item_code": getattr(it, "item_code", "") or "",
+                }
+            )
+        model = EditableItemsModel(rows)
+        self._current_doc_items_model = model
+        self.items_table.setModel(model)
+        self.items_table.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        for b in (self.btn_items_add, self.btn_items_del, self.btn_items_save):
+            b.setEnabled(True)
+
+        # load preview after table is ready to avoid blocking UI
+        QTimer.singleShot(0, lambda: self._load_preview(self.preview_view, self._current_doc_path))
+
+    def _open_selected_source_v2(self) -> None:
+        self._open_file_path(self._current_doc_path)
+
+    def _docs_item_add_v2(self) -> None:
+        if not self._current_doc_items_model:
+            return
+        self._current_doc_items_model.insertRows(self._current_doc_items_model.rowCount(), 1)
+
+    def _docs_item_del_v2(self) -> None:
+        if not self._current_doc_items_model:
+            return
+        sel = self.items_table.selectionModel()
+        if not sel or not sel.hasSelection():
+            return
+        row = int(sel.selectedRows()[0].row())
+        self._current_doc_items_model.removeRows(row, 1)
+
+    def _docs_items_save_v2(self) -> None:
+        if not self._current_doc_id or not self._current_doc_items_model:
+            return
+        doc_id = int(self._current_doc_id)
+        rows = self._current_doc_items_model.rows()
+        with self.sf() as session:
+            doc = session.get(Document, doc_id)
+            if not doc:
+                return
+            existing = {int(it.id): it for it in session.execute(select(LineItem).where(LineItem.document_id == doc_id)).scalars().all()}
+
+            # update + create
+            new_items: List[LineItem] = []
+            line_no = 1
+            total_sum = 0.0
+            keep_ids = set()
+            for r in rows:
+                rid = r.get("id")
+                name = (r.get("name") or "").strip()
+                if not name:
+                    name = f"Položka {line_no}"
+                qty = float(r.get("quantity") or 0.0)
+                up = float(r.get("unit_price") or 0.0)
+                lt = float(r.get("line_total") or 0.0)
+                if not lt and (qty or up):
+                    lt = qty * up
+                vr = float(r.get("vat_rate") or 0.0)
+                ean = (r.get("ean") or "").strip() or None
+                code = (r.get("item_code") or "").strip() or None
+                total_sum += float(lt or 0.0)
+
+                if rid and int(rid) in existing:
+                    it = existing[int(rid)]
+                    it.line_no = line_no
+                    it.name = name[:512]
+                    it.quantity = qty
+                    it.line_total = lt
+                    it.vat_rate = vr
+                    if hasattr(it, "ean"):
+                        it.ean = ean
+                    if hasattr(it, "item_code"):
+                        it.item_code = code
+                    session.add(it)
+                    keep_ids.add(int(it.id))
+                else:
+                    it = LineItem(
+                        document_id=doc_id,
+                        line_no=line_no,
+                        name=name[:512],
+                        quantity=qty,
+                        line_total=lt,
+                        vat_rate=vr,
+                    )
+                    if hasattr(it, "ean"):
+                        it.ean = ean
+                    if hasattr(it, "item_code"):
+                        it.item_code = code
+                    session.add(it)
+                    new_items.append(it)
+                line_no += 1
+
+            # delete removed
+            for it_id, it in existing.items():
+                if it_id not in keep_ids:
+                    session.delete(it)
+
+            # update total (volitelně)
+            if total_sum and (doc.total_with_vat is None or abs(float(doc.total_with_vat or 0.0) - total_sum) > 0.01):
+                doc.total_with_vat = float(total_sum)
+                session.add(doc)
+
+            session.flush()
+            # rebuild FTS (text = položky)
+            full_text = "\n".join([(r.get("name") or "").strip() for r in rows if (r.get("name") or "").strip()])
+            rebuild_fts_for_document(session, doc_id, full_text=full_text)
+            session.commit()
+
+        QMessageBox.information(self, "Účty", "Položky byly uloženy.")
+        self._docs_new_search_v2()
+
+    # ---- NEROZPOZNANÉ ----
+
+    def _refresh_unrec_v2(self) -> None:
+        with self.sf() as session:
+            rows = db_api.list_quarantine(session)
+            doc_ids = [int(d.id) for d, _f in rows]
+            counts = {}
+            if doc_ids:
+                for did, c in session.execute(
+                    select(LineItem.document_id, text("COUNT(*)")).where(LineItem.document_id.in_(doc_ids)).group_by(LineItem.document_id)
+                ).all():
+                    counts[int(did)] = int(c)
+
+        self._unrec_listing: List[Dict[str, Any]] = []
+        for d, f in rows:
+            did = int(d.id)
+            self._unrec_listing.append(
+                {
+                    "doc_id": did,
+                    "file_id": int(f.id),
+                    "path": f.current_path,
+                    "date": d.issue_date.isoformat() if d.issue_date else "",
+                    "total": float(d.total_with_vat or 0.0) if d.total_with_vat is not None else 0.0,
+                    "supplier_ico": (d.supplier_ico or "") or "",
+                    "items_count": counts.get(did, 0),
+                    "status": f.status or "",
+                }
+            )
+
+        headers = ["Datum", "Celkem vč. DPH", "Dodavatel (IČO)", "Počet položek", "Stav"]
+        trows = [[r["date"], r["total"], r["supplier_ico"], r["items_count"], r["status"]] for r in self._unrec_listing]
+        self.unrec_table.setModel(TableModel(headers, trows))
+
+        # clear detail
+        self._current_unrec_doc_id = None
+        self._current_unrec_file_id = None
+        self._current_unrec_path = None
+        self._current_unrec_items_model = None
+        self.doc_src_line_u.setText("")
+        self.preview_view_u.clear()
+        self.items_table_u.setModel(TableModel([], []))
+        self.btn_u_save.setEnabled(False)
+        for b in (self.btn_u_item_add, self.btn_u_item_del):
+            b.setEnabled(False)
+
+        # auto-select first row and hook selection change
+        try:
+            sm = self.unrec_table.selectionModel()
+            if sm:
+                sm.selectionChanged.connect(lambda *_: self._on_unrec_selected_v2(sm.currentIndex()))
+            if self._unrec_listing:
+                idx = self.unrec_table.model().index(0, 0)
+                self.unrec_table.setCurrentIndex(idx)
+                self.unrec_table.selectRow(0)
+                self._on_unrec_selected_v2(idx)
+        except Exception:
+            pass
+
+    def _on_unrec_selected_v2(self, index: QModelIndex) -> None:
+        try:
+            row = int(index.row())
+        except Exception:
+            return
+        if not hasattr(self, "_unrec_listing") or row < 0 or row >= len(self._unrec_listing):
+            return
+        meta = self._unrec_listing[row]
+        doc_id = int(meta["doc_id"])
+        with self.sf() as session:
+            det = db_api.get_document_detail(session, doc_id)
+            doc: Document = det["doc"]
+            f: DocumentFile = det["file"]
+            items: List[LineItem] = det["items"]
+
+        self._current_unrec_doc_id = int(doc.id)
+        self._current_unrec_file_id = int(f.id) if f else None
+        self._current_unrec_path = f.current_path if f else None
+
+        # fill header fields (jen co se povedlo vytěžit)
+        self.ed_u_ico.setText(doc.supplier_ico or "")
+        self.ed_u_docno.setText(doc.doc_number or "")
+        self.ed_u_bank.setText(doc.bank_account or "")
+        if doc.issue_date:
+            try:
+                self.ed_u_date.setDate(doc.issue_date)
+            except Exception:
+                pass
+        self.ed_u_total.setValue(float(doc.total_with_vat or 0.0))
+
+        self.doc_src_line_u.setText(self._current_unrec_path or "")
+
+        rows = []
+        for it in items:
+            qty_val = float(it.quantity or 0.0)
+            denom = qty_val if qty_val else 1.0
+            try:
+                unit_price_val = float(getattr(it, "unit_price", None) or (float(it.line_total or 0.0) / denom))
+            except Exception:
+                unit_price_val = 0.0
+            rows.append(
+                {
+                    "id": int(it.id),
+                    "name": it.name or "",
+                    "quantity": float(it.quantity or 0.0),
+                    "unit_price": unit_price_val,
+                    "line_total": float(it.line_total or 0.0),
+                    "vat_rate": float(it.vat_rate or 0.0),
+                    "ean": getattr(it, "ean", "") or "",
+                    "item_code": getattr(it, "item_code", "") or "",
+                }
+            )
+        model = EditableItemsModel(rows)
+        self._current_unrec_items_model = model
+        self.items_table_u.setModel(model)
+        self.items_table_u.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        self.btn_u_save.setEnabled(True)
+        for b in (self.btn_u_item_add, self.btn_u_item_del):
+            b.setEnabled(True)
+
+        QTimer.singleShot(0, lambda: self._load_preview(self.preview_view_u, self._current_unrec_path))
+
+    def _open_selected_unrec_source_v2(self) -> None:
+        self._open_file_path(self._current_unrec_path)
+
+    def _unrec_item_add_v2(self) -> None:
+        if not self._current_unrec_items_model:
+            return
+        self._current_unrec_items_model.insertRows(self._current_unrec_items_model.rowCount(), 1)
+
+    def _unrec_item_del_v2(self) -> None:
+        if not self._current_unrec_items_model:
+            return
+        sel = self.items_table_u.selectionModel()
+        if not sel or not sel.hasSelection():
+            return
+        row = int(sel.selectedRows()[0].row())
+        self._current_unrec_items_model.removeRows(row, 1)
+
+    def _unrec_apply_ico_v2(self) -> None:
+        if not self._current_unrec_doc_id:
+            return
+        ico_raw = (self.ed_u_ico.text() or "").strip()
+        if not ico_raw:
+            QMessageBox.warning(self, "Dodavatel", "Zadejte IČO.")
+            return
+        ico = normalize_ico(ico_raw) or ico_raw
+
+        def _fetch():
+            return fetch_by_ico(ico)
+
+        def _apply(data):
+            with self.sf() as session:
+                doc = session.get(Document, int(self._current_unrec_doc_id))
+                if not doc:
+                    return
+                sup = None
+                if data:
+                    sup = upsert_supplier(
+                        session,
+                        ico=ico,
+                        name=data.get("name"),
+                        dic=data.get("dic"),
+                        address=data.get("address"),
+                        is_vat_payer=data.get("is_vat_payer"),
+                        ares_last_sync=dt.datetime.utcnow(),
+                        legal_form=data.get("legal_form"),
+                        street=data.get("street"),
+                        street_number=data.get("street_number"),
+                        orientation_number=data.get("orientation_number"),
+                        city=data.get("city"),
+                        zip_code=data.get("zip_code"),
+                        overwrite=True,
+                    )
+                else:
+                    # minimální založení (pokud ARES nedá data)
+                    sup = upsert_supplier(session, ico=ico, overwrite=False)
+
+                doc.supplier_id = int(sup.id) if sup else None
+                doc.supplier_ico = ico
+                session.add(doc)
+                session.flush()
+
+                full_text = ""
+                try:
+                    if self._current_unrec_items_model:
+                        full_text = "\n".join(
+                            [(r.get("name") or "").strip() for r in self._current_unrec_items_model.rows() if (r.get("name") or "").strip()]
+                        )
+                except Exception:
+                    full_text = ""
+                rebuild_fts_for_document(session, int(doc.id), full_text=full_text)
+                session.commit()
+
+            QMessageBox.information(self, "Dodavatel", "Dodavatel byl aktualizován podle IČO.")
+            self._docs_new_search_v2()
+
+        self._run_with_busy("ARES", "Načítám dodavatele podle IČO…", _fetch, _apply)
+
+    def _unrec_save_done_v2(self) -> None:
+        if not self._current_unrec_doc_id or not self._current_unrec_file_id:
+            return
+        doc_id = int(self._current_unrec_doc_id)
+        file_id = int(self._current_unrec_file_id)
+        rows = self._current_unrec_items_model.rows() if self._current_unrec_items_model else []
+
+        with self.sf() as session:
+            doc = session.get(Document, doc_id)
+            f = session.get(DocumentFile, file_id)
+            if not doc or not f:
+                return
+
+            # update header fields
+            doc.supplier_ico = (normalize_ico((self.ed_u_ico.text() or "").strip()) or (self.ed_u_ico.text() or "").strip()) or None
+            doc.doc_number = (self.ed_u_docno.text() or "").strip() or None
+            doc.bank_account = (self.ed_u_bank.text() or "").strip() or None
+            try:
+                doc.issue_date = self.ed_u_date.date().toPython()
+            except Exception:
+                pass
+            doc.total_with_vat = float(self.ed_u_total.value())
+
+            # items: update/create/delete
+            existing = {int(it.id): it for it in session.execute(select(LineItem).where(LineItem.document_id == doc_id)).scalars().all()}
+            keep_ids = set()
+            line_no = 1
+            total_sum = 0.0
+            for r in rows:
+                rid = r.get("id")
+                name = (r.get("name") or "").strip() or f"Položka {line_no}"
+                qty = float(r.get("quantity") or 0.0)
+                up = float(r.get("unit_price") or 0.0)
+                lt = float(r.get("line_total") or 0.0)
+                if not lt and (qty or up):
+                    lt = qty * up
+                vr = float(r.get("vat_rate") or 0.0)
+                ean = (r.get("ean") or "").strip() or None
+                code = (r.get("item_code") or "").strip() or None
+                total_sum += float(lt or 0.0)
+
+                if rid and int(rid) in existing:
+                    it = existing[int(rid)]
+                    it.line_no = line_no
+                    it.name = name[:512]
+                    it.quantity = qty
+                    it.line_total = lt
+                    it.vat_rate = vr
+                    if hasattr(it, "ean"):
+                        it.ean = ean
+                    if hasattr(it, "item_code"):
+                        it.item_code = code
+                    session.add(it)
+                    keep_ids.add(int(it.id))
+                else:
+                    it = LineItem(
+                        document_id=doc_id,
+                        line_no=line_no,
+                        name=name[:512],
+                        quantity=qty,
+                        line_total=lt,
+                        vat_rate=vr,
+                    )
+                    if hasattr(it, "ean"):
+                        it.ean = ean
+                    if hasattr(it, "item_code"):
+                        it.item_code = code
+                    session.add(it)
+                line_no += 1
+
+            for it_id, it in existing.items():
+                if it_id not in keep_ids:
+                    session.delete(it)
+
+            if total_sum and (doc.total_with_vat is None or abs(float(doc.total_with_vat or 0.0) - total_sum) > 0.01):
+                doc.total_with_vat = float(total_sum)
+
+            session.add(doc)
+            session.flush()
+
+            # rebuild FTS
+            full_text = "\n".join([(r.get("name") or "").strip() for r in rows if (r.get("name") or "").strip()])
+            rebuild_fts_for_document(session, doc_id, full_text=full_text)
+
+            # move file out of quarantine to output_dir
+            src = Path(f.current_path or "")
+            out_dir = Path(self.cfg.get("paths", {}).get("output_dir") or "")
+            if not out_dir:
+                out_dir = self.paths.data_dir / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dst = self._safe_unique_path(out_dir / src.name)
+            try:
+                shutil.move(str(src), str(dst))
+            except Exception as exc:
+                QMessageBox.critical(self, "Karanténa", f"Nepodařilo se přesunout soubor:\n{exc}")
+                session.rollback()
+                return
+
+            f.current_path = str(dst)
+            f.status = "PROCESSED"
+            session.add(f)
+            session.commit()
+
+        QMessageBox.information(self, "Karanténa", "Doklad byl uložen jako hotový a přesunut z karantény.")
+        self._refresh_unrec_v2()
+        self._docs_new_search_v2()
+
     def _render_pdf_preview_bytes(self, path: Path, dpi: int = 160) -> bytes | None:
         """
-        Render první stránku PDF v samostatném procesu, aby případné chyby
-        v pdfiu/pillow nesestřelily celé GUI. Vrací PNG byty nebo None.
+        Render první stránku PDF. Dříve se dělalo multiprocesově, ale na Windows
+        se spawn+join blokoval UI a padal na pickling, proto nyní přímo
+        (rychlejší a stabilnější) s malou cache.
         """
-        ctx = mp.get_context("spawn")
-        q: mp.Queue = ctx.Queue(maxsize=1)
-
-        def _worker(pdf_path: str, dpi_val: int, out_q):
-            try:
-                from pathlib import Path
-                from kajovospend.ocr.pdf_render import render_pdf_to_images
-
-                imgs = render_pdf_to_images(Path(pdf_path), dpi=dpi_val, max_pages=1)
-                if not imgs:
-                    out_q.put(None)
-                    return
-                buf = BytesIO()
-                imgs[0].save(buf, format="PNG")
-                out_q.put(buf.getvalue())
-            except Exception as exc:
-                try:
-                    out_q.put({"error": str(exc)})
-                except Exception:
-                    pass
-
-        proc = ctx.Process(target=_worker, args=(str(path), dpi, q))
-        proc.start()
-        proc.join(10)
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(2)
-            self.log.warning("Preview render timed out; killed worker for %s", path)
         try:
-            res = q.get_nowait()
-        except queue.Empty:
-            res = None
-
-        if isinstance(res, dict) and "error" in res:
-            raise RuntimeError(res["error"])
-        return res if isinstance(res, (bytes, bytearray)) else None
+            imgs = render_pdf_to_images(path, dpi=int(dpi), max_pages=1)
+            if not imgs:
+                return None
+            buf = BytesIO()
+            imgs[0].save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception as exc:
+            self.log.exception("Preview render failed for %s: %s", path, exc)
+            return None
 
     def _export_with_busy(self, fmt: str) -> None:
         """
