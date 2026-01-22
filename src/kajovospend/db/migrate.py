@@ -89,7 +89,7 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_requires_review ON documents(requires_review)"))
 
         # Line items foreign key / filtering
-        con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_document_id ON line_items(document_id)"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_document_id ON items(document_id)"))
 
         # FTS helpers (join keys)
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_fts_document_id ON documents_fts(document_id)"))

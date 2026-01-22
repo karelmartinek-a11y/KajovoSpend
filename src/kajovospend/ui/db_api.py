@@ -116,8 +116,7 @@ def _fts_doc_ids_ranked(
 
       SELECT d.id AS doc_id, bm25(items_fts) AS rank
       FROM items_fts
-      JOIN line_items li ON li.id = items_fts.line_item_id
-      JOIN documents d ON d.id = li.document_id
+      JOIN documents d ON d.id = items_fts.document_id
       WHERE items_fts MATCH :q {where_date}
     ),
     dedup AS (
@@ -157,8 +156,7 @@ def count_documents(session: Session, q: str = "", date_from=None, date_to=None)
 
           SELECT d.id AS doc_id
           FROM items_fts
-          JOIN line_items li ON li.id = items_fts.line_item_id
-          JOIN documents d ON d.id = li.document_id
+          JOIN documents d ON d.id = items_fts.document_id
           WHERE items_fts MATCH :q {where_date}
         )
         SELECT COUNT(*) AS c FROM hits
