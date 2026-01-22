@@ -128,20 +128,26 @@ def fetch_by_ico(
     is_vat_payer: Optional[bool] = None
     regs = obj.get("seznamRegistraci") or {}
     stav_dph = regs.get("stavZdrojeDph")
-    if stav_dph is None:
-        # konzervativní fallback: pokud ARES neposkytne stav, necháme None
-        # (nebudeme hádat z DIČ, protože DIČ může existovat i mimo DPH registr)
-        is_vat_payer = None
-    else:
+    if stav_dph is not None:
         sval = str(stav_dph).strip().lower()
-        # typicky očekávané hodnoty (různé implementace / ciselníky)
         if sval in {"a", "akt", "aktivni", "ano", "true", "1"} or sval.startswith("akt"):
             is_vat_payer = True
         elif sval in {"n", "ne", "neaktivni", "false", "0"} or sval.startswith("neakt"):
             is_vat_payer = False
-        else:
-            # neznámý stav -> ponecháme None (raději kontrola uživatelem)
-            is_vat_payer = None
+    # fallback na starší klíče
+    if is_vat_payer is None:
+        vat = obj.get("platceDph") or obj.get("jePlatceDph") or obj.get("platceDPH")
+        if isinstance(vat, bool):
+            is_vat_payer = vat
+        elif isinstance(vat, str):
+            sval = vat.strip().lower()
+            if sval in {"true", "1", "ano", "a"}:
+                is_vat_payer = True
+            elif sval in {"false", "0", "ne", "n"}:
+                is_vat_payer = False
+    # pokud máme DIČ typu CZ123..., je to silný indikátor plátce DPH
+    if is_vat_payer is None and isinstance(dic, str) and dic.strip().upper().startswith("CZ"):
+        is_vat_payer = True
 
     # address
     adr = obj.get("sidlo") or {}
@@ -150,9 +156,17 @@ def fetch_by_ico(
         str(adr.get("cisloDomovni") or adr.get("cisloPopisne") or "") or None
     )
     orientation_number = str(adr.get("cisloOrientacni") or "") or None
+    orient_letter = (adr.get("cisloOrientacniPismeno") or "").strip()
+    if orient_letter:
+        orientation_number = (orientation_number or "") + orient_letter
     city = adr.get("nazevObce") or adr.get("obec") or None
     zip_code = str(adr.get("psc") or "") or None
-    address = _compose_address(street, street_number, orientation_number, city, zip_code)
+
+    address = None
+    if isinstance(adr.get("textovaAdresa"), str) and adr.get("textovaAdresa").strip():
+        address = adr.get("textovaAdresa").strip()
+    if not address:
+        address = _compose_address(street, street_number, orientation_number, city, zip_code)
 
     rec = AresRecord(
         ico=ico_norm,
