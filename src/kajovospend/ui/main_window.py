@@ -198,6 +198,8 @@ class MainWindow(QMainWindow):
         # keep threads/workers alive
         self._threads: List[QThread] = []
         self._dialogs: List[QProgressDialog] = []
+        self._workers: List[_Worker] = []
+        self._timers: List[QTimer] = []
         self._sup_sel_connected = False
 
         self.paths = resolve_app_paths(
@@ -258,6 +260,8 @@ class MainWindow(QMainWindow):
         completed = False
         timer = None
 
+        self._workers.append(wk)
+
         def _finish_once() -> bool:
             nonlocal completed
             if completed:
@@ -286,6 +290,15 @@ class MainWindow(QMainWindow):
                 pass
             try:
                 self._dialogs.remove(dlg)
+            except Exception:
+                pass
+            try:
+                self._workers.remove(wk)
+            except Exception:
+                pass
+            try:
+                if timer is not None:
+                    self._timers.remove(timer)
             except Exception:
                 pass
 
@@ -321,6 +334,7 @@ class MainWindow(QMainWindow):
             timer.setSingleShot(True)
             timer.timeout.connect(lambda: _err("Operace překročila časový limit."))
             timer.start(int(timeout_ms))
+            self._timers.append(timer)
 
     def _load_logo_pixmap(self) -> Optional[QPixmap]:
         # Prefer a dedicated logo if present, fallback to app.ico.
