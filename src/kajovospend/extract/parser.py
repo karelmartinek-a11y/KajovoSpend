@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import datetime as dt
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 from dateutil import parser as dtparser
 
@@ -24,6 +24,11 @@ class Extracted:
 
 
 _amount_re = re.compile(r"(-?\d+[\d\s]*[.,]\d{2})")
+_ICO_CTX_RE = re.compile(r"\b(IČO|ICO|IČ)\b", re.IGNORECASE)
+_ICO_DIGITS_RE = re.compile(r"\D+")
+
+# Časté mapování DPH písmenem na účtenkách (není univerzální, ale pomáhá u velké části CZ retail).
+_VAT_LETTER_MAP: Dict[str, float] = {"A": 21.0, "B": 15.0, "C": 10.0}
 
 
 def _norm_amount(s: str) -> float:
@@ -42,6 +47,21 @@ def _find_first(patterns: list[re.Pattern], text: str) -> Optional[str]:
     return None
 
 
+def _normalize_ico_soft(ico: str | None) -> str | None:
+    if ico is None:
+        return None
+    raw = str(ico).strip()
+    if not raw:
+        return None
+    digits = _ICO_DIGITS_RE.sub("", raw)
+    if not digits:
+        return None
+    if len(digits) > 8:
+        # když OCR slije více čísel – raději vrátit původní digit-only; verifikace ARES stejně rozhodne
+        return digits
+    return digits.zfill(8)
+
+
 def _parse_date(s: str) -> Optional[dt.date]:
     s = s.strip()
     try:
@@ -56,11 +76,17 @@ def extract_from_text(text: str) -> Extracted:
     raw = text or ""
     t = raw
 
-    ico = _find_first([
-        re.compile(r"\bIČ\s*[: ]\s*(\d{8})\b", re.IGNORECASE),
-        re.compile(r"\bICO\s*[: ]\s*(\d{8})\b", re.IGNORECASE),
-        re.compile(r"\b(\d{8})\b")
-    ], t)
+    # IČO: dříve se bralo libovolné 8-číslí => často sebralo VS/číslo dokladu.
+    # Teď vyžadujeme kontext (IČO/ICO/IČ) a normalizujeme.
+    ico = _find_first(
+        [
+            re.compile(r"\bIČO\s*[: ]\s*([0-9][0-9\s-]{6,}[0-9])\b", re.IGNORECASE),
+            re.compile(r"\bICO\s*[: ]\s*([0-9][0-9\s-]{6,}[0-9])\b", re.IGNORECASE),
+            re.compile(r"\bIČ\s*[: ]\s*([0-9][0-9\s-]{6,}[0-9])\b", re.IGNORECASE),
+        ],
+        t,
+    )
+    ico = _normalize_ico_soft(ico)
 
     doc_no = _find_first([
         re.compile(r"Č[ií]slo\s+faktury\s*[: ]\s*([\w-]+)", re.IGNORECASE),
@@ -129,7 +155,9 @@ def extract_from_text(text: str) -> Extracted:
     # receipts (Albert): lines like "2 x 5,60 Kč 11,20"
     if not items:
         rec_pat = re.compile(r"^(?P<name>[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ0-9 .,'/-]{3,})\s*$")
-        qty_price_pat = re.compile(r"^(?P<qty>\d+(?:[.,]\d+)?)\s*[xX]\s*(?P<unit>\d+[\s\d]*[.,]\d{2}).*?(?P<total>\d+[\s\d]*[.,]\d{2})\s*(?:[A-Z])?\s*$")
+        qty_price_pat = re.compile(
+            r"^(?P<qty>\d+(?:[.,]\d+)?)\s*[xX]\s*(?P<unit>\d+[\s\d]*[.,]\d{2}).*?(?P<total>\d+[\s\d]*[.,]\d{2})\s*(?P<vat_letter>[A-Z])?\s*$"
+        )
         pending_name: Optional[str] = None
         for ln in t.splitlines():
             ln = ln.strip()
@@ -144,16 +172,49 @@ def extract_from_text(text: str) -> Extracted:
                 try:
                     qty = float(m2.group("qty").replace(",", "."))
                     line_total = _norm_amount(m2.group("total"))
-                    # VAT letter A/B not reliable
-                    items.append({"name": pending_name, "quantity": qty, "vat_rate": 0.0, "line_total": line_total})
+                    vat_letter = (m2.group("vat_letter") or "").strip().upper()
+                    vat = _VAT_LETTER_MAP.get(vat_letter, 0.0)
+                    items.append({"name": pending_name, "quantity": qty, "vat_rate": vat, "line_total": line_total})
                 except Exception:
                     pass
                 pending_name = None
             else:
                 pending_name = None
 
-    # confidence heuristic
+    # --- kontrola součtu položek vs. celkem ---
+    # Cíl: co nejvíc dokladů vyřešit offline, a na OpenAI posílat jen minimum.
     reasons: List[str] = []
+    if items and total is not None and total > 0:
+        try:
+            sum_items = float(sum(float(i.get("line_total") or 0.0) for i in items))
+            rel_diff = abs(sum_items - total) / max(total, 1e-9)
+            # běžně rounding/DPH rozdíly do ~1.5%; necháme rezervu i pro různé formáty => 3%
+            tol = 0.03
+            if rel_diff > tol:
+                # pokus: položky jsou bez DPH, ale celkem je s DPH
+                sum_items_gross = 0.0
+                for it in items:
+                    lt = float(it.get("line_total") or 0.0)
+                    vr = float(it.get("vat_rate") or 0.0)
+                    if vr > 0:
+                        sum_items_gross += lt * (1.0 + vr / 100.0)
+                    else:
+                        sum_items_gross += lt
+                rel_diff2 = abs(sum_items_gross - total) / max(total, 1e-9)
+                if rel_diff2 + 1e-9 < rel_diff and rel_diff2 <= tol:
+                    # upravíme line_total na částky s DPH pro položky s DPH > 0
+                    for it in items:
+                        lt = float(it.get("line_total") or 0.0)
+                        vr = float(it.get("vat_rate") or 0.0)
+                        if vr > 0:
+                            it["line_total"] = round(lt * (1.0 + vr / 100.0), 2)
+                    reasons.append("položky přepočteny z bez DPH na s DPH")
+                else:
+                    reasons.append("nesedí součet položek vs. celkem")
+        except Exception:
+            reasons.append("nelze ověřit součet položek")
+
+    # confidence heuristic
     conf = 0.0
     if ico:
         conf += 0.25
@@ -176,7 +237,8 @@ def extract_from_text(text: str) -> Extracted:
     else:
         reasons.append("chybí položky")
 
-    requires_review = conf < 0.75
+    # Pokud máme explicitní problém se součtem, zvyšujeme šanci karantény i když conf vyjde „OK“.
+    requires_review = (conf < 0.75) or any("nesedí součet položek" in r for r in reasons)
     if requires_review:
         reasons.append("nízká jistota vytěžení")
 

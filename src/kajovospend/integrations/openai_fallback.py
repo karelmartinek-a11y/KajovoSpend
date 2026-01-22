@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import base64
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Sequence
 
 import requests
 
@@ -40,17 +41,41 @@ _SCHEMA = {
 }
 
 
-def extract_with_openai(cfg: OpenAIConfig, ocr_text: str, timeout: int = 40) -> Tuple[Optional[Dict[str, Any]], str]:
+def _b64_data_url(mime: str, data: bytes) -> str:
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def extract_with_openai(
+    cfg: OpenAIConfig,
+    ocr_text: str,
+    images: Optional[Sequence[Tuple[str, bytes]]] = None,
+    timeout: int = 40,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    # Responses API supports multimodal input items (input_text + input_image).
+    # image_url může být i base64 data URL.
+    # Zapneme JSON mode přes text.format json_object.
     prompt = (
         "Jsi extrakční systém pro české doklady (faktury, účtenky). "
-        "Z následujícího textu vytěž povinná data a vrať POUZE JSON podle tohoto schématu: "
+        "Vrať POUZE validní JSON objekt (bez markdownu, bez komentářů). "
+        "Schéma JSON je: "
         + json.dumps(_SCHEMA, ensure_ascii=False)
-        + "\n\nText dokladu:\n" + ocr_text
+        + "\n\nOCR text dokladu:\n"
+        + (ocr_text or "")
     )
+
+    content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    if images:
+        for mime, data in images:
+            if not data:
+                continue
+            mm = mime if mime in ("image/png", "image/jpeg", "image/webp") else "image/png"
+            content.append({"type": "input_image", "image_url": _b64_data_url(mm, data)})
 
     payload = {
         "model": cfg.model,
-        "input": prompt,
+        "input": [{"role": "user", "content": content}],
+        "text": {"format": {"type": "json_object"}},
     }
 
     r = requests.post(

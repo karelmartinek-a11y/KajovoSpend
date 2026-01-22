@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 import shutil
+import io
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 from PIL import Image
 from pypdf import PdfReader
@@ -52,6 +53,36 @@ class Processor:
         except Exception as e:
             self.log.warning(f"OCR init failed; will quarantine documents. Error: {e}")
             self.ocr_engine = None
+
+    def _openai_images_for_path(self, path: Path) -> List[Tuple[str, bytes]]:
+        """
+        Připraví obrazové vstupy pro OpenAI fallback.
+        - PDF: render první 1-2 strany do PNG (rozumný kompromis cena/výkon).
+        - image: vezme bytes přímo (png/jpg/webp).
+        """
+        images: List[Tuple[str, bytes]] = []
+        try:
+            suf = path.suffix.lower()
+            if suf == ".pdf":
+                dpi = int(self.cfg["ocr"].get("pdf_dpi", 200))
+                pages = render_pdf_to_images(path, dpi=dpi)
+                for img in pages[:2]:
+                    buf = io.BytesIO()
+                    # PNG je robustní pro text/čáry; optimalize kvůli velikosti
+                    img.save(buf, format="PNG", optimize=True)
+                    images.append(("image/png", buf.getvalue()))
+            else:
+                mime = "image/png"
+                if suf in (".jpg", ".jpeg"):
+                    mime = "image/jpeg"
+                elif suf == ".webp":
+                    mime = "image/webp"
+                data = path.read_bytes()
+                if data:
+                    images.append((mime, data))
+        except Exception as e:
+            self.log.debug(f"OpenAI image prep failed ({path.name}): {e}")
+        return images
 
     def _ocr_pdf(self, pdf_path: Path) -> Tuple[str, float, int]:
         # Try embedded text first
@@ -123,7 +154,12 @@ class Processor:
             model = str(self.cfg["openai"].get("model") or "").strip()
             if api_key and model:
                 try:
-                    obj, raw = extract_with_openai(OpenAIConfig(api_key=api_key, model=model), ocr_text)
+                    imgs = self._openai_images_for_path(path)
+                    obj, raw = extract_with_openai(
+                        OpenAIConfig(api_key=api_key, model=model),
+                        ocr_text,
+                        images=imgs if imgs else None,
+                    )
                     if obj:
                         # map obj to extracted
                         extracted.supplier_ico = obj.get("supplier_ico") or extracted.supplier_ico
@@ -201,6 +237,38 @@ class Processor:
                 extracted.supplier_ico = ares.ico
             except Exception as e:
                 reasons.append(f"ARES selhal: {e}")
+                requires_review = True
+
+        # Business duplicita: stejné IČO + číslo dokladu + datum (pokud vše existuje).
+        # Při velkých objemech je to zásadní. Soubor přesuneme do DUPLICITY.
+        if extracted.supplier_ico and extracted.doc_number and extracted.issue_date:
+            try:
+                dup = session.execute(
+                    text(
+                        "SELECT id FROM documents "
+                        "WHERE supplier_ico = :ico AND doc_number = :dn AND issue_date = :d "
+                        "LIMIT 1"
+                    ),
+                    {"ico": extracted.supplier_ico, "dn": extracted.doc_number, "d": extracted.issue_date},
+                ).fetchone()
+                if dup:
+                    dup_dir = out_base / self.cfg["paths"].get("duplicate_dir_name", "DUPLICITY")
+                    moved = safe_move(path, dup_dir, path.name)
+                    file_record.current_path = str(moved)
+                    file_record.status = "DUPLICATE"
+                    file_record.processed_at = dt.datetime.utcnow()
+                    session.add(file_record)
+                    session.flush()
+                    return {
+                        "status": "DUPLICATE",
+                        "sha256": sha,
+                        "file_id": file_record.id,
+                        "moved_to": str(moved),
+                        "duplicate_of_document_id": int(dup[0]),
+                    }
+            except Exception as e:
+                # nesmí to shodit pipeline; jen zvedneme review
+                reasons.append(f"dup-check selhal: {e}")
                 requires_review = True
 
         doc = add_document(

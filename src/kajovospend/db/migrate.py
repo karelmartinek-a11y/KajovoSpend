@@ -98,6 +98,8 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_doc_number ON documents(doc_number)"))
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_bank_account ON documents(bank_account)"))
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_requires_review ON documents(requires_review)"))
+        # Kompozitní index pro business duplicity (IČO + číslo dokladu + datum).
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_dup_key ON documents(supplier_ico, doc_number, issue_date)"))
 
         # Line items foreign key / filtering
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_document_id ON items(document_id)"))
