@@ -44,14 +44,15 @@ class DocumentFile(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     processed_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
-    document: Mapped[Document | None] = relationship(back_populates="file", uselist=False)  # type: ignore[name-defined]
+    # one file can contain multiple documents (e.g., multiple receipts in one PDF)
+    documents: Mapped[list[Document]] = relationship(back_populates="file", cascade="all, delete-orphan")  # type: ignore[name-defined]
 
 
 class Document(Base):
     __tablename__ = "documents"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    file_id: Mapped[int] = mapped_column(ForeignKey("files.id"), unique=True)
+    file_id: Mapped[int] = mapped_column(ForeignKey("files.id"), index=True)
     supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), nullable=True)
 
     supplier_ico: Mapped[str | None] = mapped_column(String(16), index=True, nullable=True)
@@ -59,6 +60,9 @@ class Document(Base):
     bank_account: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     issue_date: Mapped[dt.date | None] = mapped_column(Date, nullable=True)
     total_with_vat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # page range within the original file (1-based, inclusive)
+    page_from: Mapped[int] = mapped_column(Integer, default=1)
+    page_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
     currency: Mapped[str] = mapped_column(String(8), default="CZK")
 
     extraction_confidence: Mapped[float] = mapped_column(Float, default=0.0)
@@ -69,12 +73,13 @@ class Document(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
 
-    file: Mapped[DocumentFile] = relationship(back_populates="document")
+    file: Mapped[DocumentFile] = relationship(back_populates="documents")
     supplier: Mapped[Supplier | None] = relationship(back_populates="documents")
     items: Mapped[list[LineItem]] = relationship(back_populates="document", cascade="all, delete-orphan")  # type: ignore[name-defined]
 
     __table_args__ = (
         Index("ix_documents_issue_date", "issue_date"),
+        Index("ix_documents_file_page", "file_id", "page_from", "page_to"),
     )
 
 

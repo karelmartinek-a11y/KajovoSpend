@@ -110,7 +110,10 @@ def create_file_record(session: Session, sha256: str, original_name: str, path: 
 def add_document(session: Session, file_id: int, supplier_id: int | None, supplier_ico: str | None,
                  doc_number: str | None, bank_account: str | None, issue_date, total_with_vat: float | None,
                  currency: str, confidence: float, method: str, requires_review: bool, review_reasons: str | None,
-                 items: Iterable[dict]) -> Document:
+                 items: Iterable[dict],
+                 *,
+                 page_from: int = 1,
+                 page_to: int | None = None) -> Document:
     d = Document(
         file_id=file_id,
         supplier_id=supplier_id,
@@ -124,6 +127,8 @@ def add_document(session: Session, file_id: int, supplier_id: int | None, suppli
         extraction_method=method,
         requires_review=requires_review,
         review_reasons=review_reasons,
+        page_from=int(page_from or 1),
+        page_to=(int(page_to) if page_to is not None else None),
     )
     session.add(d)
     session.flush()
