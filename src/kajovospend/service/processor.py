@@ -17,7 +17,7 @@ from kajovospend.db.queries import (
     upsert_supplier,
 )
 from kajovospend.extract.parser import extract_from_text
-from kajovospend.integrations.ares import fetch_by_ico
+from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
 from kajovospend.integrations.openai_fallback import OpenAIConfig, extract_with_openai
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 from kajovospend.ocr.rapidocr_engine import RapidOcrEngine
@@ -172,6 +172,13 @@ class Processor:
 
         supplier_id = None
         if extracted.supplier_ico:
+            # normalizace IČO (OCR často vrací mezery / oddělovače)
+            try:
+                extracted.supplier_ico = normalize_ico(extracted.supplier_ico)
+            except Exception:
+                # neblokujeme pipeline; ARES může stále selhat, dodavatel se založí "jak je"
+                pass
+
             try:
                 ares = fetch_by_ico(extracted.supplier_ico)
                 s = upsert_supplier(
@@ -188,8 +195,10 @@ class Processor:
                     orientation_number=ares.orientation_number,
                     city=ares.city,
                     zip_code=ares.zip_code,
+                    overwrite=True,
                 )
                 supplier_id = s.id
+                extracted.supplier_ico = ares.ico
             except Exception as e:
                 reasons.append(f"ARES selhal: {e}")
                 requires_review = True

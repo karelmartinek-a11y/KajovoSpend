@@ -1,12 +1,36 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Iterable
+from typing import Iterable, Optional
+import re
 
 from sqlalchemy import text, select, func
 from sqlalchemy.orm import Session
 
 from .models import Supplier, DocumentFile, Document, LineItem, ImportJob, ServiceState
+
+_ICO_DIGITS_RE = re.compile(r"\D+")
+
+
+def _normalize_ico_soft(ico: Optional[str]) -> Optional[str]:
+    """
+    Soft normalizace IČO pro matching v DB:
+    - None -> None
+    - ponechá jen číslice
+    - doplní zleva nuly na 8 (pokud délka <= 8)
+    - pokud je >8 číslic, vrátí původní digit string (bez paddingu) – nechceme házet výjimku v DB vrstvě
+    """
+    if ico is None:
+        return None
+    raw = str(ico).strip()
+    if not raw:
+        return None
+    digits = _ICO_DIGITS_RE.sub("", raw)
+    if not digits:
+        return None
+    if len(digits) > 8:
+        return digits
+    return digits.zfill(8)
 
 
 def upsert_supplier(
@@ -24,50 +48,49 @@ def upsert_supplier(
     orientation_number: str | None = None,
     city: str | None = None,
     zip_code: str | None = None,
+    overwrite: bool | None = None,
 ) -> Supplier:
-    ico = ico.strip()
-    existing = session.execute(select(Supplier).where(Supplier.ico == ico)).scalar_one_or_none()
-    if existing:
-        if name is not None:
-            existing.name = name
-        if dic is not None:
-            existing.dic = dic
-        if legal_form is not None:
-            existing.legal_form = legal_form
-        if address is not None:
-            existing.address = address
-        if street is not None:
-            existing.street = street
-        if street_number is not None:
-            existing.street_number = street_number
-        if orientation_number is not None:
-            existing.orientation_number = orientation_number
-        if city is not None:
-            existing.city = city
-        if zip_code is not None:
-            existing.zip_code = zip_code
-        if is_vat_payer is not None:
-            existing.is_vat_payer = is_vat_payer
-        if ares_last_sync is not None:
-            existing.ares_last_sync = ares_last_sync
-        session.add(existing)
-        session.flush()
-        return existing
-    s = Supplier(
-        ico=ico,
-        name=name,
-        dic=dic,
-        legal_form=legal_form,
-        address=address,
-        street=street,
-        street_number=street_number,
-        orientation_number=orientation_number,
-        city=city,
-        zip_code=zip_code,
-        is_vat_payer=is_vat_payer,
-        ares_last_sync=ares_last_sync,
-    )
-    session.add(s)
+    # overwrite default: pokud jde o ARES sync (ares_last_sync != None), chceme přepsat i None hodnotami
+    if overwrite is None:
+        overwrite = ares_last_sync is not None
+
+    ico_norm = _normalize_ico_soft(ico) or str(ico).strip()
+
+    # 1) pokus: přesná shoda na uložené IČO
+    s = session.execute(select(Supplier).where(Supplier.ico == ico_norm)).scalar_one_or_none()
+
+    # 2) fallback: v DB může být IČO historicky uloženo s mezerami/znaky -> match přes normalizaci
+    if s is None and ico_norm:
+        candidates = session.execute(select(Supplier).where(Supplier.ico.is_not(None))).scalars().all()
+        for cand in candidates:
+            if _normalize_ico_soft(cand.ico) == ico_norm:
+                s = cand
+                break
+
+    if not s:
+        s = Supplier(ico=ico_norm)
+        session.add(s)
+    else:
+        # kanonizace IČO v DB (pokud doteď bylo třeba s mezerami)
+        s.ico = ico_norm
+
+    def _set(attr: str, val):
+        if overwrite or val is not None:
+            setattr(s, attr, val)
+
+    _set("name", name)
+    _set("dic", dic)
+    _set("legal_form", legal_form)
+    _set("address", address)
+    _set("street", street)
+    _set("street_number", street_number)
+    _set("orientation_number", orientation_number)
+    _set("city", city)
+    _set("zip_code", zip_code)
+    _set("is_vat_payer", is_vat_payer)
+    if ares_last_sync is not None:
+        s.ares_last_sync = ares_last_sync
+
     session.flush()
     return s
 
