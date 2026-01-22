@@ -262,6 +262,12 @@ class MainWindow(QMainWindow):
 
         self._workers.append(wk)
 
+        def _dispatch_ui(fn) -> None:
+            if QThread.currentThread() != self.thread():
+                QTimer.singleShot(0, self, fn)
+                return
+            fn()
+
         def _finish_once() -> bool:
             nonlocal completed
             if completed:
@@ -303,25 +309,29 @@ class MainWindow(QMainWindow):
                 pass
 
         def _ok(res):
-            if not _finish_once():
-                return
-            _cleanup()
-            try:
-                on_done(res)
-            except Exception:
-                self.log.exception("UI on_done handler failed")
+            def _impl():
+                if not _finish_once():
+                    return
+                _cleanup()
+                try:
+                    on_done(res)
+                except Exception:
+                    self.log.exception("UI on_done handler failed")
+            _dispatch_ui(_impl)
 
         def _err(msg: str):
-            if not _finish_once():
-                return
-            _cleanup()
-            if on_error:
-                try:
-                    on_error(msg)
+            def _impl():
+                if not _finish_once():
                     return
-                except Exception:
-                    self.log.exception("UI on_error handler failed")
-            QMessageBox.critical(self, title, f"Chyba: {msg}")
+                _cleanup()
+                if on_error:
+                    try:
+                        on_error(msg)
+                        return
+                    except Exception:
+                        self.log.exception("UI on_error handler failed")
+                QMessageBox.critical(self, title, f"Chyba: {msg}")
+            _dispatch_ui(_impl)
 
         wk.done.connect(_ok)
         wk.error.connect(_err)
