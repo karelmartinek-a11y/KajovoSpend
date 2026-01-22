@@ -869,15 +869,11 @@ class MainWindow(QMainWindow):
         self.sup_table.setColumnHidden(0, True)
 
         sm = self.sup_table.selectionModel()
-        if sm:
-            if self._sup_sel_connected:
-                try:
-                    sm.selectionChanged.disconnect(self._on_sup_selection_changed)
-                except Exception:
-                    pass
-                self._sup_sel_connected = False
+        if sm and not self._sup_sel_connected:
             sm.selectionChanged.connect(self._on_sup_selection_changed)
             self._sup_sel_connected = True
+        elif sm is None:
+            self._sup_sel_connected = False
 
         if keep_id is not None:
             self._select_supplier_in_table(keep_id)
