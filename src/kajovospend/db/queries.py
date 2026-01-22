@@ -56,23 +56,20 @@ def upsert_supplier(
 
     ico_norm = _normalize_ico_soft(ico) or str(ico).strip()
 
-    # 1) pokus: přesná shoda na uložené IČO
-    s = session.execute(select(Supplier).where(Supplier.ico == ico_norm)).scalar_one_or_none()
-
-    # 2) fallback: v DB může být IČO historicky uloženo s mezerami/znaky -> match přes normalizaci
-    if s is None and ico_norm:
-        candidates = session.execute(select(Supplier).where(Supplier.ico.is_not(None))).scalars().all()
-        for cand in candidates:
-            if _normalize_ico_soft(cand.ico) == ico_norm:
-                s = cand
-                break
+    # Fast path: indexed lookup by normalized key (no full table scan).
+    s = session.execute(
+        select(Supplier).where(
+            (Supplier.ico_norm == ico_norm) | (Supplier.ico == ico_norm)
+        )
+    ).scalar_one_or_none()
 
     if not s:
-        s = Supplier(ico=ico_norm)
+        s = Supplier(ico=ico_norm, ico_norm=ico_norm)
         session.add(s)
     else:
         # kanonizace IČO v DB (pokud doteď bylo třeba s mezerami)
         s.ico = ico_norm
+        s.ico_norm = ico_norm
 
     def _set(attr: str, val):
         if overwrite or val is not None:

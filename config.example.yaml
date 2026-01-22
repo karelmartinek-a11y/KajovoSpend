@@ -28,5 +28,11 @@ openai:
   model: ""     # chosen model
 
 performance:
+  # UI paging for large datasets (tens of thousands of documents)
+  docs_page_size: 500
+  # Debounce supplier search (ms)
+  supplier_debounce_ms: 250
+  # PDF preview render DPI (lower = faster)
+  preview_dpi: 120
   image_max_px: 3000
   parallel_pages: 2

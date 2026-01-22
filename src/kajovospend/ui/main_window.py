@@ -10,14 +10,15 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread
-from PySide6.QtGui import QIcon, QPixmap, QImage
+from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl
+from PySide6.QtGui import QIcon, QPixmap, QImage, QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTabWidget, QTableView,
     QLineEdit, QFormLayout, QSplitter, QTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QFileDialog,
     QMessageBox, QDateEdit, QProgressBar, QDialog, QDialogButtonBox, QHeaderView, QAbstractItemView,
     QCheckBox, QProgressDialog, QApplication, QInputDialog,
 )
+from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select, text
@@ -36,6 +37,54 @@ from kajovospend.ocr.pdf_render import render_pdf_to_images
 
 from .styles import QSS
 from . import db_api
+
+
+class PdfPreviewView(QGraphicsView):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pix_item = QGraphicsPixmapItem()
+        self._scene.addItem(self._pix_item)
+
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+
+    def clear(self):
+        self._pix_item.setPixmap(QPixmap())
+        self._scene.setSceneRect(0, 0, 1, 1)
+        self.resetTransform()
+
+    def set_pixmap(self, px: QPixmap):
+        self._pix_item.setPixmap(px)
+        if not px.isNull():
+            self._scene.setSceneRect(px.rect())
+            self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def zoom_in(self):
+        self.scale(1.25, 1.25)
+
+    def zoom_out(self):
+        self.scale(0.8, 0.8)
+
+    def reset_zoom(self):
+        self.resetTransform()
+        if not self._scene.sceneRect().isEmpty():
+            self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def wheelEvent(self, event):
+        # Ctrl+wheel for zoom; plain wheel = scroll/pan default
+        if event.modifiers() & Qt.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+            event.accept()
+            return
+        super().wheelEvent(event)
 
 
 class TableModel(QAbstractTableModel):
@@ -204,6 +253,15 @@ class MainWindow(QMainWindow):
         self._workers: List[_Worker] = []
         self._timers: List[QTimer] = []
         self._sup_sel_connected = False
+        self._sup_filter_timer = QTimer(self)
+        self._sup_filter_timer.setSingleShot(True)
+
+        # paging / cache for documents
+        self._doc_page_size = int(self.cfg.get("performance", {}).get("docs_page_size", 500) or 500)
+        self._doc_offset = 0
+        self._doc_total = 0
+        self._preview_cache: Dict[Tuple[str, int], QPixmap] = {}
+        self._preview_dpi = int(self.cfg.get("performance", {}).get("preview_dpi", 120) or 120)
 
         self.paths = resolve_app_paths(
             self.cfg["app"].get("data_dir"),
@@ -598,51 +656,62 @@ class MainWindow(QMainWindow):
         dl2 = QVBoxLayout(self.tab_docs)
         filters = QWidget(); filters.setProperty("panel", True)
         fl = QHBoxLayout(filters); fl.setContentsMargins(10,6,10,6)
-        self.ed_doc_search = QLineEdit(); self.ed_doc_search.setPlaceholderText("Číslo, VS/KS/SS, text…")
-        self.cb_all_dates = QCheckBox("Vše"); self.cb_all_dates.setToolTip("Ignorovat datumové omezení a zobrazit všechny doklady/účty"); self.cb_all_dates.setChecked(True)
-        self.dt_from = QDateEdit(); self.dt_from.setCalendarPopup(True); self.dt_from.setDisplayFormat("dd.MM.yyyy")
-        self.dt_to = QDateEdit(); self.dt_to.setCalendarPopup(True); self.dt_to.setDisplayFormat("dd.MM.yyyy")
-        self.dt_from.setDate(dt.date.today() - dt.timedelta(days=365))
-        self.dt_to.setDate(dt.date.today())
-        self.btn_doc_search = QPushButton("Hledat")
-        self.btn_export_csv = QPushButton("Export CSV")
-        self.btn_export_xlsx = QPushButton("Export XLSX")
-        fl.addWidget(self.ed_doc_search, 1)
-        fl.addWidget(self.cb_all_dates)
-        fl.addWidget(self.dt_from)
-        fl.addWidget(self.dt_to)
-        fl.addWidget(self.btn_doc_search)
-        fl.addWidget(self.btn_export_csv)
-        fl.addWidget(self.btn_export_xlsx)
-        dl2.addWidget(filters)
-        # start state
-        self._toggle_doc_dates(True)
+        doc_toolbar = QWidget()
+        dtb = QHBoxLayout(doc_toolbar); dtb.setContentsMargins(0, 0, 0, 0)
+        self.doc_filter = QLineEdit(); self.doc_filter.setPlaceholderText("Vyhledat v účtech (IČO, číslo dokladu, účet, text, položky)…")
+        self.doc_date_from = QDateEdit(); self.doc_date_from.setCalendarPopup(True); self.doc_date_from.setDisplayFormat("dd.MM.yyyy")
+        self.doc_date_to = QDateEdit(); self.doc_date_to.setCalendarPopup(True); self.doc_date_to.setDisplayFormat("dd.MM.yyyy")
+        self.doc_date_from.setDate(dt.date.today() - dt.timedelta(days=365))
+        self.doc_date_to.setDate(dt.date.today())
+        self.cb_all_dates = QCheckBox("Bez filtru dat"); self.cb_all_dates.setChecked(True)
+        self.btn_docs_search = QPushButton("Hledat")
+        self.btn_docs_more = QPushButton("Načíst další")
+        self.lbl_docs_page = QLabel("0 / 0")
+        dtb.addWidget(self.doc_filter, 1)
+        dtb.addWidget(QLabel("Od:"))
+        dtb.addWidget(self.doc_date_from)
+        dtb.addWidget(QLabel("Do:"))
+        dtb.addWidget(self.doc_date_to)
+        dtb.addWidget(self.cb_all_dates)
+        dtb.addWidget(self.btn_docs_search)
+        dtb.addWidget(self.btn_docs_more)
+        dtb.addWidget(self.lbl_docs_page)
+        dl2.addWidget(doc_toolbar)
 
         splitter = QSplitter()
+        splitter.setOrientation(Qt.Horizontal)
         left = QWidget(); ll = QVBoxLayout(left)
-        self.doc_table = QTableView()
-        self.doc_table.setAlternatingRowColors(True)
-        self.doc_table.setShowGrid(True)
-        self.doc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.doc_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.doc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        ll.addWidget(self.doc_table, 1)
+        self.docs_table = QTableView()
+        self.docs_table.setAlternatingRowColors(True)
+        self.docs_table.setShowGrid(True)
+        self.docs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.docs_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.docs_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        ll.addWidget(self.docs_table, 1)
         splitter.addWidget(left)
 
         right = QWidget(); rl = QVBoxLayout(right)
-        self.preview = QLabel("Náhled")
-        self.preview.setObjectName("PreviewBox")
-        self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumWidth(420)
+        srcrow = QWidget(); sr = QHBoxLayout(srcrow); sr.setContentsMargins(0, 0, 0, 0)
+        self.doc_src_line = QLineEdit(); self.doc_src_line.setReadOnly(True)
+        self.btn_open_source = QPushButton("Otevřít soubor")
+        self.btn_zoom_in = QPushButton("+"); self.btn_zoom_out = QPushButton("-"); self.btn_zoom_reset = QPushButton("Fit")
+        sr.addWidget(QLabel("Zdroj:")); sr.addWidget(self.doc_src_line, 1); sr.addWidget(self.btn_open_source)
+        sr.addWidget(self.btn_zoom_in); sr.addWidget(self.btn_zoom_out); sr.addWidget(self.btn_zoom_reset)
+        rl.addWidget(srcrow)
+
+        self.preview_view = PdfPreviewView()
+        rl.addWidget(self.preview_view, 3)
+
         self.items_table = QTableView()
         self.items_table.setAlternatingRowColors(True)
         self.items_table.setShowGrid(True)
+        self.items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        rl.addWidget(self.preview, 3)
         rl.addWidget(self.items_table, 2)
+
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
         dl2.addWidget(splitter, 1)
         self.tabs.addTab(self.tab_docs, "ÚČTY")
 
@@ -687,7 +756,8 @@ class MainWindow(QMainWindow):
         self.btn_load_models.clicked.connect(self.on_load_models)
 
         self.btn_sup_refresh.clicked.connect(self.refresh_suppliers)
-        self.sup_filter.textChanged.connect(lambda _=None: self.refresh_suppliers())
+        self._sup_filter_timer.timeout.connect(self.refresh_suppliers)
+        self.sup_filter.textChanged.connect(self._on_sup_filter_changed)
         self.btn_sup_add.clicked.connect(self.on_add_supplier)
         self.btn_sup_merge.clicked.connect(self.on_merge_suppliers)
         self.btn_sup_edit.clicked.connect(self.on_edit_supplier)
@@ -695,13 +765,15 @@ class MainWindow(QMainWindow):
         self.btn_sup_ares_detail.clicked.connect(self.on_supplier_ares)
         self.sup_table.clicked.connect(self.on_supplier_selected)
 
-        self.btn_doc_search.clicked.connect(self.refresh_documents)
-        self.ed_doc_search.returnPressed.connect(self.refresh_documents)
-        self.cb_all_dates.toggled.connect(self._toggle_doc_dates)
-        self.cb_all_dates.toggled.connect(lambda _checked: self.refresh_documents())
-        self.doc_table.clicked.connect(self.on_doc_selected)
-        self.btn_export_csv.clicked.connect(lambda: self._export_with_busy("csv"))
-        self.btn_export_xlsx.clicked.connect(lambda: self._export_with_busy("xlsx"))
+        self.doc_filter.returnPressed.connect(self._docs_new_search)
+        self.btn_docs_search.clicked.connect(self._docs_new_search)
+        self.btn_docs_more.clicked.connect(self._docs_load_more)
+        self.cb_all_dates.stateChanged.connect(self._docs_new_search)
+        self.docs_table.clicked.connect(self._on_doc_selected_fast)
+        self.btn_open_source.clicked.connect(self._open_selected_source)
+        self.btn_zoom_in.clicked.connect(self.preview_view.zoom_in)
+        self.btn_zoom_out.clicked.connect(self.preview_view.zoom_out)
+        self.btn_zoom_reset.clicked.connect(self.preview_view.reset_zoom)
 
         self.unrec_table.clicked.connect(self.on_unrec_selected)
         self.btn_u_save.clicked.connect(self.on_unrec_save)
@@ -720,8 +792,8 @@ class MainWindow(QMainWindow):
     def _toggle_doc_dates(self, all_dates: bool) -> None:
         # UI helper: datumové filtry zbytečně matou, pokud je zvoleno „Vše“
         try:
-            self.dt_from.setEnabled(not all_dates)
-            self.dt_to.setEnabled(not all_dates)
+            self.doc_date_from.setEnabled(not all_dates)
+            self.doc_date_to.setEnabled(not all_dates)
         except Exception:
             pass
 
@@ -1165,67 +1237,137 @@ class MainWindow(QMainWindow):
         self.sup_vat.setChecked(False)
         self._set_supplier_editing(False)
 
-    def refresh_documents(self):
-        q = self.ed_doc_search.text().strip()
-        dfrom = self.dt_from.date().toPython()
-        dto = self.dt_to.date().toPython()
-        if getattr(self, "cb_all_dates", None) is not None and self.cb_all_dates.isChecked():
-            dfrom = None
-            dto = None
-        else:
-            if dfrom and dto and dfrom > dto:
-                dfrom, dto = dto, dfrom
-        with self.sf() as session:
-            docs = db_api.list_documents(session, q=q, date_from=dfrom, date_to=dto)
-            rows = []
-            for d, f in docs:
-                rows.append([d.id, d.issue_date.isoformat() if d.issue_date else "", d.supplier_ico or "", d.doc_number or "", d.total_with_vat or "", d.currency, "ANO" if d.requires_review else "", f.status])
-        self.doc_model = TableModel(["ID", "Datum", "IČO", "Číslo", "Celkem", "Měna", "Kontrola", "Status"], rows)
-        self.doc_table.setModel(self.doc_model)
-
-    def on_doc_selected(self, index):
+    def _on_sup_filter_changed(self, _=None):
+        ms = int(self.cfg.get("performance", {}).get("supplier_debounce_ms", 250) or 250)
         try:
-            doc_id = int(self.doc_model.rows[index.row()][0])
+            self._sup_filter_timer.stop()
+        except Exception:
+            pass
+        self._sup_filter_timer.start(ms)
+
+    def _current_doc_filters(self):
+        q = (self.doc_filter.text() or "").strip()
+        if self.cb_all_dates.isChecked():
+            return q, None, None
+        df = self.doc_date_from.date().toPython()
+        dtv = self.doc_date_to.date().toPython()
+        if df and dtv and df > dtv:
+            df, dtv = dtv, df
+        return q, df, dtv
+
+    def _docs_new_search(self):
+        self._doc_offset = 0
+        self._preview_cache.clear()
+        self.preview_view.clear()
+        self._refresh_documents_page(reset=True)
+
+    def _docs_load_more(self):
+        if self._doc_offset >= self._doc_total:
+            return
+        self._refresh_documents_page(reset=False)
+
+    def _refresh_documents_page(self, reset: bool):
+        self._toggle_doc_dates(self.cb_all_dates.isChecked())
+        q, dfrom, dto = self._current_doc_filters()
+        with self.sf() as session:
+            self._doc_total = db_api.count_documents(session, q=q, date_from=dfrom, date_to=dto)
+            docs = db_api.list_documents(
+                session,
+                q=q,
+                date_from=dfrom,
+                date_to=dto,
+                limit=self._doc_page_size,
+                offset=self._doc_offset,
+            )
+
+        shown = min(self._doc_offset + len(docs), self._doc_total)
+        self.lbl_docs_page.setText(f"{shown} / {self._doc_total}")
+
+        headers = ["ID", "Datum", "IČO", "Číslo", "Účet", "Celkem", "Měna", "Kontrola"]
+        new_rows: List[List[Any]] = []
+        for d, f in docs:
+            new_rows.append([
+                d.id,
+                d.issue_date.isoformat() if d.issue_date else "",
+                d.supplier_ico or "",
+                d.doc_number or "",
+                d.bank_account or "",
+                d.total_with_vat or 0.0,
+                d.currency or "",
+                "ANO" if d.requires_review else "",
+            ])
+
+        if reset or self.docs_table.model() is None:
+            model = TableModel(headers, new_rows)
+        else:
+            model = self.docs_table.model()
+            try:
+                model.rows.extend(new_rows)  # type: ignore[attr-defined]
+                model.layoutChanged.emit()
+            except Exception:
+                model = TableModel(headers, new_rows)
+        self.docs_table.setModel(model)
+        self.docs_table.resizeColumnsToContents()
+
+        self._doc_offset += len(docs)
+
+    def refresh_documents(self):
+        # backward compatibility for existing call sites
+        self._docs_new_search()
+
+    def _open_selected_source(self):
+        p = (self.doc_src_line.text() or "").strip()
+        if not p:
+            return
+        fp = Path(p)
+        if not fp.exists():
+            QMessageBox.warning(self, "Soubor", "Soubor neexistuje.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(fp)))
+
+    def _on_doc_selected_fast(self, *_):
+        idx = self.docs_table.currentIndex()
+        if not idx.isValid():
+            return
+        model = self.docs_table.model()
+        if model is None:
+            return
+        try:
+            doc_id = int(model.rows[idx.row()][0])  # type: ignore[attr-defined]
         except Exception:
             return
+
         with self.sf() as session:
-            detail = db_api.get_document_detail(session, doc_id)
-            f: DocumentFile = detail["file"]
-            items: List[LineItem] = detail["items"]
-        it_rows = [[i.line_no, i.name, i.quantity, i.vat_rate, i.line_total] for i in items]
-        self.items_table.setModel(TableModel(["#", "Název", "Počet", "DPH %", "Cena"], it_rows))
-
-        # preview in background (PDF render / image load can block)
-        self.preview.setText("Načítám náhled…")
-        self.preview.setPixmap(QPixmap())
-        QApplication.processEvents()
-
-        p = Path(f.current_path)
-
-        def work():
-            if not p.exists():
-                raise FileNotFoundError(p)
-            if p.suffix.lower() == ".pdf":
-                return self._render_pdf_preview_bytes(p, dpi=160)
-            from PIL import Image
-            with Image.open(p) as img:
-                # ensure underlying file handle is released (Windows)
-                return pil_to_qimage(img.copy())
-
-        def done(res):
-            if res is None:
-                self.preview.setText("Nelze načíst náhled")
+            d = session.get(Document, doc_id)
+            if not d:
                 return
-            qimg = res
-            if isinstance(res, (bytes, bytearray)):
-                qimg = QImage.fromData(res, "PNG")
-            if qimg is None or (hasattr(qimg, "isNull") and qimg.isNull()):
-                self.preview.setText("Náhled se nepodařilo vytvořit")
-                return
-            pix = QPixmap.fromImage(qimg)
-            self.preview.setPixmap(pix.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            f = session.get(DocumentFile, d.file_id)
+            items = session.execute(select(LineItem).where(LineItem.document_id == doc_id).order_by(LineItem.line_no.asc())).scalars().all()
 
-        self._run_with_busy("Náhled", "Generuji náhled dokladu…", work, done)
+        src = f.current_path if f else ""
+        self.doc_src_line.setText(src or "")
+
+        item_headers = ["#", "Název", "Množství", "DPH", "Cena"]
+        item_rows: List[List[Any]] = []
+        for it in items:
+            item_rows.append([it.line_no, it.name, it.quantity, it.vat_rate, it.line_total])
+        self.items_table.setModel(TableModel(item_headers, item_rows))
+        self.items_table.resizeColumnsToContents()
+
+        self.preview_view.clear()
+        if src and src.lower().endswith(".pdf") and Path(src).exists():
+            key = (src, self._preview_dpi)
+            px = self._preview_cache.get(key)
+            if px is None:
+                try:
+                    imgs = render_pdf_to_images(Path(src), dpi=self._preview_dpi, max_pages=1)
+                    if imgs:
+                        px = pil_to_pixmap(imgs[0])
+                        self._preview_cache[key] = px
+                except Exception:
+                    px = QPixmap()
+            if px and not px.isNull():
+                self.preview_view.set_pixmap(px)
 
     def refresh_unrecognized(self):
         with self.sf() as session:
@@ -1362,9 +1504,7 @@ class MainWindow(QMainWindow):
 
     def _export(self, kind: str):
         # export current filtered documents (same filter as in UI)
-        q = self.ed_doc_search.text().strip()
-        dfrom = self.dt_from.date().toPython()
-        dto = self.dt_to.date().toPython()
+        q, dfrom, dto = self._current_doc_filters()
 
         default_name = f"kajovospend_export_{dt.date.today().isoformat()}.{kind}"
         path, _ = QFileDialog.getSaveFileName(self, f"Uložit {kind.upper()}", str(Path.home() / default_name))

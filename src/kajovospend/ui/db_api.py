@@ -69,38 +69,157 @@ def merge_suppliers(session: Session, keep_id: int, merge_ids: List[int]) -> Non
             session.delete(sup)
     session.flush()
 
-def list_documents(session: Session, q: str = "", date_from: Optional[dt.date] = None, date_to: Optional[dt.date] = None) -> List[Tuple[Document, DocumentFile]]:
-    stmt = select(Document, DocumentFile).join(DocumentFile, DocumentFile.id == Document.file_id)
+def _apply_date_filters(stmt, date_from=None, date_to=None):
     if date_from:
-        # Allow docs with unknown date to still show up (prevents "empty list" when OCR didn't extract date).
-        stmt = stmt.where((Document.issue_date.is_(None)) | (Document.issue_date >= date_from))
+        stmt = stmt.where(Document.issue_date >= date_from)
     if date_to:
-        stmt = stmt.where((Document.issue_date.is_(None)) | (Document.issue_date <= date_to))
-    if q.strip():
-        qtxt = q.strip()
-        ids = set()
-        try:
-            for row in session.execute(text("SELECT document_id FROM documents_fts WHERE documents_fts MATCH :q"), {"q": qtxt}).fetchall():
-                ids.add(int(row[0]))
-            for row in session.execute(text("SELECT document_id FROM items_fts WHERE items_fts MATCH :q"), {"q": qtxt}).fetchall():
-                ids.add(int(row[0]))
-        except Exception:
-            qq = f"%{qtxt}%"
-            stmt = (
-                stmt.where(
-                    (Document.doc_number.like(qq))
-                    | (Document.var_symbol.like(qq))
-                    | (Document.par_symbol.like(qq))
-                    | (Document.supplier_ico.like(qq))
-                    | (DocumentFile.current_path.like(qq))
-                )
-            )
-        else:
-            if not ids:
-                return []
-            stmt = stmt.where(Document.id.in_(sorted(ids)))
-    stmt = stmt.order_by(Document.issue_date.desc().nullslast(), Document.created_at.desc())
-    return list(session.execute(stmt).all())
+        stmt = stmt.where(Document.issue_date <= date_to)
+    return stmt
+
+
+def _fts_doc_ids_ranked(
+    session: Session,
+    q: str,
+    *,
+    date_from=None,
+    date_to=None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> List[int]:
+    qfts = (q or "").strip()
+
+    # Rank with bm25 and deduplicate by picking best rank per doc_id.
+    # Note: keep SQL small and deterministic; apply date filters on documents join.
+    where_date = ""
+    params: Dict[str, Any] = {"q": qfts}
+    if date_from is not None:
+        where_date += " AND d.issue_date >= :df"
+        params["df"] = date_from
+    if date_to is not None:
+        where_date += " AND d.issue_date <= :dt"
+        params["dt"] = date_to
+
+    lim_sql = ""
+    if limit is not None:
+        lim_sql = " LIMIT :lim OFFSET :off"
+        params["lim"] = int(limit)
+        params["off"] = int(offset or 0)
+
+    sql = f"""
+    WITH hits AS (
+      SELECT d.id AS doc_id, bm25(documents_fts) AS rank
+      FROM documents_fts
+      JOIN documents d ON d.id = documents_fts.document_id
+      WHERE documents_fts MATCH :q {where_date}
+
+      UNION ALL
+
+      SELECT d.id AS doc_id, bm25(items_fts) AS rank
+      FROM items_fts
+      JOIN line_items li ON li.id = items_fts.line_item_id
+      JOIN documents d ON d.id = li.document_id
+      WHERE items_fts MATCH :q {where_date}
+    ),
+    dedup AS (
+      SELECT doc_id, MIN(rank) AS rank
+      FROM hits
+      GROUP BY doc_id
+    )
+    SELECT doc_id
+    FROM dedup
+    ORDER BY rank ASC
+    {lim_sql}
+    """
+    rows = session.execute(text(sql), params).fetchall()
+    return [int(r.doc_id) for r in rows]
+
+
+def count_documents(session: Session, q: str = "", date_from=None, date_to=None) -> int:
+    q = (q or "").strip()
+    if q:
+        where_date = ""
+        params: Dict[str, Any] = {"q": q}
+        if date_from is not None:
+            where_date += " AND d.issue_date >= :df"
+            params["df"] = date_from
+        if date_to is not None:
+            where_date += " AND d.issue_date <= :dt"
+            params["dt"] = date_to
+
+        sql = f"""
+        WITH hits AS (
+          SELECT d.id AS doc_id
+          FROM documents_fts
+          JOIN documents d ON d.id = documents_fts.document_id
+          WHERE documents_fts MATCH :q {where_date}
+
+          UNION
+
+          SELECT d.id AS doc_id
+          FROM items_fts
+          JOIN line_items li ON li.id = items_fts.line_item_id
+          JOIN documents d ON d.id = li.document_id
+          WHERE items_fts MATCH :q {where_date}
+        )
+        SELECT COUNT(*) AS c FROM hits
+        """
+        return int(session.execute(text(sql), params).scalar_one() or 0)
+
+    stmt = select(func.count(Document.id))
+    stmt = _apply_date_filters(stmt, date_from=date_from, date_to=date_to)
+    return int(session.execute(stmt).scalar_one() or 0)
+
+
+def list_documents(
+    session: Session,
+    q: str = "",
+    date_from=None,
+    date_to=None,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> List[Tuple[Document, DocumentFile]]:
+    """
+    Fast document listing suitable for tens of thousands of rows:
+    - supports pagination (limit/offset)
+    - FTS search returns ranked docs (bm25) and only loads the requested page.
+    """
+    q = (q or "").strip()
+    if q:
+        ids = _fts_doc_ids_ranked(
+            session,
+            q,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+        )
+        if not ids:
+            return []
+
+        stmt = (
+            select(Document, DocumentFile)
+            .join(DocumentFile, Document.file_id == DocumentFile.id)
+            .where(Document.id.in_(ids))
+        )
+        # extra safety on date range (even if already applied in FTS)
+        stmt = _apply_date_filters(stmt, date_from=date_from, date_to=date_to)
+        rows = session.execute(stmt).all()
+        by_id: Dict[int, Tuple[Document, DocumentFile]] = {int(d.id): (d, f) for d, f in rows}
+        # keep FTS order
+        return [by_id[i] for i in ids if i in by_id]
+
+    stmt = (
+        select(Document, DocumentFile)
+        .join(DocumentFile, Document.file_id == DocumentFile.id)
+        .order_by(Document.issue_date.desc().nullslast(), Document.id.desc())
+    )
+    stmt = _apply_date_filters(stmt, date_from=date_from, date_to=date_to)
+    if limit is not None:
+        stmt = stmt.limit(int(limit))
+    if offset:
+        stmt = stmt.offset(int(offset))
+    return session.execute(stmt).all()
 
 
 def get_document_detail(session: Session, doc_id: int) -> Dict[str, Any]:

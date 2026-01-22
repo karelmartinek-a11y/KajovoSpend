@@ -11,7 +11,10 @@ class Supplier(Base):
     __tablename__ = "suppliers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ico: Mapped[str] = mapped_column(String(16), unique=True, index=True)
+    # Canonical IČO (usually 8 digits, but we store whatever upstream provides)
+    ico: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    # Normalized IČO used for fast matching (digits-only, left padded to 8 where applicable)
+    ico_norm: Mapped[str | None] = mapped_column(String(16), unique=True, index=True, nullable=True)
     dic: Mapped[str | None] = mapped_column(String(32), nullable=True)
     name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     legal_form: Mapped[str | None] = mapped_column(String(256), nullable=True)
@@ -53,7 +56,7 @@ class Document(Base):
 
     supplier_ico: Mapped[str | None] = mapped_column(String(16), index=True, nullable=True)
     doc_number: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
-    bank_account: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    bank_account: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     issue_date: Mapped[dt.date | None] = mapped_column(Date, nullable=True)
     total_with_vat: Mapped[float | None] = mapped_column(Float, nullable=True)
     currency: Mapped[str] = mapped_column(String(8), default="CZK")
