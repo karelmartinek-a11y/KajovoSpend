@@ -26,7 +26,7 @@ from kajovospend.db.session import make_engine, make_session_factory
 from kajovospend.db.migrate import init_db
 from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem
 from kajovospend.db.queries import upsert_supplier
-from kajovospend.integrations.ares import fetch_by_ico
+from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
 from kajovospend.integrations.openai_fallback import list_models
 from kajovospend.service.control_client import send_cmd
 from kajovospend.ocr.pdf_render import render_pdf_to_images
@@ -929,7 +929,12 @@ class MainWindow(QMainWindow):
         if sid is None:
             QMessageBox.warning(self, "ARES", "Vyber přesně jednoho dodavatele v tabulce.")
             return
-        ico = self.sup_ico.text().strip()
+        ico_raw = self.sup_ico.text().strip()
+        try:
+            ico = normalize_ico(ico_raw)
+        except Exception as e:
+            QMessageBox.warning(self, "ARES", f"Neplatné IČO: {e}")
+            return
         if not ico:
             QMessageBox.warning(self, "ARES", "Dodavatel nemá IČO.")
             return
@@ -953,6 +958,7 @@ class MainWindow(QMainWindow):
                     orientation_number=rec.orientation_number,
                     city=rec.city,
                     zip_code=rec.zip_code,
+                    overwrite=True,
                 )
                 session.commit()
                 sid_loc = int(s.id)
