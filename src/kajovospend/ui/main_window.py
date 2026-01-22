@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import queue
 import subprocess
 import sys
+import multiprocessing as mp
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -722,6 +725,48 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _render_pdf_preview_bytes(self, path: Path, dpi: int = 160) -> bytes | None:
+        """
+        Render první stránku PDF v samostatném procesu, aby případné chyby
+        v pdfiu/pillow nesestřelily celé GUI. Vrací PNG byty nebo None.
+        """
+        ctx = mp.get_context("spawn")
+        q: mp.Queue = ctx.Queue(maxsize=1)
+
+        def _worker(pdf_path: str, dpi_val: int, out_q):
+            try:
+                from pathlib import Path
+                from kajovospend.ocr.pdf_render import render_pdf_to_images
+
+                imgs = render_pdf_to_images(Path(pdf_path), dpi=dpi_val, max_pages=1)
+                if not imgs:
+                    out_q.put(None)
+                    return
+                buf = BytesIO()
+                imgs[0].save(buf, format="PNG")
+                out_q.put(buf.getvalue())
+            except Exception as exc:
+                try:
+                    out_q.put({"error": str(exc)})
+                except Exception:
+                    pass
+
+        proc = ctx.Process(target=_worker, args=(str(path), dpi, q))
+        proc.start()
+        proc.join(10)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(2)
+            self.log.warning("Preview render timed out; killed worker for %s", path)
+        try:
+            res = q.get_nowait()
+        except queue.Empty:
+            res = None
+
+        if isinstance(res, dict) and "error" in res:
+            raise RuntimeError(res["error"])
+        return res if isinstance(res, (bytes, bytearray)) else None
+
     def _export_with_busy(self, fmt: str) -> None:
         """
         Export může obsahovat UI interakce (např. dialog pro výběr souboru),
@@ -1158,19 +1203,24 @@ class MainWindow(QMainWindow):
         p = Path(f.current_path)
 
         def work():
+            if not p.exists():
+                raise FileNotFoundError(p)
             if p.suffix.lower() == ".pdf":
-                imgs = render_pdf_to_images(p, dpi=160, max_pages=1)
-                if not imgs:
-                    return None
-                return pil_to_qimage(imgs[0])
+                return self._render_pdf_preview_bytes(p, dpi=160)
             from PIL import Image
             with Image.open(p) as img:
                 # ensure underlying file handle is released (Windows)
                 return pil_to_qimage(img.copy())
 
-        def done(qimg):
-            if qimg is None:
+        def done(res):
+            if res is None:
                 self.preview.setText("Nelze načíst náhled")
+                return
+            qimg = res
+            if isinstance(res, (bytes, bytearray)):
+                qimg = QImage.fromData(res, "PNG")
+            if qimg is None or (hasattr(qimg, "isNull") and qimg.isNull()):
+                self.preview.setText("Náhled se nepodařilo vytvořit")
                 return
             pix = QPixmap.fromImage(qimg)
             self.preview.setPixmap(pix.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
