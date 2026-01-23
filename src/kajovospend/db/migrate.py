@@ -96,6 +96,16 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         if "page_to" not in doc_col_names:
             con.execute(text("ALTER TABLE documents ADD COLUMN page_to INTEGER"))
 
+        # items: UI expects unit_price/ean/item_code
+        cols_items = con.execute(text("PRAGMA table_info('items')")).fetchall()
+        item_col_names = {row[1] for row in cols_items}
+        if "unit_price" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN unit_price REAL"))
+        if "ean" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN ean TEXT"))
+        if "item_code" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN item_code TEXT"))
+
         # --- indexes (IF NOT EXISTS is safe) ---
         # Supplier fast lookups / joins
         con.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_suppliers_ico_norm ON suppliers(ico_norm)"))
@@ -112,6 +122,9 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
 
         # Line items foreign key / filtering
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_document_id ON items(document_id)"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_name ON items(name)"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_ean ON items(ean)"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_item_code ON items(item_code)"))
 
 def init_db(engine: Engine) -> None:
     # ensure tables exist

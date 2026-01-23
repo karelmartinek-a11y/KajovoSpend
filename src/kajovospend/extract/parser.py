@@ -39,6 +39,10 @@ def _norm_amount(s: str) -> float:
     return float(s)
 
 
+def _safe_float(s: str) -> float:
+    return float(str(s).strip().replace("\xa0", " ").replace(" ", "").replace(",", "."))
+
+
 def _find_first(patterns: list[re.Pattern], text: str) -> Optional[str]:
     for p in patterns:
         m = p.search(text)
@@ -145,10 +149,11 @@ def extract_from_text(text: str) -> Extracted:
         if m:
             try:
                 name = m.group("name").strip()
-                qty = float(m.group("qty").replace(",", "."))
+                qty = _safe_float(m.group("qty"))
+                unit_price = _norm_amount(m.group("unit"))
                 vat = float(m.group("vat"))
                 line_total = _norm_amount(m.group("total"))
-                items.append({"name": name, "quantity": qty, "vat_rate": vat, "line_total": line_total})
+                items.append({"name": name, "quantity": qty, "unit_price": unit_price, "vat_rate": vat, "line_total": line_total})
             except Exception:
                 continue
 
@@ -170,11 +175,12 @@ def extract_from_text(text: str) -> Extracted:
             m2 = qty_price_pat.match(ln)
             if m2:
                 try:
-                    qty = float(m2.group("qty").replace(",", "."))
+                    qty = _safe_float(m2.group("qty"))
+                    unit_price = _norm_amount(m2.group("unit"))
                     line_total = _norm_amount(m2.group("total"))
                     vat_letter = (m2.group("vat_letter") or "").strip().upper()
                     vat = _VAT_LETTER_MAP.get(vat_letter, 0.0)
-                    items.append({"name": pending_name, "quantity": qty, "vat_rate": vat, "line_total": line_total})
+                    items.append({"name": pending_name, "quantity": qty, "unit_price": unit_price, "vat_rate": vat, "line_total": line_total})
                 except Exception:
                     pass
                 pending_name = None

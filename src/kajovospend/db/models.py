@@ -92,8 +92,11 @@ class LineItem(Base):
 
     name: Mapped[str] = mapped_column(String(512))
     quantity: Mapped[float] = mapped_column(Float, default=1.0)
+    unit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     vat_rate: Mapped[float] = mapped_column(Float, default=0.0)
     line_total: Mapped[float] = mapped_column(Float, default=0.0)
+    ean: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    item_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     document: Mapped[Document] = relationship(back_populates="items")
 

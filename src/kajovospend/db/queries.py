@@ -92,6 +92,29 @@ def upsert_supplier(
     return s
 
 
+def _to_float(v, default: float = 0.0) -> float:
+    if v is None:
+        return float(default)
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        s = str(v).strip().replace("\xa0", " ").replace(" ", "").replace(",", ".")
+        if not s:
+            return float(default)
+        return float(s)
+    except Exception:
+        return float(default)
+
+
+def _to_str(v, max_len: int) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    return s[:max_len]
+
+
 def create_file_record(session: Session, sha256: str, original_name: str, path: str, pages: int, status: str,
                        mime_type: str | None = None) -> DocumentFile:
     f = DocumentFile(
@@ -134,13 +157,23 @@ def add_document(session: Session, file_id: int, supplier_id: int | None, suppli
     session.flush()
     line_no = 1
     for it in items:
+        qty = _to_float(it.get("quantity"), 1.0)
+        unit_price = it.get("unit_price")
+        unit_price_f = None if unit_price is None else _to_float(unit_price, 0.0)
+        line_total = _to_float(it.get("line_total"), 0.0)
+        # If line_total is missing/zero but unit_price exists, deterministically compute.
+        if (line_total == 0.0) and (unit_price_f is not None) and (qty != 0.0):
+            line_total = round(qty * unit_price_f, 2)
         li = LineItem(
             document_id=d.id,
             line_no=line_no,
             name=str(it.get("name") or "").strip()[:512] or f"Položka {line_no}",
-            quantity=float(it.get("quantity") or 1.0),
-            vat_rate=float(it.get("vat_rate") or 0.0),
-            line_total=float(it.get("line_total") or 0.0),
+            quantity=qty,
+            unit_price=unit_price_f,
+            vat_rate=_to_float(it.get("vat_rate"), 0.0),
+            line_total=line_total,
+            ean=_to_str(it.get("ean"), 64),
+            item_code=_to_str(it.get("item_code"), 64),
         )
         session.add(li)
         line_no += 1
