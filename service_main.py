@@ -6,6 +6,11 @@ import signal
 import sys
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parent
+SRC_DIR = ROOT_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 from kajovospend.utils.config import load_yaml
 from kajovospend.utils.paths import resolve_app_paths, default_data_dir
 from kajovospend.utils.logging_setup import setup_logging

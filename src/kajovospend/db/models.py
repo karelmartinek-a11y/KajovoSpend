@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import List
 
 from .base import Base
 
@@ -27,7 +28,7 @@ class Supplier(Base):
     is_vat_payer: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     ares_last_sync: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
-    documents: Mapped[list[Document]] = relationship(back_populates="supplier")  # type: ignore[name-defined]
+    documents: Mapped[List["Document"]] = relationship(back_populates="supplier")  # type: ignore[name-defined]
 
 
 class DocumentFile(Base):
@@ -45,7 +46,7 @@ class DocumentFile(Base):
     processed_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     # one file can contain multiple documents (e.g., multiple receipts in one PDF)
-    documents: Mapped[list[Document]] = relationship(back_populates="file", cascade="all, delete-orphan")  # type: ignore[name-defined]
+    documents: Mapped[List["Document"]] = relationship(back_populates="file", cascade="all, delete-orphan")  # type: ignore[name-defined]
 
 
 class Document(Base):
@@ -75,7 +76,7 @@ class Document(Base):
 
     file: Mapped[DocumentFile] = relationship(back_populates="documents")
     supplier: Mapped[Supplier | None] = relationship(back_populates="documents")
-    items: Mapped[list[LineItem]] = relationship(back_populates="document", cascade="all, delete-orphan")  # type: ignore[name-defined]
+    items: Mapped[List["LineItem"]] = relationship(back_populates="document", cascade="all, delete-orphan")  # type: ignore[name-defined]
 
     __table_args__ = (
         Index("ix_documents_issue_date", "issue_date"),

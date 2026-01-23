@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "kajovospend"
 version = "0.1.0"
 description = "KájovoSpend – evidence and categorization of expenses"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 readme = "README.md"
 
 [tool.setuptools]
