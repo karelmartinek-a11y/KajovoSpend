@@ -106,6 +106,26 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         if "item_code" not in item_col_names:
             con.execute(text("ALTER TABLE items ADD COLUMN item_code TEXT"))
 
+        # service_state: observability columns (idempotent)
+        cols_ss = con.execute(text("PRAGMA table_info('service_state')")).fetchall()
+        ss_col_names = {row[1] for row in cols_ss}
+        for name, coltype, dflt in [
+            ("inflight", "INTEGER", "0"),
+            ("max_workers", "INTEGER", "0"),
+            ("current_job_id", "INTEGER", "NULL"),
+            ("current_path", "TEXT", "NULL"),
+            ("current_phase", "TEXT", "NULL"),
+            ("current_progress", "REAL", "NULL"),
+            ("heartbeat_at", "TEXT", "NULL"),
+            ("stuck", "INTEGER", "0"),
+            ("stuck_reason", "TEXT", "NULL"),
+        ]:
+            if name not in ss_col_names:
+                if dflt == "NULL":
+                    con.execute(text(f"ALTER TABLE service_state ADD COLUMN {name} {coltype}"))
+                else:
+                    con.execute(text(f"ALTER TABLE service_state ADD COLUMN {name} {coltype} DEFAULT {dflt}"))
+
         # --- indexes (IF NOT EXISTS is safe) ---
         # Supplier fast lookups / joins
         con.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_suppliers_ico_norm ON suppliers(ico_norm)"))
@@ -137,8 +157,8 @@ def init_db(engine: Engine) -> None:
         con.execute(
             text(
                 """
-                INSERT OR IGNORE INTO service_state (singleton, running, queue_size)
-                VALUES (1, 0, 0)
+                INSERT OR IGNORE INTO service_state (singleton, running, queue_size, inflight, max_workers, stuck)
+                VALUES (1, 0, 0, 0, 0, 0)
                 """
             )
         )

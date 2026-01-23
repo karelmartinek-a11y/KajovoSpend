@@ -399,8 +399,29 @@ class StatusDialog(QDialog):
         txt = QTextEdit()
         txt.setReadOnly(True)
         lines = []
-        for k in ["running", "queue_size", "last_success", "last_error", "last_error_at", "last_seen"]:
-            lines.append(f"{k}: {status.get(k)}")
+        keys = [
+            "running",
+            "queue_size",
+            "inflight",
+            "max_workers",
+            "current_phase",
+            "current_progress",
+            "current_job_id",
+            "current_path",
+            "heartbeat_at",
+            "stuck",
+            "stuck_reason",
+            "last_success",
+            "last_error",
+            "last_error_at",
+            "last_seen",
+        ]
+        for k in keys:
+            v = status.get(k)
+            # shorten long paths a bit
+            if k == "current_path" and isinstance(v, str) and len(v) > 140:
+                v = "…" + v[-140:]
+            lines.append(f"{k}: {v}")
         txt.setText("\n".join(lines))
         lay.addWidget(txt)
         bb = QDialogButtonBox(QDialogButtonBox.Ok)

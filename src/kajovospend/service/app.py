@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -77,6 +78,30 @@ class ServiceApp:
         session.flush()
         return job
 
+    def _watchdog_mark_stuck(self, session: Session, timeout_sec: int) -> int:
+        """
+        If a job is RUNNING for too long, mark it ERROR to avoid infinite "zaseknutá fronta".
+        Deterministic rule: started_at older than now-timeout => ERROR (stuck_timeout).
+        """
+        if timeout_sec <= 0:
+            return 0
+        cutoff = dt.datetime.utcnow() - dt.timedelta(seconds=int(timeout_sec))
+        stuck_jobs = session.execute(
+            select(ImportJob).where(
+                (ImportJob.status == "RUNNING") &
+                (ImportJob.started_at != None) &  # noqa: E711
+                (ImportJob.started_at < cutoff)
+            )
+        ).scalars().all()
+        n = 0
+        for j in stuck_jobs:
+            j.status = "ERROR"
+            j.error = f"stuck_timeout>{timeout_sec}s"
+            j.finished_at = dt.datetime.utcnow()
+            session.add(j)
+            n += 1
+        return n
+
     def _run_job(self, job_id: int):
         with self.sf() as session:
             job = session.get(ImportJob, job_id)
@@ -84,6 +109,18 @@ class ServiceApp:
                 return
             p = Path(job.path)
             try:
+                # best-effort "current job" observability
+                update_service_state(
+                    session,
+                    current_job_id=int(job.id),
+                    current_path=str(p),
+                    current_phase="processing",
+                    current_progress=0.0,
+                    heartbeat_at=dt.datetime.utcnow(),
+                    inflight=self._inflight_count(),
+                    max_workers=int(self._max_workers),
+                )
+                session.commit()
                 if not p.exists():
                     job.status = "ERROR"
                     job.error = "file_missing"
@@ -99,6 +136,13 @@ class ServiceApp:
                 st = session.get(ServiceState, 1)
                 if st:
                     st.queue_size = queue_size(session)
+                    st.inflight = self._inflight_count()
+                    st.max_workers = int(self._max_workers)
+                    st.current_progress = 100.0
+                    st.heartbeat_at = dt.datetime.utcnow()
+                    st.current_phase = "dispatching"
+                    st.current_job_id = None
+                    st.current_path = None
                     if job.status in ("PROCESSED",):
                         st.last_success = dt.datetime.utcnow()
                     elif job.status in ("ERROR",):
@@ -112,7 +156,14 @@ class ServiceApp:
                     job.error = str(e)
                     job.finished_at = dt.datetime.utcnow()
                     session.add(job)
-                    update_service_state(session, last_error=str(e), last_error_at=dt.datetime.utcnow())
+                    update_service_state(
+                        session,
+                        last_error=str(e),
+                        last_error_at=dt.datetime.utcnow(),
+                        current_phase="error",
+                        heartbeat_at=dt.datetime.utcnow(),
+                        inflight=self._inflight_count(),
+                    )
                     session.commit()
                 except Exception:
                     self.log.exception("Failed to persist job failure state")
@@ -129,6 +180,15 @@ class ServiceApp:
                 "last_error_at": st.last_error_at.isoformat() if st.last_error_at else None,
                 "queue_size": int(st.queue_size or 0),
                 "last_seen": st.last_seen.isoformat() if st.last_seen else None,
+                "inflight": int(st.inflight or 0),
+                "max_workers": int(st.max_workers or 0),
+                "current_job_id": int(st.current_job_id) if st.current_job_id is not None else None,
+                "current_path": st.current_path,
+                "current_phase": st.current_phase,
+                "current_progress": float(st.current_progress) if st.current_progress is not None else None,
+                "heartbeat_at": st.heartbeat_at.isoformat() if st.heartbeat_at else None,
+                "stuck": bool(st.stuck) if st.stuck is not None else False,
+                "stuck_reason": st.stuck_reason,
             }
 
     def request_stop(self) -> None:
@@ -137,15 +197,39 @@ class ServiceApp:
     def run_forever(self):
         # mark running
         with self.sf() as session:
-            update_service_state(session, running=True)
+            update_service_state(
+                session,
+                running=True,
+                max_workers=int(self._max_workers),
+                inflight=0,
+                current_phase="idle",
+                heartbeat_at=dt.datetime.utcnow(),
+                stuck=False,
+                stuck_reason=None,
+            )
             session.commit()
 
         self._watcher.start()
         scan_interval = float(self.cfg["service"].get("scan_interval_sec", 2))
+        watchdog_sec = int(self.cfg.get("service", {}).get("watchdog_timeout_sec", 900) or 900)
 
         try:
             while not self._stop.is_set():
+                # watchdog: clear stuck RUNNING jobs (so UI can see what's wrong)
+                with self.sf() as session:
+                    n_stuck = self._watchdog_mark_stuck(session, watchdog_sec)
+                    if n_stuck:
+                        update_service_state(
+                            session,
+                            last_error=f"watchdog: {n_stuck} job(s) stuck_timeout",
+                            last_error_at=dt.datetime.utcnow(),
+                            stuck=True,
+                            stuck_reason=f"stuck_timeout>{watchdog_sec}s",
+                        )
+                    session.commit()
+
                 # scan for missed files
+                phase = "scanning"
                 for p in scan_directory(Path(self.cfg["paths"]["input_dir"])):
                     self.enqueue_path(p)
 
@@ -155,6 +239,10 @@ class ServiceApp:
                         session,
                         queue_size=queue_size(session),
                         last_seen=dt.datetime.utcnow(),
+                        inflight=self._inflight_count(),
+                        max_workers=int(self._max_workers),
+                        current_phase="dispatching",
+                        heartbeat_at=dt.datetime.utcnow(),
                     )
                     session.commit()
 
@@ -169,6 +257,16 @@ class ServiceApp:
                         session.commit()
                         self._submit_job(job_id)
                         dispatched += 1
+
+                # if idle, mark so dashboard shows "nic neběží"
+                with self.sf() as session:
+                    update_service_state(
+                        session,
+                        inflight=self._inflight_count(),
+                        current_phase=("idle" if (self._inflight_count() == 0 and queue_size(session) == 0) else "dispatching"),
+                        heartbeat_at=dt.datetime.utcnow(),
+                    )
+                    session.commit()
 
                 time.sleep(scan_interval)
         finally:
@@ -188,6 +286,9 @@ class ServiceApp:
                         running=False,
                         last_seen=dt.datetime.utcnow(),
                         queue_size=queue_size(session),
+                        inflight=0,
+                        current_phase="shutdown",
+                        heartbeat_at=dt.datetime.utcnow(),
                     )
                     session.commit()
             except Exception:

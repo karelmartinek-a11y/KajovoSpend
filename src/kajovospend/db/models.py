@@ -130,3 +130,14 @@ class ServiceState(Base):
     last_error_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     queue_size: Mapped[int] = mapped_column(Integer, default=0)
     last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # dashboard / observability
+    inflight: Mapped[int] = mapped_column(Integer, default=0)                 # futures currently running
+    max_workers: Mapped[int] = mapped_column(Integer, default=0)              # configured worker pool size
+    current_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_phase: Mapped[str | None] = mapped_column(String(32), nullable=True)   # idle/scanning/dispatching/processing/shutdown
+    current_progress: Mapped[float | None] = mapped_column(Float, nullable=True)  # 0..100 best-effort
+    heartbeat_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    stuck: Mapped[bool] = mapped_column(Boolean, default=False)
+    stuck_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
