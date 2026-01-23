@@ -498,7 +498,9 @@ class MainWindow(QMainWindow):
 
         # selection model guards to prevent duplicate signal connections after model resets
         self._docs_sel_model = None
+        self._docs_sel_connected = False
         self._unrec_sel_model = None
+        self._unrec_sel_connected = False
 
         # paging for per-item search tab
         self._items_page_size = int(self.cfg.get("performance", {}).get("items_page_size", 1000) or 1000)
@@ -1500,18 +1502,18 @@ class MainWindow(QMainWindow):
         try:
             sm = self.docs_table.selectionModel()
             if sm:
-                # disconnect previous selection model (model resets create a new selection model)
-                if self._docs_sel_model is not None and self._docs_sel_model is not sm:
-                    try:
-                        self._docs_sel_model.selectionChanged.disconnect(self._docs_selection_changed_v2)
-                    except Exception:
-                        pass
-                self._docs_sel_model = sm
-                try:
-                    sm.selectionChanged.disconnect(self._docs_selection_changed_v2)
-                except Exception:
-                    pass
-                sm.selectionChanged.connect(self._docs_selection_changed_v2)
+                # odpoj předchozí model jen pokud byl skutečně připojen
+                if self._docs_sel_model is not sm:
+                    if self._docs_sel_connected and self._docs_sel_model is not None:
+                        try:
+                            self._docs_sel_model.selectionChanged.disconnect(self._docs_selection_changed_v2)
+                        except Exception:
+                            pass
+                        self._docs_sel_connected = False
+                    self._docs_sel_model = sm
+                if not self._docs_sel_connected:
+                    sm.selectionChanged.connect(self._docs_selection_changed_v2)
+                    self._docs_sel_connected = True
             if reset and self._docs_listing:
                 idx = self.docs_table.model().index(0, 0)
                 self.docs_table.setCurrentIndex(idx)
@@ -1721,17 +1723,17 @@ class MainWindow(QMainWindow):
         try:
             sm = self.unrec_table.selectionModel()
             if sm:
-                if self._unrec_sel_model is not None and self._unrec_sel_model is not sm:
-                    try:
-                        self._unrec_sel_model.selectionChanged.disconnect(self._unrec_selection_changed_v2)
-                    except Exception:
-                        pass
-                self._unrec_sel_model = sm
-                try:
-                    sm.selectionChanged.disconnect(self._unrec_selection_changed_v2)
-                except Exception:
-                    pass
-                sm.selectionChanged.connect(self._unrec_selection_changed_v2)
+                if self._unrec_sel_model is not sm:
+                    if self._unrec_sel_connected and self._unrec_sel_model is not None:
+                        try:
+                            self._unrec_sel_model.selectionChanged.disconnect(self._unrec_selection_changed_v2)
+                        except Exception:
+                            pass
+                        self._unrec_sel_connected = False
+                    self._unrec_sel_model = sm
+                if not self._unrec_sel_connected:
+                    sm.selectionChanged.connect(self._unrec_selection_changed_v2)
+                    self._unrec_sel_connected = True
             if self._unrec_listing:
                 idx = self.unrec_table.model().index(0, 0)
                 self.unrec_table.setCurrentIndex(idx)
