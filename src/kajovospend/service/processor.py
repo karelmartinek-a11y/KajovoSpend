@@ -150,7 +150,11 @@ class Processor:
         extracted = extract_from_text(ocr_text)
 
         method = "offline"
-        if extracted.confidence < 0.75 and self.cfg.get("openai", {}).get("enabled"):
+        # Podle zadání: když offline nedá deterministicky dobrý výsledek (requires_review),
+        # zkusíme OpenAI fallback ještě před karanténou.
+        # Dříve se fallback spouštěl jen při confidence<0.75, což neřešilo případy "nesedí součet"
+        # i když byly vytažené všechny fieldy. (requires_review=True, confidence klidně 1.0)
+        if (extracted.requires_review or extracted.confidence < 0.75) and self.cfg.get("openai", {}).get("enabled"):
             api_key = str(self.cfg["openai"].get("api_key") or "").strip()
             model = str(self.cfg["openai"].get("model") or "").strip()
             if api_key and model:
@@ -180,6 +184,7 @@ class Processor:
                             extracted.currency = str(obj.get("currency"))
                         if obj.get("items"):
                             extracted.items = list(obj.get("items"))
+                        # po OpenAI ještě jednou necháme parser-normalizaci a součet vyhodnotit v dalším kroku (DB/UI)
                         extracted.confidence = max(extracted.confidence, 0.85)
                         extracted.requires_review = False
                         extracted.review_reasons = [r for r in extracted.review_reasons if r != "nízká jistota vytěžení"]

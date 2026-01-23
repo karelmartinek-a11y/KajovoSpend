@@ -36,7 +36,7 @@ _SCHEMA = {
     "total_with_vat": "number",
     "currency": "string",
     "items": [
-        {"name": "string", "quantity": "number", "vat_rate": "number", "line_total": "number"}
+        {"name": "string", "quantity": "number", "unit_price": "number", "vat_rate": "number", "line_total": "number"}
     ],
 }
 

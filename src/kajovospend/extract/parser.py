@@ -38,6 +38,40 @@ def _norm_amount(s: str) -> float:
     s = s.replace(",", ".")
     return float(s)
 
+def _f(v, default: float = 0.0) -> float:
+    if v is None:
+        return float(default)
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        s = str(v).strip().replace("\xa0", " ").replace(" ", "").replace(",", ".")
+        if not s:
+            return float(default)
+        return float(s)
+    except Exception:
+        return float(default)
+
+def _normalize_items(items: List[dict], reasons: List[str]) -> None:
+    """
+    Sjednotí položky do deterministické podoby pro výpočty:
+    - když chybí line_total a máme qty+unit_price -> dopočítá
+    - když line_total zjevně obsahuje jednotkovou cenu (qty>1 a line_total≈unit_price) -> opraví na qty*unit_price
+    """
+    for it in items:
+        q = _f(it.get("quantity"), 1.0)
+        up = it.get("unit_price")
+        upf = None if up is None else _f(up, 0.0)
+        lt = _f(it.get("line_total"), 0.0)
+        # dopočet, když line_total chybí
+        if (lt <= 0.0) and (upf is not None) and (q > 0):
+            it["line_total"] = round(q * upf, 2)
+            continue
+        # častý OCR/format case: line_total je ve skutečnosti jednotková cena
+        if (upf is not None) and (q > 1.0) and (lt > 0.0):
+            if abs(lt - upf) <= 0.02 and abs((q * upf) - lt) > 0.05:
+                it["line_total"] = round(q * upf, 2)
+                reasons.append("oprava položky: řádková cena dopočtena z qty*unit_price")
+
 
 def _safe_float(s: str) -> float:
     return float(str(s).strip().replace("\xa0", " ").replace(" ", "").replace(",", "."))
@@ -190,33 +224,55 @@ def extract_from_text(text: str) -> Extracted:
     # --- kontrola součtu položek vs. celkem ---
     # Cíl: co nejvíc dokladů vyřešit offline, a na OpenAI posílat jen minimum.
     reasons: List[str] = []
+    if items:
+        _normalize_items(items, reasons)
     if items and total is not None and total > 0:
         try:
-            sum_items = float(sum(float(i.get("line_total") or 0.0) for i in items))
-            rel_diff = abs(sum_items - total) / max(total, 1e-9)
-            # běžně rounding/DPH rozdíly do ~1.5%; necháme rezervu i pro různé formáty => 3%
-            tol = 0.03
-            if rel_diff > tol:
-                # pokus: položky jsou bez DPH, ale celkem je s DPH
+            sum_items = float(sum(_f(i.get("line_total"), 0.0) for i in items))
+            diff = abs(sum_items - total)
+            rel_diff = diff / max(total, 1e-9)
+
+            # tolerance: kombinace relativní + absolutní (u malých účtenek absolutní hraje velkou roli)
+            rel_tol = 0.03   # ~3% (rezerva pro různé formáty)
+            abs_tol = 2.00   # 2 Kč (zaokrouhlení, drobné přepočty)
+
+            def _ok(d: float, r: float) -> bool:
+                return (d <= abs_tol) or (r <= rel_tol)
+
+            if not _ok(diff, rel_diff):
+                # pokus A: položky jsou bez DPH, celkem je s DPH
                 sum_items_gross = 0.0
                 for it in items:
-                    lt = float(it.get("line_total") or 0.0)
-                    vr = float(it.get("vat_rate") or 0.0)
-                    if vr > 0:
-                        sum_items_gross += lt * (1.0 + vr / 100.0)
-                    else:
-                        sum_items_gross += lt
-                rel_diff2 = abs(sum_items_gross - total) / max(total, 1e-9)
-                if rel_diff2 + 1e-9 < rel_diff and rel_diff2 <= tol:
-                    # upravíme line_total na částky s DPH pro položky s DPH > 0
+                    lt = _f(it.get("line_total"), 0.0)
+                    vr = _f(it.get("vat_rate"), 0.0)
+                    sum_items_gross += (lt * (1.0 + vr / 100.0)) if vr > 0 else lt
+                diff_g = abs(sum_items_gross - total)
+                rel_g = diff_g / max(total, 1e-9)
+                if _ok(diff_g, rel_g) and (diff_g + 1e-9 < diff):
                     for it in items:
-                        lt = float(it.get("line_total") or 0.0)
-                        vr = float(it.get("vat_rate") or 0.0)
+                        lt = _f(it.get("line_total"), 0.0)
+                        vr = _f(it.get("vat_rate"), 0.0)
                         if vr > 0:
                             it["line_total"] = round(lt * (1.0 + vr / 100.0), 2)
                     reasons.append("položky přepočteny z bez DPH na s DPH")
                 else:
-                    reasons.append("nesedí součet položek vs. celkem")
+                    # pokus B: položky jsou s DPH, ale celkem je bez DPH (méně časté, ale existuje)
+                    sum_items_net = 0.0
+                    for it in items:
+                        lt = _f(it.get("line_total"), 0.0)
+                        vr = _f(it.get("vat_rate"), 0.0)
+                        sum_items_net += (lt / (1.0 + vr / 100.0)) if vr > 0 else lt
+                    diff_n = abs(sum_items_net - total)
+                    rel_n = diff_n / max(total, 1e-9)
+                    if _ok(diff_n, rel_n) and (diff_n + 1e-9 < diff):
+                        for it in items:
+                            lt = _f(it.get("line_total"), 0.0)
+                            vr = _f(it.get("vat_rate"), 0.0)
+                            if vr > 0:
+                                it["line_total"] = round(lt / (1.0 + vr / 100.0), 2)
+                        reasons.append("položky přepočteny ze s DPH na bez DPH")
+                    else:
+                        reasons.append("nesedí součet položek vs. celkem")
         except Exception:
             reasons.append("nelze ověřit součet položek")
 
