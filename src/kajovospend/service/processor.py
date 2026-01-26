@@ -18,9 +18,8 @@ from kajovospend.db.queries import (
     rebuild_fts_for_document,
     upsert_supplier,
 )
-from kajovospend.extract.parser import extract_from_text
+from kajovospend.extract.parser import extract_from_text, postprocess_items_for_db
 from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
-from kajovospend.integrations.openai_fallback import OpenAIConfig, extract_with_openai
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 from kajovospend.ocr.rapidocr_engine import RapidOcrEngine
 from kajovospend.utils.hashing import sha256_file
@@ -55,43 +54,15 @@ class Processor:
             self.log.warning(f"OCR init failed; will quarantine documents. Error: {e}")
             self.ocr_engine = None
 
-    def _openai_images_for_path(self, path: Path) -> List[Tuple[str, bytes]]:
-        """
-        Připraví obrazové vstupy pro OpenAI fallback.
-        - PDF: render první 1-2 strany do PNG (rozumný kompromis cena/výkon).
-        - image: vezme bytes přímo (png/jpg/webp).
-        """
-        images: List[Tuple[str, bytes]] = []
-        try:
-            suf = path.suffix.lower()
-            if suf == ".pdf":
-                dpi = int(self.cfg["ocr"].get("pdf_dpi", 200))
-                pages = render_pdf_to_images(path, dpi=dpi)
-                for img in pages[:2]:
-                    buf = io.BytesIO()
-                    # PNG je robustní pro text/čáry; optimalize kvůli velikosti
-                    img.save(buf, format="PNG", optimize=True)
-                    images.append(("image/png", buf.getvalue()))
-            else:
-                mime = "image/png"
-                if suf in (".jpg", ".jpeg"):
-                    mime = "image/jpeg"
-                elif suf == ".webp":
-                    mime = "image/webp"
-                data = path.read_bytes()
-                if data:
-                    images.append((mime, data))
-        except Exception as e:
-            self.log.debug(f"OpenAI image prep failed ({path.name}): {e}")
-        return images
-
-    def _ocr_pdf_pages(self, pdf_path: Path) -> Tuple[List[str], List[float], int]:
+    def _ocr_pdf_pages(self, pdf_path: Path, status_cb=None) -> Tuple[List[str], List[float], int]:
         """
         Vrátí OCR text po jednotlivých stránkách:
         - embedded text: per page extract_text()
         - jinak: render->OCR per page
         """
         # Try embedded text first (page-by-page)
+        if status_cb:
+            status_cb("PDF: čtu text (bez OCR)…")
         try:
             reader = PdfReader(str(pdf_path))
             texts: List[str] = []
@@ -108,10 +79,16 @@ class Processor:
         # fallback to image OCR
         if self.ocr_engine is None:
             return [], [], 0
-        images = render_pdf_to_images(pdf_path, dpi=int(self.cfg["ocr"].get("pdf_dpi", 200)))
+        dpi_cfg = int(self.cfg["ocr"].get("pdf_dpi", 200))
+        dpi = max(300, dpi_cfg)
+        if status_cb:
+            status_cb(f"PDF: render na obrázky ({dpi} DPI)…")
+        images = render_pdf_to_images(pdf_path, dpi=dpi)
         texts2: List[str] = []
         confs2: List[float] = []
-        for img in images:
+        for idx_page, img in enumerate(images, start=1):
+            if status_cb:
+                status_cb(f"OCR: strana {idx_page}/{len(images)}…")
             t, c = self.ocr_engine.image_to_text(img)
             texts2.append(t or "")
             confs2.append(float(c or 0.0))
@@ -172,14 +149,87 @@ class Processor:
             merged.append(cur)
         return merged
 
-    def _ocr_image(self, path: Path) -> Tuple[str, float, int]:
+    def _ocr_image(self, path: Path, status_cb=None) -> Tuple[str, float, int]:
         if self.ocr_engine is None:
             return "", 0.0, 1
+        if status_cb:
+            status_cb("OCR: zpracovávám obrázek…")
         with Image.open(path) as img:
             t, c = self.ocr_engine.image_to_text(img)
         return t, c, 1
 
-    def process_path(self, session, path: Path) -> Dict[str, Any]:
+    def _guess_supplier_ico_from_text(self, text: str) -> Optional[str]:
+        """Best-effort: pokud OCR nevyčetl IČO pomocí kontextu, zkus najít 8místné kandidáty.
+
+        Strategie:
+        - vytáhne všechny 8-místné sekvence číslic
+        - zkusí je ověřit přes ARES (rychlý timeout)
+        - když vyjde právě 1, vrátí ji
+
+        Pozn.: cíleně nevrací víc kandidátů, abychom nevytvářeli falešně pozitivní dodavatele.
+        """
+        if not text:
+            return None
+
+    def _looks_like_ico(self, ico: str | None) -> bool:
+        if not ico:
+            return False
+        s = str(ico).strip()
+        return bool(re.fullmatch(r"\d{6,10}", s))
+
+    def _extract_supplier_name_guess(self, text: str) -> str | None:
+        """Heuristika pro účtenky bez IČO: vezme první 'rozumný' řádek v horní části."""
+        if not text:
+            return None
+        for ln in (text.splitlines()[:30]):
+            ln = str(ln).strip()
+            if not ln:
+                continue
+            # ignoruj generické a šum
+            if re.search(r"(daňov|doklad|účtenk|uctenk|datum|celkem|prodej|platba|dph|iban|swift)", ln, re.IGNORECASE):
+                continue
+            # musí obsahovat aspoň 3 písmena
+            if len(re.findall(r"[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]", ln)) < 3:
+                continue
+            return ln[:80].strip()
+        return None
+
+    def _pseudo_ico(self, supplier_name: str) -> str:
+        """Deterministické pseudo-IČO pro retail účtenky bez uvedeného IČO."""
+        import hashlib
+        base = (supplier_name or "UNKNOWN").strip().upper().encode("utf-8", errors="ignore")
+        h = hashlib.sha256(base).hexdigest()[:10]
+        return f"NOICO-{h}"
+        cands = []
+        for m in re.finditer(r"\b\d{8}\b", text):
+            cands.append(m.group(0))
+        # de-dup, stabilní pořadí
+        seen = set()
+        uniq = []
+        for c in cands:
+            if c not in seen:
+                uniq.append(c)
+                seen.add(c)
+
+        valid: List[str] = []
+        for c in uniq[:20]:
+            try:
+                ico_n = normalize_ico(c)
+            except Exception:
+                continue
+            try:
+                # rychlá validace přes ARES
+                fetch_by_ico(ico_n, timeout=4)
+                valid.append(ico_n)
+            except Exception:
+                continue
+            if len(valid) > 1:
+                break
+        if len(valid) == 1:
+            return valid[0]
+        return None
+
+    def process_path(self, session, path: Path, status_cb=None) -> Dict[str, Any]:
         # returns dict with outcome
         sha = sha256_file(path)
         # dedupe check
@@ -194,13 +244,16 @@ class Processor:
             moved = safe_move(path, dup_dir, path.name)
             return {"status": "DUPLICATE", "sha256": sha, "moved_to": str(moved)}
 
+        if status_cb:
+            status_cb("Začínám vytěžování…")
+
         # OCR
         min_conf = float(self.cfg["ocr"].get("min_confidence", 0.65))
         pages = 1
         per_doc_chunks: List[Dict[str, Any]] = []
 
         if path.suffix.lower() == ".pdf":
-            page_texts, page_confs, pages = self._ocr_pdf_pages(path)
+            page_texts, page_confs, pages = self._ocr_pdf_pages(path, status_cb=status_cb)
             if not page_texts:
                 # no text => hard quarantine later
                 page_texts = []
@@ -213,7 +266,7 @@ class Processor:
             # Merge multi-page invoices deterministically by key
             per_doc_chunks = self._merge_extracted_by_key(per_page)
         else:
-            ocr_text, ocr_conf, pages = self._ocr_image(path)
+            ocr_text, ocr_conf, pages = self._ocr_image(path, status_cb=status_cb)
             ex = extract_from_text(ocr_text or "")
             per_doc_chunks = [{
                 "page_from": 1,
@@ -244,7 +297,9 @@ class Processor:
         method_global = "offline"
 
         # per-document processing within the file
-        for chunk in per_doc_chunks:
+        for idx_doc, chunk in enumerate(per_doc_chunks, start=1):
+            if status_cb:
+                status_cb(f"Parsování dokladu {idx_doc}/{max(1, len(per_doc_chunks))}…")
             extracted = chunk["extracted"]
             ocr_conf = float(chunk.get("ocr_conf") or 0.0)
             ocr_text = chunk.get("full_text") or ""
@@ -254,78 +309,102 @@ class Processor:
             method = "offline"
             reasons = list(extracted.review_reasons or [])
 
-            # OpenAI fallback: for PDF, it’s file-level images; OK as a first deterministic step
-            if (extracted.requires_review or extracted.confidence < 0.75) and self.cfg.get("openai", {}).get("enabled"):
-                api_key = str(self.cfg["openai"].get("api_key") or "").strip()
-                model = str(self.cfg["openai"].get("model") or "").strip()
-                if api_key and model:
-                    try:
-                        imgs = self._openai_images_for_path(path)
-                        obj, raw = extract_with_openai(
-                            OpenAIConfig(api_key=api_key, model=model),
-                            ocr_text,
-                            images=imgs if imgs else None,
-                        )
-                        if obj:
-                            extracted.supplier_ico = obj.get("supplier_ico") or extracted.supplier_ico
-                            extracted.doc_number = obj.get("doc_number") or extracted.doc_number
-                            extracted.bank_account = obj.get("bank_account") or extracted.bank_account
-                            if obj.get("issue_date"):
-                                try:
-                                    extracted.issue_date = dt.date.fromisoformat(obj["issue_date"])
-                                except Exception:
-                                    pass
-                            if obj.get("total_with_vat") is not None:
-                                try:
-                                    extracted.total_with_vat = float(obj["total_with_vat"])
-                                except Exception:
-                                    pass
-                            if obj.get("currency"):
-                                extracted.currency = str(obj.get("currency"))
-                            if obj.get("items"):
-                                extracted.items = list(obj.get("items"))
-                            extracted.confidence = max(extracted.confidence, 0.85)
-                            extracted.requires_review = False
-                            extracted.review_reasons = [r for r in extracted.review_reasons if r != "nízká jistota vytěžení"]
-                            method = "openai"
-                            method_global = "openai"
-                    except Exception as e:
-                        self.log.warning(f"OpenAI fallback failed: {e}")
+            # Pokud chybí IČO, zkus heuristiku: najít 8-místné číslo a ověřit v ARES.
+            if not extracted.supplier_ico:
+                guessed_ico = self._guess_supplier_ico_from_text(ocr_text)
+                if guessed_ico:
+                    extracted.supplier_ico = guessed_ico
+                    extracted.confidence = float(max(extracted.confidence or 0.0, 0.80))
+                    reasons.append("IČO doplněno heuristikou (ARES validace)")
 
-            # Decide quarantine for this extracted doc
-            requires_review = bool(extracted.requires_review or (ocr_conf < min_conf))
+
+            # Pokud IČO na dokladu vůbec není (běžné u retail účtenek),
+            # vytvoříme deterministické pseudo-ID dodavatele, aby doklad mohl projít "complete" kontrolou.
+            if not extracted.supplier_ico:
+                supplier_name_guess = self._extract_supplier_name_guess(ocr_text) or "NEZNAMY_DODAVATEL"
+                extracted.supplier_ico = self._pseudo_ico(supplier_name_guess)
+                extracted.confidence = float(max(extracted.confidence or 0.0, 0.75))
+                reasons.append("IČO není na dokladu: použito pseudo-ID dodavatele")
+
+            # Po offline i OpenAI: kanonizace položek (unit_price bez DPH, line_total s DPH) + kontrola součtu.
+            items_ref = list(extracted.items or [])
+            sum_ok, reasons = postprocess_items_for_db(
+                items=items_ref,
+                total_with_vat=extracted.total_with_vat,
+                reasons=reasons,
+            )
+            extracted.items = items_ref
+            extracted.review_reasons = reasons
+
+            # Povinné minimum pro přesun do OUT:
+            # - IČO, číslo dokladu, datum, total (vč. DPH)
+            # - položky
+            # - součet položek (včetně zaokrouhlení) sedí na total v toleranci
+            complete = bool(
+                extracted.supplier_ico
+                and extracted.doc_number
+                and extracted.issue_date
+                and (extracted.total_with_vat is not None)
+                and (len(list(extracted.items or [])) > 0)
+                and sum_ok
+            )
+
+            requires_review = bool((not complete) or (ocr_conf < min_conf))
             if ocr_conf < min_conf:
                 reasons.append("nízká jistota OCR")
+            if not complete:
+                reasons.append("nekompletní vytěžení")
+
+            # zapiš zpět pro UI/DB konzistenci
+            extracted.requires_review = requires_review
+            # de-dup důvodů, stabilní pořadí
+            extracted.review_reasons = list(dict.fromkeys(reasons))
 
             supplier_id = None
+            supplier_name_guess: str | None = None
             if extracted.supplier_ico:
-                try:
-                    extracted.supplier_ico = normalize_ico(extracted.supplier_ico)
-                except Exception:
-                    pass
-                try:
-                    ares = fetch_by_ico(extracted.supplier_ico)
+                # ARES voláme jen pro "skutečné" IČO (číslice). Pro pseudo-IČO nic přes síť neřešíme.
+                if self._looks_like_ico(extracted.supplier_ico):
+                    try:
+                        extracted.supplier_ico = normalize_ico(extracted.supplier_ico)
+                    except Exception:
+                        pass
+                    try:
+                        if status_cb:
+                            status_cb("ARES: doplňuji dodavatele…")
+                        ares = fetch_by_ico(extracted.supplier_ico)
+                        s = upsert_supplier(
+                            session,
+                            ares.ico,
+                            name=ares.name,
+                            dic=ares.dic,
+                            address=ares.address,
+                            is_vat_payer=ares.is_vat_payer,
+                            ares_last_sync=ares.fetched_at,
+                            legal_form=ares.legal_form,
+                            street=ares.street,
+                            street_number=ares.street_number,
+                            orientation_number=ares.orientation_number,
+                            city=ares.city,
+                            zip_code=ares.zip_code,
+                            overwrite=True,
+                        )
+                        supplier_id = s.id
+                        extracted.supplier_ico = ares.ico
+                    except Exception as e:
+                        reasons.append(f"ARES selhal: {e}")
+                        requires_review = True
+                else:
+                    # Pseudo-IČO: uložíme dodavatele lokálně jen se jménem (pokud ho umíme odhadnout).
+                    supplier_name_guess = self._extract_supplier_name_guess(ocr_text)
                     s = upsert_supplier(
                         session,
-                        ares.ico,
-                        name=ares.name,
-                        dic=ares.dic,
-                        address=ares.address,
-                        is_vat_payer=ares.is_vat_payer,
-                        ares_last_sync=ares.fetched_at,
-                        legal_form=ares.legal_form,
-                        street=ares.street,
-                        street_number=ares.street_number,
-                        orientation_number=ares.orientation_number,
-                        city=ares.city,
-                        zip_code=ares.zip_code,
-                        overwrite=True,
+                        str(extracted.supplier_ico),
+                        name=supplier_name_guess,
+                        overwrite=False,
                     )
                     supplier_id = s.id
-                    extracted.supplier_ico = ares.ico
-                except Exception as e:
-                    reasons.append(f"ARES selhal: {e}")
-                    requires_review = True
+
 
             # Business duplicita per-doc
             if extracted.supplier_ico and extracted.doc_number and extracted.issue_date:

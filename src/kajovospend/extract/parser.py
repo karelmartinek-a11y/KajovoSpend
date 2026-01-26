@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import datetime as dt
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Iterable
 
 from dateutil import parser as dtparser
 
@@ -29,6 +29,146 @@ _ICO_DIGITS_RE = re.compile(r"\D+")
 
 # Časté mapování DPH písmenem na účtenkách (není univerzální, ale pomáhá u velké části CZ retail).
 _VAT_LETTER_MAP: Dict[str, float] = {"A": 21.0, "B": 15.0, "C": 10.0}
+
+# Položky typu „zaokrouhlení“ (často samostatný řádek na účtence)
+_ROUNDING_RE = re.compile(
+    r"\b(zaokrouhlen[ií]|zaokr\.?)(?:\s*[: ]\s*)?(?P<amount>-?\d+[\d\s]*[.,]\d{2})\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_rounding_items(text: str) -> List[dict]:
+    items: List[dict] = []
+    if not text:
+        return items
+    for ln in text.splitlines():
+        m = _ROUNDING_RE.search(ln)
+        if not m:
+            continue
+        try:
+            amt = _norm_amount(m.group("amount"))
+        except Exception:
+            continue
+        # Zaokrouhlení je samostatná položka; DPH neaplikujeme.
+        items.append(
+            {
+                "name": "Zaokrouhlení",
+                "quantity": 1.0,
+                "unit_price": amt,   # kanonicky: bez DPH; u zaokrouhlení je to stejné
+                "vat_rate": 0.0,
+                "line_total": amt,   # včetně DPH; u zaokrouhlení je to stejné
+            }
+        )
+    return items
+
+
+def _iter_non_rounding(items: Iterable[dict]) -> Iterable[dict]:
+    for it in items:
+        name = str(it.get("name") or "").strip().lower()
+        if "zaokrouhl" in name or name in {"zaokr", "zaokr."}:
+            continue
+        yield it
+
+
+def _canonicalize_items_to_unit_net_and_line_gross(
+    items: List[dict],
+    total_with_vat: Optional[float],
+    reasons: List[str],
+    *,
+    rel_tol: float = 0.03,
+    abs_tol: float = 2.0,
+) -> bool:
+    """
+    Kanonická reprezentace položek pro výpočty a DB:
+      - unit_price = cena za 1 jednotku bez DPH
+      - line_total = řádková cena včetně DPH
+
+    Vrací True, pokud součet položek sedí na total_with_vat v toleranci.
+    """
+    if not items:
+        return False
+
+    # nejdřív doplň chybějící line_total tam, kde to jde
+    _normalize_items(items, reasons)
+
+    # u mnoha dokladů jsou částky v položkách net (bez DPH), ale total je gross
+    # => vyzkoušíme 2 režimy a vybereme ten s menší odchylkou.
+    def _sum_for_mode(mode: str) -> float:
+        s = 0.0
+        for it in items:
+            q = _f(it.get("quantity"), 1.0)
+            vr = _f(it.get("vat_rate"), 0.0)
+            lt = _f(it.get("line_total"), 0.0)
+            up = it.get("unit_price")
+            upf = None if up is None else _f(up, 0.0)
+            base = lt if lt != 0.0 else (q * (upf or 0.0))
+            if mode == "gross":
+                s += base
+            else:
+                # net -> gross
+                s += base * (1.0 + (vr / 100.0)) if vr > 0 else base
+        return float(s)
+
+    chosen = "gross"
+    if total_with_vat is not None and total_with_vat != 0.0:
+        sum_g = _sum_for_mode("gross")
+        sum_n = _sum_for_mode("net")
+        diff_g = abs(sum_g - total_with_vat)
+        diff_n = abs(sum_n - total_with_vat)
+        chosen = "net" if diff_n + 1e-9 < diff_g else "gross"
+
+    # Kanonizace do (unit_net, line_gross)
+    for it in items:
+        name = str(it.get("name") or "").strip()
+        q = _f(it.get("quantity"), 1.0)
+        vr = _f(it.get("vat_rate"), 0.0)
+        lt = _f(it.get("line_total"), 0.0)
+        up = it.get("unit_price")
+        upf = None if up is None else _f(up, 0.0)
+        if q == 0.0:
+            q = 1.0
+            it["quantity"] = 1.0
+            reasons.append("oprava položky: quantity=0 nahrazeno 1")
+
+        # zaokrouhlení a podobné položky bereme jako gross==net
+        if "zaokrouhl" in name.lower():
+            it["vat_rate"] = 0.0
+            it["unit_price"] = round(lt if lt != 0.0 else (upf or 0.0), 2)
+            it["line_total"] = round(lt if lt != 0.0 else (upf or 0.0), 2)
+            continue
+
+        base = lt if lt != 0.0 else (q * (upf or 0.0))
+        if chosen == "net":
+            line_gross = base * (1.0 + (vr / 100.0)) if vr > 0 else base
+            unit_net = (base / q) if q else 0.0
+        else:
+            line_gross = base
+            unit_net = (base / q) / (1.0 + (vr / 100.0)) if (q and vr > 0) else ((base / q) if q else 0.0)
+
+        # finální zápis
+        it["unit_price"] = round(unit_net, 4)  # 4 desetinná místa zlepší následné přepočty
+        it["line_total"] = round(line_gross, 2)
+
+    # Ověření: podle unit_net * (1+vat) * qty musí sedět line_total a total
+    sum_calc = 0.0
+    for it in items:
+        q = _f(it.get("quantity"), 1.0)
+        vr = _f(it.get("vat_rate"), 0.0)
+        upn = _f(it.get("unit_price"), 0.0)
+        calc = (upn * (1.0 + vr / 100.0) * q) if vr > 0 else (upn * q)
+        calc = round(calc, 2)
+        lt = _f(it.get("line_total"), 0.0)
+        # pokud se liší o víc než haléř, přepiš na konzistentní výsledek
+        if abs(calc - lt) > 0.02:
+            it["line_total"] = calc
+            reasons.append("oprava položky: line_total přepočteno z unit_price_net*DPH*qty")
+        sum_calc += _f(it.get("line_total"), 0.0)
+
+    if total_with_vat is None or total_with_vat == 0.0:
+        return False
+    diff = abs(sum_calc - total_with_vat)
+    rel = diff / max(abs(total_with_vat), 1e-9)
+    return (diff <= abs_tol) or (rel <= rel_tol)
 
 
 def _norm_amount(s: str) -> float:
@@ -128,8 +268,15 @@ def extract_from_text(text: str) -> Extracted:
 
     doc_no = _find_first([
         re.compile(r"Č[ií]slo\s+faktury\s*[: ]\s*([\w-]+)", re.IGNORECASE),
-        re.compile(r"DAŇOVÝ\s+DOKLAD\s+č\.?\s*([\w-]+)", re.IGNORECASE),
+        re.compile(r"Faktura\s*#\s*(\d+)", re.IGNORECASE),
+        re.compile(r"Č[ií]slo\s+objednávky\s*[: ]\s*([\w-]+)", re.IGNORECASE),
+        # Daňové doklady často mají číslo hned pod nadpisem bez "č."
+        re.compile(r"DAŇOVÝ\s+DOKLAD\s*(?:č\.?\s*)?\n?\s*([A-Z0-9][A-Z0-9-]{2,})\b", re.IGNORECASE),
         re.compile(r"Faktura\s*-?\s*daňový\s+doklad\s+č\.?\s*([\w-]+)", re.IGNORECASE),
+        # Účtenky
+        re.compile(r"Ú?čtenka\s+č[ií]slo\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),
+        re.compile(r"Doklad\s+č[ií]slo\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),
+        # Variabilní symbol (u faktur často funguje jako stabilní identifikátor)
         re.compile(r"\bVS\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),
     ], t)
 
@@ -144,6 +291,8 @@ def extract_from_text(text: str) -> Extracted:
     date_s = _find_first([
         re.compile(r"Datum\s+vystaven[ií]\s*[: ]\s*([0-9]{1,2}[./][0-9]{1,2}[./][0-9]{2,4})", re.IGNORECASE),
         re.compile(r"Datum\s*[: ]\s*([0-9]{1,2}[./][0-9]{1,2}[./][0-9]{2,4})", re.IGNORECASE),
+        # Účtenky často mají datum bez labelu, někdy i s časem (čas ignorujeme)
+        re.compile(r"\b([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{2,4})\b"),
         re.compile(r"\b([0-9]{2}/[0-9]{2}/[0-9]{4})\b"),
     ], t)
     issue_date = _parse_date(date_s) if date_s else None
@@ -158,6 +307,10 @@ def extract_from_text(text: str) -> Extracted:
         re.compile(r"K\s+zaplacení\s+celkem\s+EUR\s*([0-9\s]+[.,][0-9]{2})", re.IGNORECASE),
         re.compile(r"Cena\s+celkem\s*([0-9\s]+[.,][0-9]{2})", re.IGNORECASE),
         re.compile(r"Koruna\s+česká\s+Kč\s*([0-9\s]+[.,][0-9]{2})", re.IGNORECASE),
+        # Účtenky: "Celkem 68,20" / "PRODEJ 68,20 Kč"
+        re.compile(r"\bCelkem\s*[: ]\s*([0-9\s]+[.,][0-9]{2})\b", re.IGNORECASE),
+        re.compile(r"Celkem\s+v\s+\w+.*?([0-9\s]+[.,][0-9]{2})", re.IGNORECASE),
+        re.compile(r"\bPRODEJ\s*([0-9\s]+[.,][0-9]{2})\b", re.IGNORECASE),
     ], t)
 
     total = None
@@ -191,7 +344,65 @@ def extract_from_text(text: str) -> Extracted:
             except Exception:
                 continue
 
-    # receipts (Albert): lines like "2 x 5,60 Kč 11,20"
+    
+    # Wolt faktury: řádky typu "<název> 12% 2 214,90 429,80" (bez "Kč" u čísel)
+    if not items:
+        wolt_pat = re.compile(
+            r"^(?P<name>.+?)\s+(?P<vat>\d{1,2})%\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>\d+[\s\d]*[.,]\d{2})\s+(?P<total>-?\d+[\s\d]*[.,]\d{2})\s*$"
+        )
+        for ln in t.splitlines():
+            ln = ln.strip()
+            if not ln or len(ln) < 6:
+                continue
+            m = wolt_pat.match(ln)
+            if not m:
+                continue
+            try:
+                name = m.group("name").strip()
+                qty = _safe_float(m.group("qty"))
+                unit_price = _norm_amount(m.group("unit"))
+                vat = float(m.group("vat"))
+                line_total = _norm_amount(m.group("total"))
+                items.append({"name": name, "quantity": qty, "unit_price": unit_price, "vat_rate": vat, "line_total": line_total})
+            except Exception:
+                continue
+
+    # Better-hotel / Mevris: popis položky je často na 1-2 řádcích a ceny jsou ve formátu "... 294.14 CZK 1 294.14 CZK 355.91 CZK"
+    if not items:
+        # default VAT: vezmeme první explicitní sazbu (např. "21%") z dokumentu
+        vat_default = 0.0
+        mvat = re.search(r"\b(\d{1,2})%\b", t)
+        if mvat:
+            try:
+                vat_default = float(mvat.group(1))
+            except Exception:
+                vat_default = 0.0
+        bh_pat = re.compile(
+            r"(?P<net>\d+[\s\d]*[.,]\d{2})\s*CZK\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<net_total>\d+[\s\d]*[.,]\d{2})\s*CZK\s+(?P<gross>\d+[\s\d]*[.,]\d{2})\s*CZK",
+            re.IGNORECASE,
+        )
+        pending_desc: List[str] = []
+        for ln in t.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            m = bh_pat.search(ln)
+            if not m:
+                # bereme jen "popis" řádky, ignorujeme hlavičky
+                if not re.search(r"^(POLOŽKA|CENA|POČET|CELKEM|DPH|DODAVATEL|ODBĚRATEL)\b", ln, re.IGNORECASE):
+                    pending_desc.append(ln)
+                continue
+            try:
+                name = " ".join(pending_desc).strip() or "Položka"
+                pending_desc = []
+                qty = _safe_float(m.group("qty"))
+                unit_net = _norm_amount(m.group("net"))
+                gross = _norm_amount(m.group("gross"))
+                items.append({"name": name, "quantity": qty, "unit_price": unit_net, "vat_rate": float(vat_default or 0.0), "line_total": gross})
+            except Exception:
+                pending_desc = []
+                continue
+# receipts (Albert): lines like "2 x 5,60 Kč 11,20"
     if not items:
         rec_pat = re.compile(r"^(?P<name>[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ0-9 .,'/-]{3,})\s*$")
         qty_price_pat = re.compile(
@@ -221,59 +432,19 @@ def extract_from_text(text: str) -> Extracted:
             else:
                 pending_name = None
 
+    # zaokrouhlení (pokud existuje) přidáme jako samostatnou položku
+    items.extend(_extract_rounding_items(t))
+
     # --- kontrola součtu položek vs. celkem ---
     # Cíl: co nejvíc dokladů vyřešit offline, a na OpenAI posílat jen minimum.
     reasons: List[str] = []
-    if items:
-        _normalize_items(items, reasons)
-    if items and total is not None and total > 0:
-        try:
-            sum_items = float(sum(_f(i.get("line_total"), 0.0) for i in items))
-            diff = abs(sum_items - total)
-            rel_diff = diff / max(total, 1e-9)
-
-            # tolerance: kombinace relativní + absolutní (u malých účtenek absolutní hraje velkou roli)
-            rel_tol = 0.03   # ~3% (rezerva pro různé formáty)
-            abs_tol = 2.00   # 2 Kč (zaokrouhlení, drobné přepočty)
-
-            def _ok(d: float, r: float) -> bool:
-                return (d <= abs_tol) or (r <= rel_tol)
-
-            if not _ok(diff, rel_diff):
-                # pokus A: položky jsou bez DPH, celkem je s DPH
-                sum_items_gross = 0.0
-                for it in items:
-                    lt = _f(it.get("line_total"), 0.0)
-                    vr = _f(it.get("vat_rate"), 0.0)
-                    sum_items_gross += (lt * (1.0 + vr / 100.0)) if vr > 0 else lt
-                diff_g = abs(sum_items_gross - total)
-                rel_g = diff_g / max(total, 1e-9)
-                if _ok(diff_g, rel_g) and (diff_g + 1e-9 < diff):
-                    for it in items:
-                        lt = _f(it.get("line_total"), 0.0)
-                        vr = _f(it.get("vat_rate"), 0.0)
-                        if vr > 0:
-                            it["line_total"] = round(lt * (1.0 + vr / 100.0), 2)
-                    reasons.append("položky přepočteny z bez DPH na s DPH")
-                else:
-                    # pokus B: položky jsou s DPH, ale celkem je bez DPH (méně časté, ale existuje)
-                    sum_items_net = 0.0
-                    for it in items:
-                        lt = _f(it.get("line_total"), 0.0)
-                        vr = _f(it.get("vat_rate"), 0.0)
-                        sum_items_net += (lt / (1.0 + vr / 100.0)) if vr > 0 else lt
-                    diff_n = abs(sum_items_net - total)
-                    rel_n = diff_n / max(total, 1e-9)
-                    if _ok(diff_n, rel_n) and (diff_n + 1e-9 < diff):
-                        for it in items:
-                            lt = _f(it.get("line_total"), 0.0)
-                            vr = _f(it.get("vat_rate"), 0.0)
-                            if vr > 0:
-                                it["line_total"] = round(lt / (1.0 + vr / 100.0), 2)
-                        reasons.append("položky přepočteny ze s DPH na bez DPH")
-                    else:
-                        reasons.append("nesedí součet položek vs. celkem")
-        except Exception:
+    sum_ok = False
+    try:
+        sum_ok = _canonicalize_items_to_unit_net_and_line_gross(items, total, reasons)
+        if items and (total is not None) and not sum_ok:
+            reasons.append("nesedí součet položek vs. celkem")
+    except Exception:
+        if items and total is not None:
             reasons.append("nelze ověřit součet položek")
 
     # confidence heuristic
@@ -299,10 +470,14 @@ def extract_from_text(text: str) -> Extracted:
     else:
         reasons.append("chybí položky")
 
-    # Pokud máme explicitní problém se součtem, zvyšujeme šanci karantény i když conf vyjde „OK“.
-    requires_review = (conf < 0.75) or any("nesedí součet položek" in r for r in reasons)
-    if requires_review:
+    # Pokud máme explicitní problém se součtem, je to vždy NEROZPOZNANÉ (neprojde do OUT).
+    # „nízká jistota vytěžení“ ale přidáváme jen při nízké confidence, ne při součtových problémech.
+    requires_review = False
+    if conf < 0.75:
+        requires_review = True
         reasons.append("nízká jistota vytěžení")
+    if items and (total is not None) and (not sum_ok):
+        requires_review = True
 
     return Extracted(
         supplier_ico=ico,
@@ -317,3 +492,32 @@ def extract_from_text(text: str) -> Extracted:
         review_reasons=reasons,
         full_text=raw,
     )
+
+
+def postprocess_items_for_db(
+    *,
+    items: List[dict],
+    total_with_vat: Optional[float],
+    reasons: Optional[List[str]] = None,
+) -> Tuple[bool, List[str]]:
+    """
+    Normalizuje položky do kanonického formátu používaného v DB a provede kontrolu součtu.
+
+    Použití:
+      - po offline extrakci je voláno implicitně v extract_from_text()
+      - po OpenAI fallbacku je potřeba volat znovu, protože OpenAI vrací položky v různém základu
+
+    Vrací (sum_ok, reasons).
+    """
+    rr: List[str] = list(reasons or [])
+    ok = False
+    try:
+        ok = _canonicalize_items_to_unit_net_and_line_gross(items, total_with_vat, rr)
+        if items and (total_with_vat is not None) and not ok:
+            rr.append("nesedí součet položek vs. celkem")
+    except Exception:
+        if items and (total_with_vat is not None):
+            rr.append("nelze ověřit součet položek")
+    # de-dup reasons (stabilní pořadí)
+    rr = list(dict.fromkeys(rr))
+    return ok, rr

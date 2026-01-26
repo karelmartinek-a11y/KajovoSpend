@@ -1,26 +1,22 @@
 from __future__ import annotations
 
 import datetime as dt
-import functools
 import os
-import subprocess
-import sys
 from io import BytesIO
 from pathlib import Path
 import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl
-from PySide6.QtGui import QIcon, QPixmap, QImage, QDesktopServices
+from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl, QPointF
+from PySide6.QtGui import QIcon, QPixmap, QImage, QDesktopServices, QPainter, QPen, QColor, QFont
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTabWidget, QTableView,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QTabWidget, QTableView,
     QLineEdit, QFormLayout, QSplitter, QTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QFileDialog,
-    QMessageBox, QDateEdit, QProgressBar, QDialog, QDialogButtonBox, QHeaderView, QAbstractItemView,
-    QCheckBox, QProgressDialog, QApplication, QInputDialog,
+    QMessageBox, QDateEdit, QDialog, QDialogButtonBox, QHeaderView, QAbstractItemView,
+    QCheckBox, QProgressDialog, QApplication, QInputDialog, QScrollArea,
 )
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
-from sqlalchemy.orm import Session
 from sqlalchemy import select, text
 
 from kajovospend.utils.config import load_yaml, save_yaml, deep_set
@@ -28,11 +24,10 @@ from kajovospend.utils.paths import resolve_app_paths
 from kajovospend.utils.logging_setup import setup_logging
 from kajovospend.db.session import make_engine, make_session_factory
 from kajovospend.db.migrate import init_db
-from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem
+from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem, ImportJob
 from kajovospend.db.queries import upsert_supplier, rebuild_fts_for_document
 from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
-from kajovospend.integrations.openai_fallback import list_models
-from kajovospend.service.control_client import send_cmd
+from kajovospend.service.processor import Processor
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 
 from .styles import QSS
@@ -295,6 +290,72 @@ class _Worker(QObject):
         self.done.emit(res)
 
 
+class _ImportWorker(QObject):
+    progress = Signal(str)
+    done = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, cfg: Dict[str, Any], sf, processor: Processor):
+        super().__init__()
+        self.cfg = cfg
+        self.sf = sf
+        self.processor = processor
+
+    @Slot()
+    def run(self):
+        try:
+            input_dir = Path(self.cfg["paths"]["input_dir"])
+            if not input_dir.exists():
+                self.done.emit({"imported": 0, "message": "Adresář INPUT neexistuje."})
+                return
+
+            exts = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+            files = [p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
+            files.sort(key=lambda p: (p.stat().st_mtime, p.name))
+
+            if not files:
+                self.done.emit({"imported": 0, "message": "V INPUT nejsou žádné soubory."})
+                return
+
+            imported = 0
+            total = len(files)
+
+            for i, p in enumerate(files, start=1):
+                self.progress.emit(f"Zpracovávám {i}/{total}: {p.name}")
+                try:
+                    with self.sf() as session:
+                        job = ImportJob(path=str(p), status="RUNNING", started_at=dt.datetime.utcnow())
+                        session.add(job)
+                        session.commit()
+
+                        res = self.processor.process_path(session, p, status_cb=self.progress.emit)
+                        job.sha256 = res.get("sha256")
+                        job.status = str(res.get("status") or "DONE")
+                        job.finished_at = dt.datetime.utcnow()
+                        session.add(job)
+                        session.commit()
+                        imported += 1
+                except Exception as e:
+                    try:
+                        with self.sf() as session:
+                            job = ImportJob(
+                                path=str(p),
+                                status="ERROR",
+                                started_at=dt.datetime.utcnow(),
+                                finished_at=dt.datetime.utcnow(),
+                                error=str(e),
+                            )
+                            session.add(job)
+                            session.commit()
+                    except Exception:
+                        pass
+                    self.progress.emit(f"Chyba: {p.name}: {e}")
+
+            self.done.emit({"imported": imported, "total": total, "message": "Hotovo."})
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class _SilentRunner:
     """
     Lightweight background runner (no modal progress).
@@ -391,44 +452,6 @@ class _SilentRunner:
             window._timers.append(timer)
 
 
-class StatusDialog(QDialog):
-    def __init__(self, status: Dict[str, Any], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("STAV")
-        lay = QVBoxLayout(self)
-        txt = QTextEdit()
-        txt.setReadOnly(True)
-        lines = []
-        keys = [
-            "running",
-            "queue_size",
-            "inflight",
-            "max_workers",
-            "current_phase",
-            "current_progress",
-            "current_job_id",
-            "current_path",
-            "heartbeat_at",
-            "stuck",
-            "stuck_reason",
-            "last_success",
-            "last_error",
-            "last_error_at",
-            "last_seen",
-        ]
-        for k in keys:
-            v = status.get(k)
-            # shorten long paths a bit
-            if k == "current_path" and isinstance(v, str) and len(v) > 140:
-                v = "…" + v[-140:]
-            lines.append(f"{k}: {v}")
-        txt.setText("\n".join(lines))
-        lay.addWidget(txt)
-        bb = QDialogButtonBox(QDialogButtonBox.Ok)
-        bb.accepted.connect(self.accept)
-        lay.addWidget(bb)
-
-
 class SupplierDialog(QDialog):
     def __init__(self, parent=None, initial: Optional[Dict[str, Any]] = None):
         super().__init__(parent)
@@ -512,10 +535,11 @@ class MainWindow(QMainWindow):
         self._preview_cache: Dict[Tuple[str, int], QPixmap] = {}
         self._preview_dpi = int(self.cfg.get("performance", {}).get("preview_dpi", 120) or 120)
 
-        # background dashboard refresh (avoid UI freezes when service is down)
+        # background RUN stats refresh
         self._dash_refresh_inflight = False
         self._dash_last_counts: Dict[str, Any] | None = None
-        self._dash_last_status: Dict[str, Any] | None = None
+        self._import_running = False
+        self._import_status = "Připraveno."
 
         # selection model guards to prevent duplicate signal connections after model resets
         self._docs_sel_model = None
@@ -551,6 +575,7 @@ class MainWindow(QMainWindow):
         self.engine = make_engine(str(self.paths.db_path))
         init_db(self.engine)
         self.sf = make_session_factory(self.engine)
+        self.processor = Processor(self.cfg, self.paths, self.log)
 
         self.setWindowTitle("KájovoSpend")
         ico = self.assets_dir / "app.ico"
@@ -571,7 +596,6 @@ class MainWindow(QMainWindow):
             save_yaml(self.config_path, cfg)
         cfg.setdefault("app", {})
         cfg.setdefault("paths", {})
-        cfg.setdefault("service", {})
         cfg.setdefault("ocr", {})
         cfg.setdefault("openai", {})
         cfg.setdefault("performance", {})
@@ -700,6 +724,137 @@ class MainWindow(QMainWindow):
                 return px
         return None
 
+    def _stat_number_font(self, size: int, *, bold: bool = False) -> QFont:
+        f = QFont()
+        f.setPointSize(int(size))
+        f.setBold(bool(bold))
+        return f
+
+    def _icon_pixmap(self, kind: str, size: int) -> QPixmap:
+        """Create simple monochrome pictograms (no text)."""
+        px = QPixmap(int(size), int(size))
+        px.fill(Qt.transparent)
+
+        p = QPainter(px)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        col = QColor("#E5E7EB")
+        pen = QPen(col)
+        pen.setWidth(max(2, int(size) // 14))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+
+        s = float(size)
+        m = s * 0.12
+        x0, y0 = m, m
+        w = s - 2 * m
+        h = s - 2 * m
+
+        def rect(x, y, ww, hh, r=0.0):
+            if r and r > 0:
+                p.drawRoundedRect(int(x), int(y), int(ww), int(hh), float(r), float(r))
+            else:
+                p.drawRect(int(x), int(y), int(ww), int(hh))
+
+        k = (kind or "").lower().strip()
+
+        if k in ("receipt", "doc"):
+            rect(x0, y0, w, h, r=s * 0.08)
+            p.drawLine(int(x0 + w * 0.65), int(y0), int(x0 + w), int(y0 + h * 0.35))
+            p.drawLine(int(x0 + w * 0.65), int(y0), int(x0 + w * 0.65), int(y0 + h * 0.35))
+            p.drawLine(int(x0 + w * 0.65), int(y0 + h * 0.35), int(x0 + w), int(y0 + h * 0.35))
+            for i in range(3):
+                yy = y0 + h * (0.45 + i * 0.16)
+                p.drawLine(int(x0 + w * 0.15), int(yy), int(x0 + w * 0.85), int(yy))
+
+        elif k == "duplicate":
+            rect(x0 + w * 0.14, y0 + h * 0.05, w * 0.78, h * 0.78, r=s * 0.08)
+            rect(x0 + w * 0.05, y0 + h * 0.14, w * 0.78, h * 0.78, r=s * 0.08)
+
+        elif k == "quarantine":
+            p.drawPolygon([
+                QPointF(x0 + w * 0.5, y0),
+                QPointF(x0 + w, y0 + h),
+                QPointF(x0, y0 + h),
+            ])
+            p.drawLine(int(x0 + w * 0.5), int(y0 + h * 0.3), int(x0 + w * 0.5), int(y0 + h * 0.68))
+            p.drawPoint(int(x0 + w * 0.5), int(y0 + h * 0.82))
+
+        elif k == "items":
+            rect(x0, y0, w, h, r=s * 0.08)
+            for i in range(4):
+                yy = y0 + h * (0.2 + i * 0.18)
+                p.drawLine(int(x0 + w * 0.18), int(yy), int(x0 + w * 0.82), int(yy))
+                p.drawPoint(int(x0 + w * 0.12), int(yy))
+
+        elif k == "suppliers":
+            base_y = y0 + h * 0.75
+            p.drawLine(int(x0), int(base_y), int(x0 + w), int(base_y))
+            rect(x0 + w * 0.1, y0 + h * 0.35, w * 0.75, h * 0.4, r=s * 0.05)
+            p.drawLine(int(x0 + w * 0.1), int(y0 + h * 0.35), int(x0 + w * 0.3), int(y0 + h * 0.2))
+            p.drawLine(int(x0 + w * 0.3), int(y0 + h * 0.2), int(x0 + w * 0.5), int(y0 + h * 0.35))
+            p.drawLine(int(x0 + w * 0.5), int(y0 + h * 0.35), int(x0 + w * 0.7), int(y0 + h * 0.2))
+            p.drawLine(int(x0 + w * 0.7), int(y0 + h * 0.2), int(x0 + w * 0.85), int(y0 + h * 0.35))
+            rect(x0 + w * 0.78, y0 + h * 0.12, w * 0.12, h * 0.23, r=s * 0.03)
+
+        elif k == "offline":
+            rect(x0 + w * 0.15, y0 + h * 0.15, w * 0.7, h * 0.7, r=s * 0.1)
+            rect(x0 + w * 0.32, y0 + h * 0.32, w * 0.36, h * 0.36, r=s * 0.06)
+            for i in range(4):
+                xx = x0 + w * (0.22 + i * 0.19)
+                p.drawLine(int(xx), int(y0), int(xx), int(y0 + h * 0.15))
+                p.drawLine(int(xx), int(y0 + h * 0.85), int(xx), int(y0 + h))
+
+        elif k == "api":
+            p.drawEllipse(int(x0 + w * 0.18), int(y0 + h * 0.38), int(w * 0.38), int(h * 0.38))
+            p.drawEllipse(int(x0 + w * 0.38), int(y0 + h * 0.25), int(w * 0.38), int(h * 0.45))
+            p.drawEllipse(int(x0 + w * 0.52), int(y0 + h * 0.4), int(w * 0.34), int(h * 0.34))
+            p.drawLine(int(x0 + w * 0.18), int(y0 + h * 0.62), int(x0 + w * 0.86), int(y0 + h * 0.62))
+
+        elif k == "manual":
+            p.drawLine(int(x0 + w * 0.2), int(y0 + h * 0.8), int(x0 + w * 0.8), int(y0 + h * 0.2))
+            p.drawLine(int(x0 + w * 0.72), int(y0 + h * 0.12), int(x0 + w * 0.88), int(y0 + h * 0.28))
+            p.drawLine(int(x0 + w * 0.12), int(y0 + h * 0.72), int(x0 + w * 0.28), int(y0 + h * 0.88))
+
+        elif k in ("sum_wo_vat", "sum_w_vat", "avg_receipt", "avg_item", "avg_items", "minmax", "max_item"):
+            if k == "minmax":
+                p.drawLine(int(x0 + w * 0.5), int(y0 + h * 0.1), int(x0 + w * 0.5), int(y0 + h * 0.9))
+                p.drawLine(int(x0 + w * 0.35), int(y0 + h * 0.25), int(x0 + w * 0.5), int(y0 + h * 0.1))
+                p.drawLine(int(x0 + w * 0.65), int(y0 + h * 0.25), int(x0 + w * 0.5), int(y0 + h * 0.1))
+                p.drawLine(int(x0 + w * 0.35), int(y0 + h * 0.75), int(x0 + w * 0.5), int(y0 + h * 0.9))
+                p.drawLine(int(x0 + w * 0.65), int(y0 + h * 0.75), int(x0 + w * 0.5), int(y0 + h * 0.9))
+            elif k == "max_item":
+                cx, cy = x0 + w * 0.5, y0 + h * 0.5
+                pts = [
+                    (cx, y0),
+                    (x0 + w * 0.62, y0 + h * 0.38),
+                    (x0 + w, y0 + h * 0.4),
+                    (x0 + w * 0.7, y0 + h * 0.62),
+                    (x0 + w * 0.8, y0 + h),
+                    (cx, y0 + h * 0.78),
+                    (x0 + w * 0.2, y0 + h),
+                    (x0 + w * 0.3, y0 + h * 0.62),
+                    (x0, y0 + h * 0.4),
+                    (x0 + w * 0.38, y0 + h * 0.38),
+                ]
+                p.drawPolygon([QPointF(a, b) for a, b in pts])
+            else:
+                p.drawEllipse(int(x0 + w * 0.15), int(y0 + h * 0.2), int(w * 0.7), int(h * 0.6))
+                p.drawLine(int(x0 + w * 0.2), int(y0 + h * 0.5), int(x0 + w * 0.8), int(y0 + h * 0.5))
+                if k == "sum_w_vat":
+                    p.drawLine(int(x0 + w * 0.5), int(y0 + h * 0.28), int(x0 + w * 0.5), int(y0 + h * 0.72))
+                if k == "avg_item":
+                    p.drawEllipse(int(x0 + w * 0.42), int(y0 + h * 0.38), int(w * 0.16), int(h * 0.16))
+                if k == "avg_receipt":
+                    p.drawRect(int(x0 + w * 0.32), int(y0 + h * 0.28), int(w * 0.36), int(h * 0.44))
+
+        else:
+            p.drawEllipse(int(x0), int(y0), int(w), int(h))
+
+        p.end()
+        return px
+
     def _build_ui(self):
         root = QWidget()
         v = QVBoxLayout(root)
@@ -730,15 +885,9 @@ class MainWindow(QMainWindow):
         hl.addWidget(left)
         hl.addStretch(1)
 
-        self.btn_status = QPushButton("STAV")
-        self.btn_run = QPushButton("RUN")
-        self.btn_stop = QPushButton("STOP")
-        self.btn_restart = QPushButton("RESTART")
         self.btn_exit = QPushButton("EXIT")
         self.btn_exit.setObjectName("ExitButton")
 
-        for b in [self.btn_status, self.btn_run, self.btn_stop, self.btn_restart]:
-            hl.addWidget(b)
         hl.addStretch(1)
         hl.addWidget(self.btn_exit)
 
@@ -747,30 +896,125 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         v.addWidget(self.tabs, 1)
 
-        # Dashboard
-        self.tab_dashboard = QWidget()
-        dl = QVBoxLayout(self.tab_dashboard)
-        cards = QWidget()
-        cl = QHBoxLayout(cards)
-        self.lbl_unprocessed = QLabel("Nezpracované: 0")
-        self.lbl_processed = QLabel("Zpracované: 0")
-        self.lbl_docs = QLabel("Účty: 0")
-        self.lbl_suppliers = QLabel("Dodavatelé: 0")
-        for lab in [self.lbl_unprocessed, self.lbl_processed, self.lbl_docs, self.lbl_suppliers]:
-            lab.setMinimumWidth(180)
-            lab.setProperty("card", True)
-            cl.addWidget(lab)
-        cl.addStretch(1)
-        dl.addWidget(cards)
+                # RUN
+        self.tab_run = QWidget()
+        rl = QVBoxLayout(self.tab_run)
 
-        self.lbl_service = QLabel("Služba: ?")
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        dl.addWidget(self.lbl_service)
-        dl.addWidget(self.progress)
+        split_run = QSplitter(Qt.Vertical)
+        rl.addWidget(split_run, 1)
 
-        self.tabs.addTab(self.tab_dashboard, "DASHBOARD")
+        # Top half: process info
+        top_run = QWidget()
+        top_run.setObjectName("Panel")
+        trl = QVBoxLayout(top_run)
+
+        row = QWidget()
+        rhl = QHBoxLayout(row)
+        rhl.setContentsMargins(0, 0, 0, 0)
+        rhl.setSpacing(14)
+
+        self.btn_import = QPushButton("IMPORTUJ")
+        self.btn_import.setToolTip("Zařadí soubory z INPUT do fronty zpracování")
+
+        self.lbl_run_status = QLabel(self._import_status)
+        self.lbl_run_status.setWordWrap(True)
+
+        self.ico_quarantine = QLabel()
+        self.ico_quarantine.setPixmap(self._icon_pixmap("quarantine", 26))
+        self.lbl_quarantine_count = QLabel("0")
+        self.lbl_quarantine_count.setFont(self._stat_number_font(14, bold=True))
+        self.ico_quarantine.setToolTip("Počet účtů v karanténě")
+        self.lbl_quarantine_count.setToolTip("Počet účtů v karanténě")
+
+        self.ico_duplicates = QLabel()
+        self.ico_duplicates.setPixmap(self._icon_pixmap("duplicate", 26))
+        self.lbl_duplicates_count = QLabel("0")
+        self.lbl_duplicates_count.setFont(self._stat_number_font(14, bold=True))
+        self.ico_duplicates.setToolTip("Počet duplicitních účtů")
+        self.lbl_duplicates_count.setToolTip("Počet duplicitních účtů")
+
+        rhl.addWidget(self.btn_import)
+        rhl.addWidget(self.lbl_run_status, 1)
+
+        rhl.addWidget(self.ico_quarantine)
+        rhl.addWidget(self.lbl_quarantine_count)
+        rhl.addSpacing(10)
+        rhl.addWidget(self.ico_duplicates)
+        rhl.addWidget(self.lbl_duplicates_count)
+
+        trl.addWidget(row)
+        split_run.addWidget(top_run)
+
+        # Bottom half: stats
+        bottom_run = QWidget()
+        bottom_run.setObjectName("Panel")
+        brl = QVBoxLayout(bottom_run)
+
+        self._stat_labels: Dict[str, QLabel] = {}
+
+        stats_area = QScrollArea()
+        stats_area.setWidgetResizable(True)
+        stats_area.setFrameShape(QScrollArea.NoFrame)
+
+        stats_wrap = QWidget()
+        grid = QGridLayout(stats_wrap)
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(14)
+
+        def add_stat(key: str, icon: str, tooltip: str, row: int, col: int):
+            card = QWidget()
+            card.setObjectName("Panel")
+            hl2 = QHBoxLayout(card)
+            hl2.setContentsMargins(10, 8, 10, 8)
+            hl2.setSpacing(10)
+
+            ico = QLabel()
+            ico.setPixmap(self._icon_pixmap(icon, 48))
+            ico.setToolTip(tooltip)
+
+            val = QLabel("0")
+            val.setObjectName("CardValue")
+            val.setFont(self._stat_number_font(20, bold=True))
+            val.setToolTip(tooltip)
+
+            hl2.addWidget(ico)
+            hl2.addWidget(val, 1)
+
+            self._stat_labels[key] = val
+            grid.addWidget(card, row, col)
+
+        # 13 indicators, arranged 4 columns
+        add_stat("suppliers", "suppliers", "Počet dodavatelů (jen plně vytěžené účty)", 0, 0)
+        add_stat("receipts", "receipt", "Počet účtenek (jen plně vytěžené účty)", 0, 1)
+        add_stat("items", "items", "Počet položek (jen plně vytěžené účty)", 0, 2)
+
+        add_stat("pct_offline", "offline", "% úspěšně vytěžených účtenek offline", 1, 0)
+        add_stat("pct_api", "api", "% úspěšně vytěžených účtenek za pomoci API", 1, 1)
+        add_stat("pct_manual", "manual", "% ručně vytěžených účtenek", 1, 2)
+
+        add_stat("sum_items_wo_vat", "sum_wo_vat", "Celková částka položek bez DPH", 2, 0)
+        add_stat("sum_items_w_vat", "sum_w_vat", "Celková částka položek s DPH", 2, 1)
+        add_stat("avg_receipt", "avg_receipt", "Průměrná cena účtu", 2, 2)
+        add_stat("avg_item", "avg_item", "Průměrná cena položky", 2, 3)
+
+        add_stat("avg_items_per_receipt", "avg_items", "Průměrný počet položek na 1 účet", 3, 0)
+        add_stat("minmax_items_per_receipt", "minmax", "Min a max položek na 1 účtu", 3, 1)
+        add_stat("max_item_price", "max_item", "Nejdražší položka", 3, 2)
+
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(3, 1)
+
+        stats_area.setWidget(stats_wrap)
+        brl.addWidget(stats_area, 1)
+
+        split_run.addWidget(bottom_run)
+        split_run.setStretchFactor(0, 1)
+        split_run.setStretchFactor(1, 2)
+
+        self.tabs.addTab(self.tab_run, "RUN")
 
         # Provozní panel
         self.tab_ops = QWidget()
@@ -807,27 +1051,10 @@ class MainWindow(QMainWindow):
         stl = QVBoxLayout(self.tab_settings)
         form = QFormLayout()
 
-        self.ed_api_key = QLineEdit()
-        self.ed_api_key.setPlaceholderText("OpenAI API key")
-        self.cb_model = QComboBox()
-        self.btn_load_models = QPushButton("Načíst modely")
-
         self.ed_input_dir = QLineEdit(self.cfg["paths"].get("input_dir", ""))
         self.btn_pick_input = QPushButton("Vybrat")
         self.ed_output_dir = QLineEdit(self.cfg["paths"].get("output_dir", ""))
         self.btn_pick_output = QPushButton("Vybrat")
-
-        self.cb_openai_enabled = QComboBox()
-        self.cb_openai_enabled.addItems(["false", "true"])
-        self.cb_openai_enabled.setCurrentIndex(1 if self.cfg.get("openai", {}).get("enabled") else 0)
-
-        row_api = QWidget(); r1 = QHBoxLayout(row_api); r1.setContentsMargins(0,0,0,0)
-        r1.addWidget(self.ed_api_key); r1.addWidget(self.cb_openai_enabled)
-        form.addRow("API-KEY / enabled", row_api)
-
-        row_model = QWidget(); r2 = QHBoxLayout(row_model); r2.setContentsMargins(0,0,0,0)
-        r2.addWidget(self.cb_model, 1); r2.addWidget(self.btn_load_models)
-        form.addRow("Model OpenAI", row_model)
 
         row_in = QWidget(); r3 = QHBoxLayout(row_in); r3.setContentsMargins(0,0,0,0)
         r3.addWidget(self.ed_input_dir, 1); r3.addWidget(self.btn_pick_input)
@@ -1145,15 +1372,11 @@ class MainWindow(QMainWindow):
 
         # Actions
         self.btn_exit.clicked.connect(self.close)
-        self.btn_status.clicked.connect(self.on_show_status)
-        self.btn_run.clicked.connect(self.on_run_service)
-        self.btn_stop.clicked.connect(self.on_stop_service)
-        self.btn_restart.clicked.connect(self.on_restart_service)
+        self.btn_import.clicked.connect(self.on_import_clicked)
 
         self.btn_pick_input.clicked.connect(lambda: self._pick_dir(self.ed_input_dir))
         self.btn_pick_output.clicked.connect(lambda: self._pick_dir(self.ed_output_dir))
         self.btn_save_settings.clicked.connect(self.on_save_settings)
-        self.btn_load_models.clicked.connect(self.on_load_models)
 
         self.btn_sup_refresh.clicked.connect(self.refresh_suppliers)
         self._sup_filter_timer.timeout.connect(self.refresh_suppliers)
@@ -1222,7 +1445,7 @@ class MainWindow(QMainWindow):
 
     def _wire_timers(self):
         self.timer = QTimer(self)
-        # Do not refresh too often; otherwise a slow service status poll can starve UI.
+        # Periodic lightweight refresh for RUN tab.
         interval = int(self.cfg.get("performance", {}).get("ui_refresh_ms") or 1000)
         # keep it reasonable even if config is too aggressive
         interval = max(2000, interval)
@@ -2052,86 +2275,111 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-    def _service_status(self) -> Dict[str, Any]:
-        try:
-            return send_cmd(self.cfg["service"].get("host", "127.0.0.1"), int(self.cfg["service"].get("port", 8765)), "status")
-        except Exception as e:
-            # Never crash UI because the service is down.
-            self.log.warning("service status failed: %s", e)
-            return {
-                "ok": False,
-                "running": False,
-                "queue_size": None,
-                "last_success": None,
-                "last_error": str(e),
-                "last_error_at": dt.datetime.utcnow().isoformat(),
-                "last_seen": None,
-            }
-
-    def _start_service_process(self) -> bool:
-        # Start service as detached process
-        python = sys.executable
-        cmd = [python, str(Path(__file__).resolve().parents[3] / "service_main.py"), "--config", str(self.config_path)]
-        try:
-            if os.name == "nt":
-                subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS, close_fds=True)
-            else:
-                subprocess.Popen(cmd, start_new_session=True, close_fds=True)
-            return True
-        except Exception as e:
-            QMessageBox.critical(self, "Chyba", f"Nelze spustit službu: {e}")
-            return False
-
-    def on_run_service(self):
-        st = self._service_status()
-        if st.get("ok") is not False and st.get("running"):
-            QMessageBox.information(self, "RUN", "Služba už běží.")
-            return
-        if self._start_service_process():
-            QMessageBox.information(self, "RUN", "Služba spuštěna.")
-
-    def on_stop_service(self):
-        try:
-            send_cmd(self.cfg["service"].get("host", "127.0.0.1"), int(self.cfg["service"].get("port", 8765)), "stop")
-        except Exception as e:
-            # Stop should not crash if service is already down.
-            QMessageBox.warning(self, "STOP", f"Službu se nepodařilo zastavit (možná neběží): {e}")
-
-    def on_restart_service(self):
-        self.on_stop_service()
-        QTimer.singleShot(800, self.on_run_service)
-
-    def on_show_status(self):
-        # avoid blocking UI if service is down (socket timeout)
-        def work():
-            return self._service_status()
-        def done(st):
-            d = StatusDialog(st, self)
-            d.exec()
-        self._run_with_busy("STAV", "Načítám stav služby…", work, done, timeout_ms=8000)
-
     def on_save_settings(self):
         deep_set(self.cfg, ["paths", "input_dir"], self.ed_input_dir.text().strip())
         deep_set(self.cfg, ["paths", "output_dir"], self.ed_output_dir.text().strip())
-        enabled = self.cb_openai_enabled.currentText().lower() == "true"
-        deep_set(self.cfg, ["openai", "enabled"], enabled)
-        deep_set(self.cfg, ["openai", "api_key"], self.ed_api_key.text().strip())
-        deep_set(self.cfg, ["openai", "model"], self.cb_model.currentText().strip())
         save_yaml(self.config_path, self.cfg)
         QMessageBox.information(self, "Nastavení", "Uloženo.")
 
-    def on_load_models(self):
-        api_key = self.ed_api_key.text().strip() or str(self.cfg.get("openai", {}).get("api_key") or "")
-        if not api_key:
-            QMessageBox.warning(self, "Modely", "Nejdřív zadej API-KEY.")
+    def _on_import_progress(self, msg: str) -> None:
+        self._import_status = msg
+        try:
+            self.lbl_run_status.setText(msg)
+        except Exception:
+            pass
+
+    def _on_import_done(self, res: dict) -> None:
+        imported = int(res.get("imported") or 0)
+        total = int(res.get("total") or imported)
+        msg = str(res.get("message") or "Hotovo.")
+        self._import_status = f"{msg} ({imported}/{total})"
+        self._import_running = False
+        try:
+            self.btn_import.setEnabled(True)
+            self.lbl_run_status.setText(self._import_status)
+        except Exception:
+            pass
+
+        # refresh views (counts/stats + lists)
+        try:
+            self.refresh_all_v2()
+        except Exception:
+            pass
+        try:
+            self.refresh_ops()
+            self.refresh_suspicious()
+            self.refresh_money()
+        except Exception:
+            pass
+
+    def _on_import_error(self, msg: str) -> None:
+        self._import_running = False
+        self._import_status = f"Chyba: {msg}"
+        try:
+            self.btn_import.setEnabled(True)
+            self.lbl_run_status.setText(self._import_status)
+        except Exception:
+            pass
+        QMessageBox.critical(self, "IMPORTUJ", msg)
+
+    def on_import_clicked(self) -> None:
+        if self._import_running:
             return
-        def work():
-            return list_models(api_key)
-        def done(models: List[str]):
-            self.cb_model.clear()
-            self.cb_model.addItems(models)
-            QMessageBox.information(self, "Modely", f"Načteno: {len(models)}")
-        self._run_with_busy("Modely", "Načítám dostupné modely…", work, done)
+        input_dir_val = self.ed_input_dir.text().strip() or str(self.cfg.get("paths", {}).get("input_dir") or "")
+        if not input_dir_val:
+            QMessageBox.warning(self, "IMPORTUJ", "Není nastaven INPUT adresář (Nastavení → Input adresář).")
+            return
+        output_dir_val = self.ed_output_dir.text().strip() or str(self.cfg.get("paths", {}).get("output_dir") or "")
+        deep_set(self.cfg, ["paths", "input_dir"], input_dir_val)
+        if output_dir_val:
+            deep_set(self.cfg, ["paths", "output_dir"], output_dir_val)
+
+        self._import_running = True
+        self._import_status = "Načítám INPUT…"
+        try:
+            self.btn_import.setEnabled(False)
+            self.lbl_run_status.setText(self._import_status)
+        except Exception:
+            pass
+
+        th = QThread(self)
+        wk = _ImportWorker(self.cfg, self.sf, self.processor)
+        wk.moveToThread(th)
+        th.started.connect(wk.run)
+        wk.progress.connect(self._on_import_progress)
+        wk.done.connect(self._on_import_done)
+        wk.error.connect(self._on_import_error)
+
+        cleaned = False
+
+        def _cleanup_thread():
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+            try:
+                th.quit()
+                th.wait(2000)
+            except Exception:
+                pass
+            try:
+                self._threads.remove(th)
+            except Exception:
+                pass
+            try:
+                self._workers.remove(wk)
+            except Exception:
+                pass
+
+        wk.done.connect(lambda _res: _cleanup_thread())
+        wk.error.connect(lambda _msg: _cleanup_thread())
+        th.finished.connect(_cleanup_thread)
+
+        # Keep references alive
+        self._threads.append(th)
+        self._workers.append(wk)  # type: ignore
+
+        th.start()
 
     def refresh_all(self):
         self.refresh_dashboard()
@@ -2146,57 +2394,99 @@ class MainWindow(QMainWindow):
         # Keep API compatibility, but do not block UI thread.
         self._refresh_dashboard_async()
 
-    def _apply_dashboard(self, c: Dict[str, Any] | None, st: Dict[str, Any] | None) -> None:
+    def _apply_dashboard(self, c: Dict[str, Any] | None, rs: Dict[str, Any] | None) -> None:
+        try:
+            self.lbl_run_status.setText(self._import_status)
+        except Exception:
+            pass
+
         if c:
             try:
-                self.lbl_unprocessed.setText(f"Nezpracované: {c.get('unprocessed', 0)}")
-                self.lbl_processed.setText(f"Zpracované: {c.get('processed', 0)}")
-                self.lbl_docs.setText(f"Účty: {c.get('documents', 0)}")
-                self.lbl_suppliers.setText(f"Dodavatelé: {c.get('suppliers', 0)}")
-            except Exception:
-                pass
-        if st:
-            try:
-                running = bool(st.get("running"))
-                self.lbl_service.setText(
-                    f"Služba: {'běží' if running else 'neběží'} | fronta: {st.get('queue_size')}"
-                )
-                qsz = st.get("queue_size") or 0
-                self.progress.setValue(0 if qsz == 0 else min(95, int(100 / (qsz + 1))))
+                self.lbl_quarantine_count.setText(str(int(c.get("quarantine", 0) or 0)))
+                self.lbl_duplicates_count.setText(str(int(c.get("duplicates", 0) or 0)))
             except Exception:
                 pass
 
+        if not rs:
+            return
+
+        def fmt_int(n: int) -> str:
+            return f"{int(n):,}".replace(",", " ")
+
+        def fmt_money(x: float) -> str:
+            return f"{float(x):,.2f}".replace(",", " ")
+
+        def fmt_pct(x: float) -> str:
+            return f"{float(x):.1f} %"
+
+        try:
+            if "suppliers" in self._stat_labels:
+                self._stat_labels["suppliers"].setText(fmt_int(rs.get("suppliers", 0) or 0))
+            if "receipts" in self._stat_labels:
+                self._stat_labels["receipts"].setText(fmt_int(rs.get("receipts", 0) or 0))
+            if "items" in self._stat_labels:
+                self._stat_labels["items"].setText(fmt_int(rs.get("items", 0) or 0))
+
+            if "pct_offline" in self._stat_labels:
+                self._stat_labels["pct_offline"].setText(fmt_pct(rs.get("pct_offline", 0.0) or 0.0))
+            if "pct_api" in self._stat_labels:
+                self._stat_labels["pct_api"].setText(fmt_pct(rs.get("pct_api", 0.0) or 0.0))
+            if "pct_manual" in self._stat_labels:
+                self._stat_labels["pct_manual"].setText(fmt_pct(rs.get("pct_manual", 0.0) or 0.0))
+
+            if "sum_items_wo_vat" in self._stat_labels:
+                self._stat_labels["sum_items_wo_vat"].setText(fmt_money(rs.get("sum_items_wo_vat", 0.0) or 0.0))
+            if "sum_items_w_vat" in self._stat_labels:
+                self._stat_labels["sum_items_w_vat"].setText(fmt_money(rs.get("sum_items_w_vat", 0.0) or 0.0))
+            if "avg_receipt" in self._stat_labels:
+                self._stat_labels["avg_receipt"].setText(fmt_money(rs.get("avg_receipt", 0.0) or 0.0))
+            if "avg_item" in self._stat_labels:
+                self._stat_labels["avg_item"].setText(fmt_money(rs.get("avg_item", 0.0) or 0.0))
+
+            if "avg_items_per_receipt" in self._stat_labels:
+                self._stat_labels["avg_items_per_receipt"].setText(f"{float(rs.get('avg_items_per_receipt', 0.0) or 0.0):.2f}")
+
+            if "minmax_items_per_receipt" in self._stat_labels:
+                mi = int(rs.get("min_items_per_receipt", 0) or 0)
+                ma = int(rs.get("max_items_per_receipt", 0) or 0)
+                self._stat_labels["minmax_items_per_receipt"].setText(f"{mi}–{ma}")
+
+            if "max_item_price" in self._stat_labels:
+                mx = float(rs.get("max_item_price", 0.0) or 0.0)
+                self._stat_labels["max_item_price"].setText(fmt_money(mx))
+                nm = rs.get("max_item_name")
+                if nm:
+                    self._stat_labels["max_item_price"].setToolTip(f"Nejdražší položka: {nm}")
+        except Exception:
+            pass
+
     def _refresh_dashboard_async(self) -> None:
-        # prevent overlapping refreshes (important when service status is slow)
+        # prevent overlapping refreshes
         if self._dash_refresh_inflight:
             return
         self._dash_refresh_inflight = True
 
         def work():
             c = None
-            st = None
+            rs = None
             try:
                 with self.sf() as session:
                     c = db_api.counts(session)
+                    rs = db_api.run_stats(session)
             except Exception as e:
                 c = None
+                rs = None
                 try:
-                    self.log.debug("dashboard counts failed: %s", e)
+                    self.log.debug("run tab stats failed: %s", e)
                 except Exception:
                     pass
-            try:
-                # This may block up to socket timeout, but it's in background thread.
-                st = self._service_status()
-            except Exception as e:
-                st = {"ok": False, "running": False, "queue_size": None, "error": str(e)}
-            return (c, st)
+            return (c, rs)
 
         def done(res):
             try:
-                c, st = res
+                c, rs = res
                 self._dash_last_counts = c
-                self._dash_last_status = st
-                self._apply_dashboard(c, st)
+                self._apply_dashboard(c, rs)
             finally:
                 self._dash_refresh_inflight = False
 

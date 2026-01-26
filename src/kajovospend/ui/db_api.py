@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import select, text, func
+from sqlalchemy import select, text, func, case
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -14,14 +14,190 @@ def counts(session: Session) -> Dict[str, int]:
     unprocessed = session.execute(select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "NEW")).scalar_one()
     processed = session.execute(select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "PROCESSED")).scalar_one()
     quarantine = session.execute(select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "QUARANTINE")).scalar_one()
+    duplicates = session.execute(select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "DUPLICATE")).scalar_one()
     suppliers = session.execute(select(func.count()).select_from(Supplier)).scalar_one()
     docs = session.execute(select(func.count()).select_from(Document)).scalar_one()
     return {
         "unprocessed": int(unprocessed),
         "processed": int(processed),
         "quarantine": int(quarantine),
+        "duplicates": int(duplicates),
         "suppliers": int(suppliers),
         "documents": int(docs),
+    }
+
+
+def run_stats(session: Session) -> Dict[str, Any]:
+    """Statistics for RUN tab.
+
+    All indicators are computed strictly from *fully processed* receipts:
+    documents whose underlying file has status PROCESSED.
+    QUARANTINE and DUPLICATE files are excluded from denominators.
+    """
+
+    # base document set = documents that belong to files marked as PROCESSED
+    doc_ids = [
+        int(r[0])
+        for r in session.execute(
+            select(Document.id)
+            .join(DocumentFile, Document.file_id == DocumentFile.id)
+            .where(DocumentFile.status == "PROCESSED")
+        ).all()
+    ]
+
+    total_docs = len(doc_ids)
+    if total_docs == 0:
+        return {
+            "suppliers": 0,
+            "receipts": 0,
+            "items": 0,
+            "pct_offline": 0.0,
+            "pct_api": 0.0,
+            "pct_manual": 0.0,
+            "sum_items_wo_vat": 0.0,
+            "sum_items_w_vat": 0.0,
+            "avg_receipt": 0.0,
+            "avg_item": 0.0,
+            "avg_items_per_receipt": 0.0,
+            "min_items_per_receipt": 0,
+            "max_items_per_receipt": 0,
+            "max_item_price": 0.0,
+            "max_item_name": None,
+        }
+
+    # counts
+    suppliers = int(
+        session.execute(
+            select(func.count(func.distinct(Document.supplier_ico)))
+            .join(DocumentFile, Document.file_id == DocumentFile.id)
+            .where(DocumentFile.status == "PROCESSED")
+            .where(Document.supplier_ico.is_not(None))
+        ).scalar_one()
+        or 0
+    )
+
+    items_count = int(
+        session.execute(select(func.count()).select_from(LineItem).where(LineItem.document_id.in_(doc_ids))).scalar_one()
+        or 0
+    )
+
+    # success by extraction method
+    def _pct(method: str) -> float:
+        n = int(
+            session.execute(
+                select(func.count())
+                .select_from(Document)
+                .where(Document.id.in_(doc_ids))
+                .where(Document.extraction_method == method)
+            ).scalar_one()
+            or 0
+        )
+        return (100.0 * n / total_docs) if total_docs else 0.0
+
+    pct_offline = _pct("offline")
+    pct_api = _pct("openai")
+    pct_manual = _pct("manual")
+
+    # sums and averages over items
+    sum_with_vat = float(
+        session.execute(
+            select(func.sum(LineItem.line_total))
+            .select_from(LineItem)
+            .where(LineItem.document_id.in_(doc_ids))
+        ).scalar_one()
+        or 0.0
+    )
+
+    # best-effort VAT removal; if vat_rate is 0/NULL, treat as already without VAT
+    sum_wo_vat = float(
+        session.execute(
+            select(
+                func.sum(
+                    case(
+                        (
+                            (LineItem.vat_rate.is_(None)) | (LineItem.vat_rate == 0),
+                            LineItem.line_total,
+                        ),
+                        else_=LineItem.line_total / (1.0 + (LineItem.vat_rate / 100.0)),
+                    )
+                )
+            )
+            .select_from(LineItem)
+            .where(LineItem.document_id.in_(doc_ids))
+        ).scalar_one()
+        or 0.0
+    )
+
+    avg_item = float(
+        session.execute(
+            select(func.avg(LineItem.line_total))
+            .select_from(LineItem)
+            .where(LineItem.document_id.in_(doc_ids))
+        ).scalar_one()
+        or 0.0
+    )
+
+    # per-document item counts (for avg/min/max)
+    counts_rows = session.execute(
+        select(LineItem.document_id, func.count(LineItem.id))
+        .select_from(LineItem)
+        .where(LineItem.document_id.in_(doc_ids))
+        .group_by(LineItem.document_id)
+    ).all()
+    per_doc_counts = [int(c or 0) for _doc_id, c in counts_rows]
+    # documents with 0 items (shouldn't happen but keep deterministic)
+    if len(per_doc_counts) < total_docs:
+        per_doc_counts.extend([0] * (total_docs - len(per_doc_counts)))
+
+    avg_items_per_receipt = float(sum(per_doc_counts) / total_docs) if total_docs else 0.0
+    min_items = int(min(per_doc_counts) if per_doc_counts else 0)
+    max_items = int(max(per_doc_counts) if per_doc_counts else 0)
+
+    # average receipt value: prefer Document.total_with_vat, fallback to sum(items)
+    per_doc_sums = {int(did): float(s or 0.0) for did, s in session.execute(
+        select(LineItem.document_id, func.sum(LineItem.line_total))
+        .where(LineItem.document_id.in_(doc_ids))
+        .group_by(LineItem.document_id)
+    ).all()}
+    doc_totals = session.execute(select(Document.id, Document.total_with_vat).where(Document.id.in_(doc_ids))).all()
+    vals = []
+    for did, tv in doc_totals:
+        if tv is not None:
+            vals.append(float(tv))
+        else:
+            vals.append(per_doc_sums.get(int(did), 0.0))
+    avg_receipt = float(sum(vals) / len(vals)) if vals else 0.0
+
+    # max item
+    max_row = session.execute(
+        select(LineItem.name, LineItem.line_total)
+        .select_from(LineItem)
+        .where(LineItem.document_id.in_(doc_ids))
+        .order_by(LineItem.line_total.desc())
+        .limit(1)
+    ).first()
+    max_name = None
+    max_price = 0.0
+    if max_row:
+        max_name = max_row[0]
+        max_price = float(max_row[1] or 0.0)
+
+    return {
+        "suppliers": suppliers,
+        "receipts": total_docs,
+        "items": items_count,
+        "pct_offline": pct_offline,
+        "pct_api": pct_api,
+        "pct_manual": pct_manual,
+        "sum_items_wo_vat": sum_wo_vat,
+        "sum_items_w_vat": sum_with_vat,
+        "avg_receipt": avg_receipt,
+        "avg_item": avg_item,
+        "avg_items_per_receipt": avg_items_per_receipt,
+        "min_items_per_receipt": min_items,
+        "max_items_per_receipt": max_items,
+        "max_item_price": max_price,
+        "max_item_name": max_name,
     }
 
 
@@ -200,6 +376,7 @@ def list_documents(
             select(Document, DocumentFile)
             .join(DocumentFile, Document.file_id == DocumentFile.id)
             .where(Document.id.in_(ids))
+            .where(DocumentFile.status != "QUARANTINE")
         )
         # extra safety on date range (even if already applied in FTS)
         stmt = _apply_date_filters(stmt, date_from=date_from, date_to=date_to)
@@ -211,6 +388,7 @@ def list_documents(
     stmt = (
         select(Document, DocumentFile)
         .join(DocumentFile, Document.file_id == DocumentFile.id)
+        .where(DocumentFile.status != "QUARANTINE")
         .order_by(Document.issue_date.desc().nullslast(), Document.id.desc())
     )
     stmt = _apply_date_filters(stmt, date_from=date_from, date_to=date_to)
