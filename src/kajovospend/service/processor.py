@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import datetime as dt
 import shutil
-import io
 import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
@@ -383,17 +382,84 @@ class Processor:
         return t, c, 1
 
     def _guess_supplier_ico_from_text(self, text: str) -> Optional[str]:
-        """Best-effort: pokud OCR nevyčetl IČO pomocí kontextu, zkus najít 8místné kandidáty.
-
-        Strategie:
-        - vytáhne všechny 8-místné sekvence číslic
-        - zkusí je ověřit přes ARES (rychlý timeout)
-        - když vyjde právě 1, vrátí ji
-
-        Pozn.: cíleně nevrací víc kandidátů, abychom nevytvářeli falešně pozitivní dodavatele.
+        """
+        Best-effort self-healing IČO:
+        - primárně zkusí explicitní výskyty "IČO/ICO" + 8 číslic
+        - jinak sbírá 8místné kandidáty (\\b\\d{8}\\b), filtruje typické falešné vzory (PSČ, tel, EAN)
+        - validuje přes ARES (rychlý timeout)
+        - pokud vyjde přesně 1 validní kandidát, vrátí jej
         """
         if not text:
             return None
+
+        t = str(text)
+
+        def _is_false_pattern_line(line: str) -> bool:
+            ln = (line or "").strip().lower()
+            if not ln:
+                return False
+            if re.search(r"\bps[čc]\b", ln) or re.search(r"\bzip\b", ln):
+                return True
+            if re.search(r"\b(tel|telefon|mobil|phone)\b", ln):
+                return True
+            if re.search(r"\b(ean|barcode|čárov|carov)\b", ln):
+                return True
+            return False
+
+        def _line_for_pos(pos: int) -> str:
+            start = t.rfind("\n", 0, pos)
+            start = 0 if start < 0 else start + 1
+            end = t.find("\n", pos)
+            end = len(t) if end < 0 else end
+            return t[start:end]
+
+        def _validate_candidate(raw_ico: str) -> Optional[str]:
+            try:
+                ico_n = normalize_ico(raw_ico)
+            except Exception:
+                return None
+            try:
+                rec = fetch_by_ico(ico_n, timeout=4)
+                return getattr(rec, "ico", ico_n)
+            except Exception:
+                return None
+
+        # 1) explicitní IČO/ICO patterny (vyšší priorita)
+        #    - podporuje "IČO: 12345678", "ICO 12345678", "IČO#12345678" apod.
+        label_re = re.compile(r"(?i)\b(ič[o0]|ico)\b\s*[:#]?\s*(\d{8})\b")
+        for m in label_re.finditer(t):
+            cand = m.group(2)
+            ico = _validate_candidate(cand)
+            if ico:
+                return ico
+
+        # 2) obecné 8místné kandidáty + filtrování falešných vzorů
+        cands: List[str] = []
+        for m in re.finditer(r"\b\d{8}\b", t):
+            cand = m.group(0)
+            line = _line_for_pos(m.start())
+            if _is_false_pattern_line(line):
+                continue
+            if cand not in cands:
+                cands.append(cand)
+            if len(cands) >= 20:
+                break
+
+        if not cands:
+            return None
+
+        valid: List[str] = []
+        for cand in cands:
+            ico = _validate_candidate(cand)
+            if ico:
+                valid.append(ico)
+            if len(valid) > 1:
+                break
+
+        # bezpečné chování: vrátíme jen když je jednoznačný výsledek
+        if len(valid) == 1:
+            return valid[0]
+        return None
 
     def _looks_like_ico(self, ico: str | None) -> bool:
         if not ico:
@@ -424,34 +490,6 @@ class Processor:
         base = (supplier_name or "UNKNOWN").strip().upper().encode("utf-8", errors="ignore")
         h = hashlib.sha256(base).hexdigest()[:10]
         return f"NOICO-{h}"
-        cands = []
-        for m in re.finditer(r"\b\d{8}\b", text):
-            cands.append(m.group(0))
-        # de-dup, stabilní pořadí
-        seen = set()
-        uniq = []
-        for c in cands:
-            if c not in seen:
-                uniq.append(c)
-                seen.add(c)
-
-        valid: List[str] = []
-        for c in uniq[:20]:
-            try:
-                ico_n = normalize_ico(c)
-            except Exception:
-                continue
-            try:
-                # rychlá validace přes ARES
-                fetch_by_ico(ico_n, timeout=4)
-                valid.append(ico_n)
-            except Exception:
-                continue
-            if len(valid) > 1:
-                break
-        if len(valid) == 1:
-            return valid[0]
-        return None
 
     def process_path(self, session, path: Path, status_cb=None) -> Dict[str, Any]:
         # returns dict with outcome
