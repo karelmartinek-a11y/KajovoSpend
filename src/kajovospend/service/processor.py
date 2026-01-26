@@ -23,6 +23,7 @@ from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 from kajovospend.ocr.rapidocr_engine import RapidOcrEngine
 from kajovospend.utils.hashing import sha256_file
+from kajovospend.utils.text_quality import compute_text_quality, summarize_text_quality
 
 
 def safe_move(src: Path, dst_dir: Path, target_name: str) -> Path:
@@ -54,45 +55,263 @@ class Processor:
             self.log.warning(f"OCR init failed; will quarantine documents. Error: {e}")
             self.ocr_engine = None
 
-    def _ocr_pdf_pages(self, pdf_path: Path, status_cb=None) -> Tuple[List[str], List[float], int]:
+    def _ocr_pdf_pages(self, pdf_path: Path, status_cb=None) -> Tuple[List[str], List[float], int, str, Dict[str, Any]]:
         """
-        Vrátí OCR text po jednotlivých stránkách:
-        - embedded text: per page extract_text()
-        - jinak: render->OCR per page
+        Hybrid per-page OCR:
+        - pro každou stránku nejdřív zkus embedded text (extract_text), ohodnoť kvalitu
+        - OCRuje se jen tam, kde embedded nedává smysl
+        - výsledek = lepší z embedded/OCR na každé stránce (řeší mixované PDF)
         """
-        # Try embedded text first (page-by-page)
+        text_method = "pdf_hybrid"
+        text_debug: Dict[str, Any] = {"path": str(pdf_path)}
+
+        ocr_cfg = (self.cfg.get("ocr") or {}) if isinstance(self.cfg, dict) else {}
+        quality_threshold = float(ocr_cfg.get("page_text_quality_threshold", 0.45))
+        min_non_ws = int(ocr_cfg.get("page_text_min_non_ws", 25))
+        score_margin = float(ocr_cfg.get("page_text_score_margin", 0.02))
+
+        def _metrics(txt: str) -> Dict[str, Any]:
+            t = txt or ""
+            total = len(t)
+            non_ws = len(re.sub(r"\s+", "", t))
+            letters = len(re.findall(r"[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽáčďéěíňóřšťúůýž]", t))
+            digits = len(re.findall(r"\d", t))
+            bad = t.count("\ufffd") + len(re.findall(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", t))
+            lines_nonempty = len([ln for ln in t.splitlines() if ln.strip()])
+            return {
+                "total": total,
+                "non_ws": non_ws,
+                "letters": letters,
+                "digits": digits,
+                "bad": bad,
+                "lines_nonempty": lines_nonempty,
+            }
+
+        def _score(m: Dict[str, Any]) -> float:
+            total = int(m.get("total") or 0)
+            non_ws = int(m.get("non_ws") or 0)
+            if non_ws <= 0 or total <= 0:
+                return 0.0
+            letters = int(m.get("letters") or 0)
+            digits = int(m.get("digits") or 0)
+            bad = int(m.get("bad") or 0)
+            density = min(1.0, non_ws / 400.0)
+            alnum_ratio = (letters + digits) / max(1, non_ws)
+            bad_ratio = bad / max(1, total)
+            s = 0.55 * density + 0.55 * alnum_ratio - 0.80 * bad_ratio
+            if s < 0.0:
+                return 0.0
+            if s > 1.0:
+                return 1.0
+            return float(s)
+
+        def _conf_from_embedded(m: Dict[str, Any], s: float) -> float:
+            non_ws = int(m.get("non_ws") or 0)
+            if non_ws <= 0:
+                return 0.0
+            conf = 0.50 + 0.45 * float(s)
+            if conf < 0.0:
+                conf = 0.0
+            if conf > 0.95:
+                conf = 0.95
+            return float(conf)
+
         if status_cb:
-            status_cb("PDF: čtu text (bez OCR)…")
+            status_cb("PDF: čtu text (hybrid embedded/OCR)…")
+
         try:
             reader = PdfReader(str(pdf_path))
-            texts: List[str] = []
+            embedded_texts: List[str] = []
+            embedded_metrics: List[Dict[str, Any]] = []
+            embedded_scores: List[float] = []
             for page in reader.pages:
                 t = page.extract_text() or ""
-                texts.append(t)
-            # if at least one page has real text, treat as embedded text mode
-            if any((t or "").strip() for t in texts):
-                confs = [0.95 if (t or "").strip() else 0.0 for t in texts]
-                return texts, confs, len(texts)
-        except Exception:
-            pass
+                embedded_texts.append(t)
+                m = _metrics(t)
+                embedded_metrics.append(m)
+                embedded_scores.append(_score(m))
+            n_pages = len(embedded_texts)
+            text_debug["embedded_scores"] = embedded_scores
+            if n_pages > 0:
+                pages_with_text = sum(1 for t in embedded_texts if (t or "").strip())
+                emb_summary = summarize_text_quality([compute_text_quality(t) for t in embedded_texts])
+                text_debug["embedded"] = emb_summary
+                text_debug["embedded_pages_with_text"] = pages_with_text
+                self.log.info(
+                    "PDF text source: embedded pages_with_text=%s/%s quality=%s",
+                    pages_with_text,
+                    n_pages,
+                    emb_summary,
+                )
+        except Exception as e:
+            self.log.warning(f"PDF embedded extract_text() failed; fallback to OCR. Error: {e}")
+            embedded_texts = []
+            embedded_metrics = []
+            embedded_scores = []
+            n_pages = 0
+            text_debug["embedded_error"] = str(e)
 
-        # fallback to image OCR
+        if n_pages <= 0 and self.ocr_engine is None:
+            text_debug["reason"] = "no_embedded_no_ocr"
+            text_debug["method"] = "none"
+            return [], [], 0, "none", text_debug
+
+        needs_ocr: List[bool] = []
+        if n_pages > 0:
+            for i in range(n_pages):
+                m = embedded_metrics[i]
+                s = embedded_scores[i]
+                weak = (int(m.get("non_ws") or 0) < min_non_ws) or (float(s) < quality_threshold)
+                needs_ocr.append(bool(weak))
+
+        out_texts: List[str] = list(embedded_texts) if embedded_texts else []
+        out_confs: List[float] = []
+        if embedded_texts:
+            for i in range(n_pages):
+                out_confs.append(_conf_from_embedded(embedded_metrics[i], embedded_scores[i]))
+
+        if embedded_texts:
+            weak_cnt = sum(1 for x in needs_ocr if x)
+            text_debug["weak_pages"] = weak_cnt
+            self.log.info(
+                f"pdf_text_source: pages={n_pages} weak_pages={weak_cnt} "
+                f"threshold={quality_threshold:.2f} min_non_ws={min_non_ws}"
+            )
+
         if self.ocr_engine is None:
-            return [], [], 0
+            if embedded_texts:
+                text_debug["method"] = "embedded"
+                for i in range(n_pages):
+                    m = embedded_metrics[i]
+                    s = embedded_scores[i]
+                    chosen = "embedded"
+                    why = "weak_embedded_but_no_ocr" if needs_ocr[i] else "embedded_ok"
+                    self.log.info(
+                        f"pdf_text_source page={i+1}/{n_pages} chosen={chosen} why={why} "
+                        f"emb_score={s:.3f} emb_nonws={int(m.get('non_ws') or 0)} emb_bad={int(m.get('bad') or 0)}"
+                    )
+                text_method = "embedded"
+                return out_texts, out_confs, n_pages, text_method, text_debug
+            text_debug["reason"] = "no_ocr_engine"
+            text_debug["method"] = "none"
+            return [], [], 0, "none", text_debug
+
         dpi_cfg = int(self.cfg["ocr"].get("pdf_dpi", 200))
         dpi = max(300, dpi_cfg)
-        if status_cb:
-            status_cb(f"PDF: render na obrázky ({dpi} DPI)…")
-        images = render_pdf_to_images(pdf_path, dpi=dpi)
-        texts2: List[str] = []
-        confs2: List[float] = []
-        for idx_page, img in enumerate(images, start=1):
+        text_debug["dpi"] = dpi
+
+        if not embedded_texts:
+            text_method = "ocr"
             if status_cb:
-                status_cb(f"OCR: strana {idx_page}/{len(images)}…")
-            t, c = self.ocr_engine.image_to_text(img)
-            texts2.append(t or "")
-            confs2.append(float(c or 0.0))
-        return texts2, confs2, len(images)
+                status_cb(f"PDF: render na obrázky ({dpi} DPI)…")
+            images = render_pdf_to_images(pdf_path, dpi=dpi)
+            texts2: List[str] = []
+            confs2: List[float] = []
+            for idx_page, img in enumerate(images, start=1):
+                if status_cb:
+                    status_cb(f"OCR: strana {idx_page}/{len(images)}…")
+                t, c = self.ocr_engine.image_to_text(img)
+                texts2.append(t or "")
+                confs2.append(float(c or 0.0))
+                m = _metrics(t or "")
+                s = _score(m)
+                self.log.info(
+                    f"pdf_text_source page={idx_page}/{len(images)} chosen=ocr why=no_embedded "
+                    f"ocr_score={s:.3f} ocr_nonws={int(m.get('non_ws') or 0)} ocr_bad={int(m.get('bad') or 0)} "
+                    f"ocr_conf={float(c or 0.0):.3f}"
+                )
+            text_debug["method"] = text_method
+            text_debug["ocr_conf_avg"] = float(sum(confs2) / len(confs2)) if confs2 else 0.0
+            text_debug["ocr_conf_min"] = float(min(confs2)) if confs2 else 0.0
+            text_debug["ocr_conf_max"] = float(max(confs2)) if confs2 else 0.0
+            ocr_summary = summarize_text_quality([compute_text_quality(t) for t in texts2])
+            text_debug["ocr"] = ocr_summary
+            self.log.info(
+                "PDF text source: ocr reason=embedded_empty dpi=%s pages=%s conf_avg=%.3f conf_min=%.3f conf_max=%.3f quality=%s",
+                dpi,
+                len(images),
+                text_debug["ocr_conf_avg"],
+                text_debug["ocr_conf_min"],
+                text_debug["ocr_conf_max"],
+                ocr_summary,
+            )
+            return texts2, confs2, len(images), text_method, text_debug
+
+        need_idxs = [i for i, need in enumerate(needs_ocr) if need]
+        if not need_idxs:
+            text_method = "embedded"
+            text_debug["method"] = text_method
+            for i in range(n_pages):
+                m = embedded_metrics[i]
+                s = embedded_scores[i]
+                self.log.info(
+                    f"pdf_text_source page={i+1}/{n_pages} chosen=embedded why=embedded_ok "
+                    f"emb_score={s:.3f} emb_nonws={int(m.get('non_ws') or 0)} emb_bad={int(m.get('bad') or 0)}"
+                )
+            return out_texts, out_confs, n_pages, text_method, text_debug
+
+        segments: List[Tuple[int, int]] = []
+        seg_start = need_idxs[0]
+        seg_prev = need_idxs[0]
+        for idx in need_idxs[1:]:
+            if idx == seg_prev + 1:
+                seg_prev = idx
+                continue
+            segments.append((seg_start, seg_prev))
+            seg_start = idx
+            seg_prev = idx
+        segments.append((seg_start, seg_prev))
+        text_debug["ocr_segments"] = segments
+
+        selections: List[Dict[str, Any]] = []
+        for s0, s1 in segments:
+            count = (s1 - s0 + 1)
+            if status_cb:
+                status_cb(f"PDF: OCR strany {s0+1}-{s1+1}/{n_pages}…")
+            images = render_pdf_to_images(pdf_path, dpi=dpi, start_page=s0, max_pages=count)
+            for off, img in enumerate(images):
+                page_idx = s0 + off
+                if status_cb:
+                    status_cb(f"OCR: strana {page_idx+1}/{n_pages}…")
+                ocr_text, ocr_conf = self.ocr_engine.image_to_text(img)
+                ocr_text = ocr_text or ""
+                ocr_conf_f = float(ocr_conf or 0.0)
+
+                emb_m = embedded_metrics[page_idx]
+                emb_s = embedded_scores[page_idx]
+                ocr_m = _metrics(ocr_text)
+                ocr_s = _score(ocr_m)
+
+                choose_ocr = bool(ocr_s > (emb_s + score_margin))
+                if choose_ocr:
+                    out_texts[page_idx] = ocr_text
+                    out_confs[page_idx] = ocr_conf_f
+                    chosen = "ocr"
+                    why = "embedded_weak_or_worse"
+                else:
+                    chosen = "embedded"
+                    why = "ocr_not_better"
+
+                selections.append(
+                    {
+                        "page": page_idx + 1,
+                        "chosen": chosen,
+                        "why": why,
+                        "emb_score": emb_s,
+                        "ocr_score": ocr_s,
+                        "ocr_conf": ocr_conf_f,
+                    }
+                )
+                self.log.info(
+                    f"pdf_text_source page={page_idx+1}/{n_pages} chosen={chosen} why={why} "
+                    f"emb_score={emb_s:.3f} emb_nonws={int(emb_m.get('non_ws') or 0)} emb_bad={int(emb_m.get('bad') or 0)} "
+                    f"ocr_score={ocr_s:.3f} ocr_nonws={int(ocr_m.get('non_ws') or 0)} ocr_bad={int(ocr_m.get('bad') or 0)} "
+                    f"ocr_conf={ocr_conf_f:.3f}"
+                )
+
+        text_debug["method"] = text_method
+        text_debug["selections"] = selections
+        return out_texts, out_confs, n_pages, text_method, text_debug
 
     def _merge_extracted_by_key(self, per_page: List[Tuple[int, Any, str, float]]) -> List[Dict[str, Any]]:
         """
@@ -156,6 +375,11 @@ class Processor:
             status_cb("OCR: zpracovávám obrázek…")
         with Image.open(path) as img:
             t, c = self.ocr_engine.image_to_text(img)
+        try:
+            q = summarize_text_quality([compute_text_quality(t or "")])
+            self.log.info("Image text source: ocr conf=%.3f quality=%s", float(c or 0.0), q)
+        except Exception:
+            pass
         return t, c, 1
 
     def _guess_supplier_ico_from_text(self, text: str) -> Optional[str]:
@@ -242,7 +466,7 @@ class Processor:
             out_base = Path(self.cfg["paths"]["output_dir"])
             dup_dir = out_base / self.cfg["paths"].get("duplicate_dir_name", "DUPLICITY")
             moved = safe_move(path, dup_dir, path.name)
-            return {"status": "DUPLICATE", "sha256": sha, "moved_to": str(moved)}
+            return {"status": "DUPLICATE", "sha256": sha, "moved_to": str(moved), "text_method": None, "text_debug": {}}
 
         if status_cb:
             status_cb("Začínám vytěžování…")
@@ -251,9 +475,11 @@ class Processor:
         min_conf = float(self.cfg["ocr"].get("min_confidence", 0.65))
         pages = 1
         per_doc_chunks: List[Dict[str, Any]] = []
+        text_method: Optional[str] = None
+        text_debug: Dict[str, Any] = {}
 
         if path.suffix.lower() == ".pdf":
-            page_texts, page_confs, pages = self._ocr_pdf_pages(path, status_cb=status_cb)
+            page_texts, page_confs, pages, text_method, text_debug = self._ocr_pdf_pages(path, status_cb=status_cb)
             if not page_texts:
                 # no text => hard quarantine later
                 page_texts = []
@@ -267,6 +493,11 @@ class Processor:
             per_doc_chunks = self._merge_extracted_by_key(per_page)
         else:
             ocr_text, ocr_conf, pages = self._ocr_image(path, status_cb=status_cb)
+            text_method = "image_ocr"
+            try:
+                text_debug = {"ocr": summarize_text_quality([compute_text_quality(ocr_text or "")]), "ocr_conf": float(ocr_conf or 0.0)}
+            except Exception:
+                text_debug = {"ocr_conf": float(ocr_conf or 0.0)}
             ex = extract_from_text(ocr_text or "")
             per_doc_chunks = [{
                 "page_from": 1,
@@ -431,6 +662,8 @@ class Processor:
                             "file_id": file_record.id,
                             "moved_to": str(moved),
                             "duplicate_of_document_id": int(dup[0]),
+                            "text_method": text_method,
+                            "text_debug": text_debug,
                         }
                 except Exception as e:
                     reasons.append(f"dup-check selhal: {e}")
@@ -481,4 +714,6 @@ class Processor:
             "file_id": file_record.id,
             "document_ids": created_doc_ids,
             "moved_to": str(moved),
+            "text_method": text_method,
+            "text_debug": text_debug,
         }
