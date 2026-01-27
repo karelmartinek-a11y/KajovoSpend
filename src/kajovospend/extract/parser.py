@@ -278,6 +278,8 @@ def extract_from_text(text: str) -> Extracted:
         re.compile(r"Doklad\s+č[ií]slo\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),
         # Variabilní symbol (u faktur často funguje jako stabilní identifikátor)
         re.compile(r"\bVS\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),
+        re.compile(r"\bV\.?\s*S\.?\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),   # V.S.
+        re.compile(r"\bV\s+S\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),         # V S
     ], t)
 
     bank_account = _find_first([
@@ -289,8 +291,8 @@ def extract_from_text(text: str) -> Extracted:
         bank_account = bank_account.replace(" ", "")
 
     date_s = _find_first([
-        re.compile(r"Datum\s+vystaven[ií]\s*[: ]\s*([0-9]{1,2}[./][0-9]{1,2}[./][0-9]{2,4})", re.IGNORECASE),
-        re.compile(r"Datum\s*[: ]\s*([0-9]{1,2}[./][0-9]{1,2}[./][0-9]{2,4})", re.IGNORECASE),
+        re.compile(r"Datum\s+vystaven[ií]\s*[: ]\s*([0-9]{1,2}\.\s*[0-9]{1,2}\.\s*[0-9]{2,4})", re.IGNORECASE),
+        re.compile(r"Datum\s*[: ]\s*([0-9]{1,2}\.\s*[0-9]{1,2}\.\s*[0-9]{2,4})", re.IGNORECASE),
         # Účtenky často mají datum bez labelu, někdy i s časem (čas ignorujeme)
         re.compile(r"\b([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{2,4})\b"),
         re.compile(r"\b([0-9]{2}/[0-9]{2}/[0-9]{4})\b"),
@@ -311,6 +313,9 @@ def extract_from_text(text: str) -> Extracted:
         re.compile(r"\bCelkem\s*[: ]\s*([0-9\s]+[.,][0-9]{2})\b", re.IGNORECASE),
         re.compile(r"Celkem\s+v\s+\w+.*?([0-9\s]+[.,][0-9]{2})", re.IGNORECASE),
         re.compile(r"\bPRODEJ\s*([0-9\s]+[.,][0-9]{2})\b", re.IGNORECASE),
+        # tolerantnější "Celkem k úhradě" bez dvojtečky, s textem mezi
+        re.compile(r"\bCelkem\s+k\s+úhradě\b[^\d\-]{0,40}([0-9][0-9\s]*[.,][0-9]{2})\b", re.IGNORECASE),
+        re.compile(r"\bCelkem\s+k\s+uhradě\b[^\d\-]{0,40}([0-9][0-9\s]*[.,][0-9]{2})\b", re.IGNORECASE),
     ], t)
 
     total = None
@@ -408,11 +413,31 @@ def extract_from_text(text: str) -> Extracted:
         qty_price_pat = re.compile(
             r"^(?P<qty>\d+(?:[.,]\d+)?)\s*[xX]\s*(?P<unit>\d+[\s\d]*[.,]\d{2}).*?(?P<total>\d+[\s\d]*[.,]\d{2})\s*(?P<vat_letter>[A-Z])?\s*$"
         )
+        # single-line: "Název 1 x 12,90 12,90" / "Název 2ks 19,00 38,00"
+        single_line_re = re.compile(
+            r"^\s*(?P<name>[^0-9]{3,}?)\s+"
+            r"(?P<qty>\d+(?:[.,]\d+)?)\s*(?:x|ks|KUS|PCS|pc|×)?\s*"
+            r"(?P<unit>\d[\d\s]*[.,]\d{2})\s+"
+            r"(?P<total>\d[\d\s]*[.,]\d{2})\s*$",
+            re.IGNORECASE,
+        )
         pending_name: Optional[str] = None
         for ln in t.splitlines():
             ln = ln.strip()
             if not ln:
                 continue
+
+            msl = single_line_re.match(ln)
+            if msl:
+                name = (msl.group("name") or "").strip(" -:").strip()
+                qty = _parse_number(msl.group("qty"))
+                unit = _parse_number(msl.group("unit"))
+                line_total = _parse_number(msl.group("total"))
+                if name and qty and unit and line_total:
+                    items.append({"name": name, "quantity": qty, "unit_price": unit, "vat_rate": 0.0, "line_total": line_total})
+                    pending_name = None
+                    continue
+
             if pending_name is None:
                 if rec_pat.match(ln) and not re.search(r"(Celkem|DPH|Datum|Děkujeme|Kč|EUR|IBAN)", ln, re.IGNORECASE):
                     pending_name = ln

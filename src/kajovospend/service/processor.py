@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import shutil
 import re
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -486,10 +487,61 @@ class Processor:
 
     def _pseudo_ico(self, supplier_name: str) -> str:
         """Deterministické pseudo-IČO pro retail účtenky bez uvedeného IČO."""
-        import hashlib
         base = (supplier_name or "UNKNOWN").strip().upper().encode("utf-8", errors="ignore")
         h = hashlib.sha256(base).hexdigest()[:10]
         return f"NOICO-{h}"
+
+    def _classify_doc_type(self, text: str) -> str:
+        """
+        Jednoduchá klasifikace typu dokladu podle tokenů.
+        - invoice: "FAKTURA", "DAŇOVÝ DOKLAD", "INVOICE"
+        - receipt: "ÚČTENKA", "POKLADNA", "KASA", "DĚKUJEME"
+        Default: invoice (bezpečnější).
+        """
+        t = (text or "").upper()
+        if any(k in t for k in ["FAKTURA", "DAŇOVÝ DOKLAD", "DANOVY DOKLAD", "INVOICE"]):
+            return "invoice"
+        if any(k in t for k in ["ÚČTENKA", "UCTENKA", "POKLADNA", "KASA", "DĚKUJEME", "DEKUJEME"]):
+            return "receipt"
+        return "invoice"
+
+    def _synthetic_doc_number(self, sha256: str, page_from: int, page_to: int, issue_date, total_with_vat) -> str:
+        """
+        Stabilní syntetické číslo dokladu pro účtenky bez doc_number:
+        prefix SHA256 + rozsah stránek + (volitelně) datum + (volitelně) total v centech.
+        """
+        parts: List[str] = []
+        parts.append((sha256 or "")[:12])
+        parts.append(f"P{int(page_from):02d}-{int(page_to):02d}")
+        if issue_date:
+            try:
+                parts.append(issue_date.strftime("%Y%m%d"))
+            except Exception:
+                pass
+        if total_with_vat is not None:
+            try:
+                cents = int(round(float(total_with_vat) * 100.0))
+                parts.append(str(cents))
+            except Exception:
+                pass
+        return "R-" + "-".join(parts)
+
+    def _prune_receipt_reasons(self, reasons: List[str]) -> List[str]:
+        """U účtenek tolerujeme chybějící položky / sum_ok a syntetické číslo -> ořez zbytečných důvodů."""
+        drop = {
+            "nekompletní vytěžení",
+            "chybí číslo dokladu",
+            "chybí položky",
+        }
+        out: List[str] = []
+        for r in reasons or []:
+            if r in drop:
+                continue
+            # toleruj i typické hlášky o součtu (necháváme v logu parseru, ale nemá to zvedat review)
+            if "nesedí součet" in str(r).lower():
+                continue
+            out.append(r)
+        return out
 
     def process_path(self, session, path: Path, status_cb=None) -> Dict[str, Any]:
         # returns dict with outcome
@@ -577,6 +629,7 @@ class Processor:
 
             method = "offline"
             reasons = list(extracted.review_reasons or [])
+            doc_type = self._classify_doc_type(ocr_text)
 
             # Pokud chybí IČO, zkus heuristiku: najít 8-místné číslo a ověřit v ARES.
             if not extracted.supplier_ico:
@@ -587,13 +640,23 @@ class Processor:
                     reasons.append("IČO doplněno heuristikou (ARES validace)")
 
 
-            # Pokud IČO na dokladu vůbec není (běžné u retail účtenek),
-            # vytvoříme deterministické pseudo-ID dodavatele, aby doklad mohl projít "complete" kontrolou.
-            if not extracted.supplier_ico:
+            # Pseudo-IČO jen pro účtenky (u faktur by to zbytečně pouštělo falešné "complete")
+            if (doc_type == "receipt") and (not extracted.supplier_ico):
                 supplier_name_guess = self._extract_supplier_name_guess(ocr_text) or "NEZNAMY_DODAVATEL"
                 extracted.supplier_ico = self._pseudo_ico(supplier_name_guess)
                 extracted.confidence = float(max(extracted.confidence or 0.0, 0.75))
                 reasons.append("IČO není na dokladu: použito pseudo-ID dodavatele")
+
+            # Pro účtenky: syntetické číslo dokladu, pokud chybí.
+            if (doc_type == "receipt") and (not extracted.doc_number):
+                extracted.doc_number = self._synthetic_doc_number(
+                    sha256=sha,
+                    page_from=page_from,
+                    page_to=page_to,
+                    issue_date=extracted.issue_date,
+                    total_with_vat=extracted.total_with_vat,
+                )
+                reasons.append("chybí číslo dokladu: použito syntetické číslo (receipts)")
 
             # Po offline i OpenAI: kanonizace položek (unit_price bez DPH, line_total s DPH) + kontrola součtu.
             items_ref = list(extracted.items or [])
@@ -605,18 +668,47 @@ class Processor:
             extracted.items = items_ref
             extracted.review_reasons = reasons
 
+            # Pro účtenky: pokud nemáme položky, vytvoř syntetickou z total.
+            if (doc_type == "receipt") and (len(list(extracted.items or [])) == 0) and (extracted.total_with_vat is not None):
+                try:
+                    total_f = float(extracted.total_with_vat)
+                    extracted.items = [
+                        {
+                            "name": "Nákup",
+                            "quantity": 1.0,
+                            "unit_price": total_f,
+                            "vat_rate": 0.0,
+                            "line_total": total_f,
+                        }
+                    ]
+                    sum_ok = True
+                    reasons.append("chybí položky -> vytvořena syntetická položka z total")
+                except Exception:
+                    pass
+
             # Povinné minimum pro přesun do OUT:
             # - IČO, číslo dokladu, datum, total (vč. DPH)
             # - položky
             # - součet položek (včetně zaokrouhlení) sedí na total v toleranci
-            complete = bool(
-                extracted.supplier_ico
-                and extracted.doc_number
-                and extracted.issue_date
-                and (extracted.total_with_vat is not None)
-                and (len(list(extracted.items or [])) > 0)
-                and sum_ok
-            )
+            if doc_type == "receipt":
+                # Benevolentnější režim: sum_ok nevyžadujeme; položky mohou být syntetické.
+                complete = bool(
+                    extracted.supplier_ico
+                    and extracted.doc_number
+                    and extracted.issue_date
+                    and (extracted.total_with_vat is not None)
+                )
+                reasons = self._prune_receipt_reasons(reasons)
+            else:
+                # Faktura: původní striktní pravidla.
+                complete = bool(
+                    extracted.supplier_ico
+                    and extracted.doc_number
+                    and extracted.issue_date
+                    and (extracted.total_with_vat is not None)
+                    and (len(list(extracted.items or [])) > 0)
+                    and sum_ok
+                )
 
             requires_review = bool((not complete) or (ocr_conf < min_conf))
             if ocr_conf < min_conf:

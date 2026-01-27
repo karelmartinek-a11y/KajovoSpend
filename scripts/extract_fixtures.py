@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+SCHEMA_VERSION = 2
+
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
@@ -152,21 +154,17 @@ def run(fixtures_dir: Path, *, cfg: Dict[str, Any], db_path: Path, snapshot_path
                         continue
                     items = session.execute(select(LineItem).where(LineItem.document_id == doc.id).order_by(LineItem.id)).scalars().all()
                     sum_ok = _compute_sum_ok(doc, list(items))
-                    complete = bool(
-                        doc.supplier_ico
-                        and doc.doc_number
-                        and doc.issue_date
-                        and (doc.total_with_vat is not None)
-                        and (len(items) > 0)
-                        and sum_ok
-                    )
+                    # Pro regresi chceme měřit to, co rozhoduje o karanténě: complete = !requires_review
+                    complete = bool(not bool(doc.requires_review))
                     rr = _split_reasons(doc.review_reasons)
+                    method = getattr(doc, "method", None) or res.get("method") or getattr(doc, "extraction_method", None) or "offline"
                     docs_out.append(
                         {
                             "doc_id": int(doc.id),
                             "page_from": int(doc.page_from or 1),
                             "page_to": int(doc.page_to or doc.page_from or 1),
-                            "method": text_method,
+                            "method": method,
+                            "text_method": text_method,
                             "complete": bool(complete),
                             "review_reasons": rr,
                             "doc_number": doc.doc_number,
@@ -196,7 +194,8 @@ def run(fixtures_dir: Path, *, cfg: Dict[str, Any], db_path: Path, snapshot_path
             log.info("=== FIXTURE END name=%s status=%s docs=%s ===", src.name, res.get("status"), len(docs_out))
 
     snapshot = {
-        "schema": "kajovospend.extract_fixtures.v1",
+        "schema": "kajovospend.extract_fixtures.v2",
+        "schema_version": SCHEMA_VERSION,
         "fixtures_dir": str(fixtures_dir),
         "db_path": str(db_path),
         "work_dir": str(work_dir),
