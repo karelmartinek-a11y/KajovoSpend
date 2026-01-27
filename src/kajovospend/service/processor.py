@@ -4,6 +4,8 @@ import datetime as dt
 import shutil
 import re
 import hashlib
+import time
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -23,7 +25,7 @@ from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 from kajovospend.ocr.rapidocr_engine import RapidOcrEngine
 from kajovospend.utils.hashing import sha256_file
-from kajovospend.utils.text_quality import compute_text_quality, summarize_text_quality
+from kajovospend.utils.text_quality import compute_text_quality, summarize_text_quality, text_quality_score
 
 
 def safe_move(src: Path, dst_dir: Path, target_name: str) -> Path:
@@ -39,7 +41,25 @@ def safe_move(src: Path, dst_dir: Path, target_name: str) -> Path:
                 dst = cand
                 break
             i += 1
-    shutil.move(str(src), str(dst))
+    for attempt in range(3):
+        try:
+            shutil.move(str(src), str(dst))
+            return dst
+        except PermissionError:
+            if attempt < 2:
+                time.sleep(0.05)
+                continue
+            # fallback: copy + best-effort delete
+            shutil.copy2(str(src), str(dst))
+            for _ in range(20):
+                try:
+                    Path(src).unlink()
+                    break
+                except PermissionError:
+                    time.sleep(0.1)
+                except Exception:
+                    break
+            return dst
     return dst
 
 
@@ -66,49 +86,13 @@ class Processor:
         text_debug: Dict[str, Any] = {"path": str(pdf_path)}
 
         ocr_cfg = (self.cfg.get("ocr") or {}) if isinstance(self.cfg, dict) else {}
-        quality_threshold = float(ocr_cfg.get("page_text_quality_threshold", 0.45))
-        min_non_ws = int(ocr_cfg.get("page_text_min_non_ws", 25))
+        # Spec defaults: trigger OCR if score < 0.35 or len(text) < min_len (default 0 => len check disabled)
+        quality_threshold = float(ocr_cfg.get("page_text_quality_threshold", 0.35))
+        min_len = int(ocr_cfg.get("page_text_min_len", 0))
         score_margin = float(ocr_cfg.get("page_text_score_margin", 0.02))
 
-        def _metrics(txt: str) -> Dict[str, Any]:
-            t = txt or ""
-            total = len(t)
-            non_ws = len(re.sub(r"\s+", "", t))
-            letters = len(re.findall(r"[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽáčďéěíňóřšťúůýž]", t))
-            digits = len(re.findall(r"\d", t))
-            bad = t.count("\ufffd") + len(re.findall(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", t))
-            lines_nonempty = len([ln for ln in t.splitlines() if ln.strip()])
-            return {
-                "total": total,
-                "non_ws": non_ws,
-                "letters": letters,
-                "digits": digits,
-                "bad": bad,
-                "lines_nonempty": lines_nonempty,
-            }
-
-        def _score(m: Dict[str, Any]) -> float:
-            total = int(m.get("total") or 0)
-            non_ws = int(m.get("non_ws") or 0)
-            if non_ws <= 0 or total <= 0:
-                return 0.0
-            letters = int(m.get("letters") or 0)
-            digits = int(m.get("digits") or 0)
-            bad = int(m.get("bad") or 0)
-            density = min(1.0, non_ws / 400.0)
-            alnum_ratio = (letters + digits) / max(1, non_ws)
-            bad_ratio = bad / max(1, total)
-            s = 0.55 * density + 0.55 * alnum_ratio - 0.80 * bad_ratio
-            if s < 0.0:
-                return 0.0
-            if s > 1.0:
-                return 1.0
-            return float(s)
-
-        def _conf_from_embedded(m: Dict[str, Any], s: float) -> float:
-            non_ws = int(m.get("non_ws") or 0)
-            if non_ws <= 0:
-                return 0.0
+        def _conf_from_score(s: float) -> float:
+            # keep deterministic bounded mapping; never claim 0.95 for garbage text
             conf = 0.50 + 0.45 * float(s)
             if conf < 0.0:
                 conf = 0.0
@@ -119,17 +103,20 @@ class Processor:
         if status_cb:
             status_cb("PDF: čtu text (hybrid embedded/OCR)…")
 
+        reader = None
+        reader_stream = None
         try:
-            reader = PdfReader(str(pdf_path))
+            reader_stream = BytesIO(pdf_path.read_bytes())
+            reader = PdfReader(reader_stream)
             embedded_texts: List[str] = []
-            embedded_metrics: List[Dict[str, Any]] = []
             embedded_scores: List[float] = []
+            embedded_token_groups: List[int] = []
             for page in reader.pages:
                 t = page.extract_text() or ""
                 embedded_texts.append(t)
-                m = _metrics(t)
-                embedded_metrics.append(m)
-                embedded_scores.append(_score(m))
+                s, met = text_quality_score(t)
+                embedded_scores.append(float(s))
+                embedded_token_groups.append(int(met.get("token_groups") or 0))
             n_pages = len(embedded_texts)
             text_debug["embedded_scores"] = embedded_scores
             if n_pages > 0:
@@ -146,10 +133,21 @@ class Processor:
         except Exception as e:
             self.log.warning(f"PDF embedded extract_text() failed; fallback to OCR. Error: {e}")
             embedded_texts = []
-            embedded_metrics = []
             embedded_scores = []
+            embedded_token_groups = []
             n_pages = 0
             text_debug["embedded_error"] = str(e)
+        finally:
+            try:
+                if reader is not None and hasattr(reader, "close"):
+                    reader.close()
+            except Exception:
+                pass
+            try:
+                if reader_stream is not None:
+                    reader_stream.close()
+            except Exception:
+                pass
 
         if n_pages <= 0 and self.ocr_engine is None:
             text_debug["reason"] = "no_embedded_no_ocr"
@@ -159,38 +157,50 @@ class Processor:
         needs_ocr: List[bool] = []
         if n_pages > 0:
             for i in range(n_pages):
-                m = embedded_metrics[i]
                 s = embedded_scores[i]
-                weak = (int(m.get("non_ws") or 0) < min_non_ws) or (float(s) < quality_threshold)
+                t = embedded_texts[i] or ""
+                weak = (len(t) < min_len) or (float(s) < quality_threshold)
                 needs_ocr.append(bool(weak))
 
         out_texts: List[str] = list(embedded_texts) if embedded_texts else []
         out_confs: List[float] = []
+        page_audit: List[Dict[str, Any]] = []
         if embedded_texts:
             for i in range(n_pages):
-                out_confs.append(_conf_from_embedded(embedded_metrics[i], embedded_scores[i]))
+                out_confs.append(_conf_from_score(embedded_scores[i]))
 
         if embedded_texts:
             weak_cnt = sum(1 for x in needs_ocr if x)
             text_debug["weak_pages"] = weak_cnt
             self.log.info(
                 f"pdf_text_source: pages={n_pages} weak_pages={weak_cnt} "
-                f"threshold={quality_threshold:.2f} min_non_ws={min_non_ws}"
+                f"threshold={quality_threshold:.2f} min_len={min_len}"
             )
 
         if self.ocr_engine is None:
             if embedded_texts:
                 text_debug["method"] = "embedded"
                 for i in range(n_pages):
-                    m = embedded_metrics[i]
                     s = embedded_scores[i]
                     chosen = "embedded"
                     why = "weak_embedded_but_no_ocr" if needs_ocr[i] else "embedded_ok"
+                    page_audit.append({
+                        "page_no": i + 1,
+                        "chosen_mode": "embedded",
+                        "chosen_score": float(s),
+                        "embedded_score": float(s),
+                        "ocr_score": 0.0,
+                        "embedded_len": len(embedded_texts[i] or ""),
+                        "ocr_len": 0,
+                        "ocr_conf": 0.0,
+                        "token_groups": int(embedded_token_groups[i] or 0),
+                    })
                     self.log.info(
                         f"pdf_text_source page={i+1}/{n_pages} chosen={chosen} why={why} "
-                        f"emb_score={s:.3f} emb_nonws={int(m.get('non_ws') or 0)} emb_bad={int(m.get('bad') or 0)}"
+                        f"emb_score={s:.3f} emb_len={len(embedded_texts[i] or '')} token_groups={int(embedded_token_groups[i] or 0)}"
                     )
                 text_method = "embedded"
+                text_debug["page_audit"] = page_audit
                 return out_texts, out_confs, n_pages, text_method, text_debug
             text_debug["reason"] = "no_ocr_engine"
             text_debug["method"] = "none"
@@ -213,12 +223,22 @@ class Processor:
                 t, c = self.ocr_engine.image_to_text(img)
                 texts2.append(t or "")
                 confs2.append(float(c or 0.0))
-                m = _metrics(t or "")
-                s = _score(m)
+                s, met = text_quality_score(t or "")
+                tg = int(met.get("token_groups") or 0)
+                page_audit.append({
+                    "page_no": idx_page,
+                    "chosen_mode": "ocr",
+                    "chosen_score": float(s),
+                    "embedded_score": 0.0,
+                    "ocr_score": float(s),
+                    "embedded_len": 0,
+                    "ocr_len": len(t or ""),
+                    "ocr_conf": float(c or 0.0),
+                    "token_groups": tg,
+                })
                 self.log.info(
                     f"pdf_text_source page={idx_page}/{len(images)} chosen=ocr why=no_embedded "
-                    f"ocr_score={s:.3f} ocr_nonws={int(m.get('non_ws') or 0)} ocr_bad={int(m.get('bad') or 0)} "
-                    f"ocr_conf={float(c or 0.0):.3f}"
+                    f"ocr_score={float(s):.3f} ocr_len={len(t or '')} token_groups={tg} ocr_conf={float(c or 0.0):.3f}"
                 )
             text_debug["method"] = text_method
             text_debug["ocr_conf_avg"] = float(sum(confs2) / len(confs2)) if confs2 else 0.0
@@ -226,6 +246,7 @@ class Processor:
             text_debug["ocr_conf_max"] = float(max(confs2)) if confs2 else 0.0
             ocr_summary = summarize_text_quality([compute_text_quality(t) for t in texts2])
             text_debug["ocr"] = ocr_summary
+            text_debug["page_audit"] = page_audit
             self.log.info(
                 "PDF text source: ocr reason=embedded_empty dpi=%s pages=%s conf_avg=%.3f conf_min=%.3f conf_max=%.3f quality=%s",
                 dpi,
@@ -242,12 +263,23 @@ class Processor:
             text_method = "embedded"
             text_debug["method"] = text_method
             for i in range(n_pages):
-                m = embedded_metrics[i]
                 s = embedded_scores[i]
+                page_audit.append({
+                    "page_no": i + 1,
+                    "chosen_mode": "embedded",
+                    "chosen_score": float(s),
+                    "embedded_score": float(s),
+                    "ocr_score": 0.0,
+                    "embedded_len": len(embedded_texts[i] or ""),
+                    "ocr_len": 0,
+                    "ocr_conf": 0.0,
+                    "token_groups": int(embedded_token_groups[i] or 0),
+                })
                 self.log.info(
                     f"pdf_text_source page={i+1}/{n_pages} chosen=embedded why=embedded_ok "
-                    f"emb_score={s:.3f} emb_nonws={int(m.get('non_ws') or 0)} emb_bad={int(m.get('bad') or 0)}"
+                    f"emb_score={s:.3f} emb_len={len(embedded_texts[i] or '')} token_groups={int(embedded_token_groups[i] or 0)}"
                 )
+            text_debug["page_audit"] = page_audit
             return out_texts, out_confs, n_pages, text_method, text_debug
 
         segments: List[Tuple[int, int]] = []
@@ -277,10 +309,11 @@ class Processor:
                 ocr_text = ocr_text or ""
                 ocr_conf_f = float(ocr_conf or 0.0)
 
-                emb_m = embedded_metrics[page_idx]
                 emb_s = embedded_scores[page_idx]
-                ocr_m = _metrics(ocr_text)
-                ocr_s = _score(ocr_m)
+                ocr_s, ocr_met = text_quality_score(ocr_text)
+                ocr_s = float(ocr_s)
+                emb_tg = int(embedded_token_groups[page_idx] or 0)
+                ocr_tg = int(ocr_met.get("token_groups") or 0)
 
                 choose_ocr = bool(ocr_s > (emb_s + score_margin))
                 if choose_ocr:
@@ -288,9 +321,13 @@ class Processor:
                     out_confs[page_idx] = ocr_conf_f
                     chosen = "ocr"
                     why = "embedded_weak_or_worse"
+                    chosen_score = ocr_s
+                    chosen_tg = ocr_tg
                 else:
                     chosen = "embedded"
                     why = "ocr_not_better"
+                    chosen_score = float(emb_s)
+                    chosen_tg = emb_tg
 
                 selections.append(
                     {
@@ -302,15 +339,39 @@ class Processor:
                         "ocr_conf": ocr_conf_f,
                     }
                 )
+                page_audit.append({
+                    "page_no": page_idx + 1,
+                    "chosen_mode": chosen,
+                    "chosen_score": float(chosen_score),
+                    "embedded_score": float(emb_s),
+                    "ocr_score": float(ocr_s),
+                    "embedded_len": len(embedded_texts[page_idx] or ""),
+                    "ocr_len": len(ocr_text or ""),
+                    "ocr_conf": float(ocr_conf_f),
+                    "token_groups": int(chosen_tg),
+                })
                 self.log.info(
                     f"pdf_text_source page={page_idx+1}/{n_pages} chosen={chosen} why={why} "
-                    f"emb_score={emb_s:.3f} emb_nonws={int(emb_m.get('non_ws') or 0)} emb_bad={int(emb_m.get('bad') or 0)} "
-                    f"ocr_score={ocr_s:.3f} ocr_nonws={int(ocr_m.get('non_ws') or 0)} ocr_bad={int(ocr_m.get('bad') or 0)} "
+                    f"emb_score={float(emb_s):.3f} emb_len={len(embedded_texts[page_idx] or '')} emb_tg={emb_tg} "
+                    f"ocr_score={float(ocr_s):.3f} ocr_len={len(ocr_text or '')} ocr_tg={ocr_tg} "
                     f"ocr_conf={ocr_conf_f:.3f}"
                 )
 
         text_debug["method"] = text_method
         text_debug["selections"] = selections
+        text_debug["page_audit"] = page_audit
+        # pokud jsme nakonec vybrali pouze embedded text, označ metodu jako embedded (žádné OCR použité)
+        if page_audit and not any(str(pa.get("chosen_mode")) == "ocr" for pa in page_audit):
+            text_method = "embedded"
+            text_debug["method"] = text_method
+        # deterministic aggregation: weighted by chosen text length
+        denom = 0.0
+        num = 0.0
+        for pa in page_audit:
+            clen = max(1, int(pa.get("embedded_len") if pa.get("chosen_mode") == "embedded" else pa.get("ocr_len") or 0))
+            denom += float(clen)
+            num += float(pa.get("chosen_score") or 0.0) * float(clen)
+        text_debug["document_text_quality"] = float(num / denom) if denom > 0 else 0.0
         return out_texts, out_confs, n_pages, text_method, text_debug
 
     def _merge_extracted_by_key(self, per_page: List[Tuple[int, Any, str, float]]) -> List[Dict[str, Any]]:
@@ -567,6 +628,7 @@ class Processor:
         per_doc_chunks: List[Dict[str, Any]] = []
         text_method: Optional[str] = None
         text_debug: Dict[str, Any] = {}
+        page_audit_map: Dict[int, Dict[str, Any]] = {}
 
         if path.suffix.lower() == ".pdf":
             page_texts, page_confs, pages, text_method, text_debug = self._ocr_pdf_pages(path, status_cb=status_cb)
@@ -575,6 +637,9 @@ class Processor:
                 page_texts = []
                 page_confs = []
                 pages = 0
+            # per-page audit returned by _ocr_pdf_pages
+            for rec in (text_debug.get("page_audit") or []):
+                page_audit_map[int(rec.get("page_no") or 0)] = dict(rec)
             per_page: List[Tuple[int, Any, str, float]] = []
             for i, t in enumerate(page_texts, start=1):
                 ex = extract_from_text(t or "")
@@ -817,6 +882,39 @@ class Processor:
                 page_from=page_from,
                 page_to=page_to,
             )
+            # Persist aggregated document text quality (if available)
+            try:
+                # default to file-level aggregation if present; still useful
+                dtq = float(text_debug.get("document_text_quality") or 0.0)
+                setattr(doc, "document_text_quality", dtq)
+                session.add(doc)
+            except Exception:
+                pass
+
+            # Persist per-page audit rows for the pages belonging to this document chunk
+            try:
+                from kajovospend.db.models import DocumentPageAudit
+                for pno in range(int(page_from), int(page_to) + 1):
+                    rec = page_audit_map.get(int(pno))
+                    if not rec:
+                        continue
+                    session.add(DocumentPageAudit(
+                        document_id=int(doc.id),
+                        file_id=int(file_record.id),
+                        page_no=int(pno),
+                        chosen_mode=str(rec.get("chosen_mode") or "embedded"),
+                        chosen_score=float(rec.get("chosen_score") or 0.0),
+                        embedded_score=float(rec.get("embedded_score") or 0.0),
+                        ocr_score=float(rec.get("ocr_score") or 0.0),
+                        embedded_len=int(rec.get("embedded_len") or 0),
+                        ocr_len=int(rec.get("ocr_len") or 0),
+                        ocr_conf=float(rec.get("ocr_conf") or 0.0),
+                        token_groups=int(rec.get("token_groups") or 0),
+                    ))
+                session.flush()
+            except Exception as e:
+                # never fail extraction due to audit insert
+                self.log.warning(f"page_audit insert failed: {e}")
             rebuild_fts_for_document(session, doc.id, extracted.full_text if hasattr(extracted, "full_text") else ocr_text)
             created_doc_ids.append(int(doc.id))
             any_requires_review = bool(any_requires_review or requires_review)

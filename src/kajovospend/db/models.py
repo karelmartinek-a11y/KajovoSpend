@@ -68,6 +68,10 @@ class Document(Base):
 
     extraction_confidence: Mapped[float] = mapped_column(Float, default=0.0)
     extraction_method: Mapped[str] = mapped_column(String(16), default="offline")  # offline/openai/manual
+    # aggregated quality of chosen per-page text (0..1)
+    document_text_quality: Mapped[float] = mapped_column(Float, default=0.0)
+    openai_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    openai_raw_response: Mapped[str | None] = mapped_column(Text, nullable=True)
     requires_review: Mapped[bool] = mapped_column(Boolean, default=False)
     review_reasons: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -81,6 +85,31 @@ class Document(Base):
     __table_args__ = (
         Index("ix_documents_issue_date", "issue_date"),
         Index("ix_documents_file_page", "file_id", "page_from", "page_to"),
+    )
+
+
+class DocumentPageAudit(Base):
+    __tablename__ = "document_page_audit"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    file_id: Mapped[int] = mapped_column(ForeignKey("files.id", ondelete="CASCADE"), index=True)
+
+    page_no: Mapped[int] = mapped_column(Integer)  # 1-based
+    chosen_mode: Mapped[str] = mapped_column(String(16))  # embedded/ocr
+
+    chosen_score: Mapped[float] = mapped_column(Float, default=0.0)
+    embedded_score: Mapped[float] = mapped_column(Float, default=0.0)
+    ocr_score: Mapped[float] = mapped_column(Float, default=0.0)
+
+    embedded_len: Mapped[int] = mapped_column(Integer, default=0)
+    ocr_len: Mapped[int] = mapped_column(Integer, default=0)
+    ocr_conf: Mapped[float] = mapped_column(Float, default=0.0)
+    token_groups: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (
+        UniqueConstraint("document_id", "page_no", name="uq_page_audit_doc_page"),
+        Index("ix_page_audit_file_page", "file_id", "page_no"),
     )
 
 

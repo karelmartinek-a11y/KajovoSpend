@@ -1,6 +1,136 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import re
+import string
+import unicodedata
+from typing import Any, Dict, List, Tuple
+
+_AMOUNT_RE = re.compile(r"\b\d{1,6}(?:[ \u00a0]\d{3})*(?:[.,]\d{2})\b")
+
+_TOKEN_GROUPS = [
+    # G1 currency / money
+    ("kč", "kc", "czk", "eur", "usd"),
+    # G2 totals
+    ("celkem", "k úhradě", "součet", "total"),
+    # G3 identification
+    ("ičo", "ico", "dič", "dic"),
+    # G4 dates-ish
+    ("datum", "vystaven", "splatn", "duzp", "zdanit"),
+    # G5 doc type
+    ("faktura", "daňový doklad", "uctenka", "účtenka", "pokladna", "prodej", "paragon"),
+]
+
+
+def _clamp(x: float) -> float:
+    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else float(x)
+
+
+def text_quality_score(text: str) -> Tuple[float, Dict[str, Any]]:
+    """
+    Deterministické skóre kvality textu (0..1) dle pevné specifikace.
+    Vrací: (score, metrics) kde metrics obsahuje i dílčí složky pro audit/debug.
+    """
+    t = (text or "").replace("\xa0", " ").strip()
+    N = len(t)
+    if N == 0:
+        return 0.0, {
+            "N": 0,
+            "token_groups": 0,
+            "amount_matches": 0,
+            "lines": 0,
+            "score": 0.0,
+        }
+
+    non_ws = 0
+    alnum = 0
+    punct = 0
+    ctrl = 0
+    repl = t.count("\ufffd")
+
+    for ch in t:
+        if ch.isspace():
+            continue
+        non_ws += 1
+        if ch.isalnum():
+            alnum += 1
+        cat = unicodedata.category(ch)
+        if cat.startswith("P") or ch in string.punctuation:
+            punct += 1
+        if cat.startswith("C") and ch not in "\t\n\r":
+            ctrl += 1
+
+    ctrl += repl
+    whitespace = N - non_ws
+
+    alnum_ratio = alnum / max(1, non_ws)
+    whitespace_ratio = whitespace / max(1, N)
+    punct_ratio = punct / max(1, non_ws)
+
+    lower = t.lower()
+    token_groups = 0
+    for grp in _TOKEN_GROUPS:
+        if any(tok in lower for tok in grp):
+            token_groups += 1
+
+    amount_matches = len(_AMOUNT_RE.findall(t))
+    lines = sum(1 for ln in t.splitlines() if ln.strip())
+
+    # max non-space run
+    max_run = 0
+    for m in re.finditer(r"\S+", t):
+        ml = len(m.group(0))
+        if ml > max_run:
+            max_run = ml
+
+    # components 0..1 (pevné transformace)
+    c_len = _clamp(N / 600.0)
+    c_alnum = _clamp((alnum_ratio - 0.45) / 0.35)
+    c_space = _clamp(1.0 - (abs(whitespace_ratio - 0.22) / 0.22))
+    c_tokens = _clamp(token_groups / 3.0)
+    c_amounts = _clamp(amount_matches / 3.0)
+    c_lines = _clamp(lines / 10.0)
+
+    # penalties 0..1 (pevné transformace)
+    p_ctrl = _clamp(ctrl / 3.0)
+    p_run = _clamp((max_run - 40.0) / 60.0)
+    p_punct = _clamp((punct_ratio - 0.25) / 0.25)
+
+    positives = (
+        0.15 * c_len
+        + 0.25 * c_alnum
+        + 0.15 * c_space
+        + 0.20 * c_tokens
+        + 0.10 * c_amounts
+        + 0.15 * c_lines
+    )
+    penalties = (0.20 * p_ctrl) + (0.20 * p_run) + (0.15 * p_punct)
+    score = _clamp(positives - penalties)
+
+    metrics: Dict[str, Any] = {
+        "N": N,
+        "non_ws": non_ws,
+        "alnum_ratio": alnum_ratio,
+        "whitespace_ratio": whitespace_ratio,
+        "punct_ratio": punct_ratio,
+        "token_groups": token_groups,
+        "amount_matches": amount_matches,
+        "lines": lines,
+        "ctrl": ctrl,
+        "max_run": max_run,
+        "c_len": c_len,
+        "c_alnum": c_alnum,
+        "c_space": c_space,
+        "c_tokens": c_tokens,
+        "c_amounts": c_amounts,
+        "c_lines": c_lines,
+        "p_ctrl": p_ctrl,
+        "p_run": p_run,
+        "p_punct": p_punct,
+        "positives": positives,
+        "penalties": penalties,
+        "score": score,
+    }
+    return score, metrics
 
 
 def compute_text_quality(text: str) -> Dict[str, Any]:

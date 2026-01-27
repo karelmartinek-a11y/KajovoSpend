@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Set
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -95,6 +96,13 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
             con.execute(text("ALTER TABLE documents ADD COLUMN page_from INTEGER DEFAULT 1"))
         if "page_to" not in doc_col_names:
             con.execute(text("ALTER TABLE documents ADD COLUMN page_to INTEGER"))
+        # documents: audit columns for text quality + OpenAI fallback (even if OpenAI not wired yet)
+        if "document_text_quality" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN document_text_quality REAL DEFAULT 0.0"))
+        if "openai_model" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN openai_model TEXT"))
+        if "openai_raw_response" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN openai_raw_response TEXT"))
 
         # items: UI expects unit_price/ean/item_code
         cols_items = con.execute(text("PRAGMA table_info('items')")).fetchall()
@@ -139,6 +147,9 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_file_page ON documents(file_id, page_from, page_to)"))
         # Kompozitní index pro business duplicity (IČO + číslo dokladu + datum).
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_dup_key ON documents(supplier_ico, doc_number, issue_date)"))
+        # Audit / debug
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_text_quality ON documents(document_text_quality)"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_extraction_method ON documents(extraction_method)"))
 
         # Line items foreign key / filtering
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_document_id ON items(document_id)"))
