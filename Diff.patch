@@ -1,0 +1,407 @@
+diff --git a/src/kajovospend/extract/parser.py b/src/kajovospend/extract/parser.py
+index 2c0f3b1..9a7c6f4 100644
+--- a/src/kajovospend/extract/parser.py
++++ b/src/kajovospend/extract/parser.py
+@@ -1,16 +1,17 @@
+ from __future__ import annotations
+ 
+ import re
+ import datetime as dt
+ from dataclasses import dataclass
+-from typing import List, Optional, Tuple, Dict, Iterable
++from typing import List, Optional, Tuple, Dict, Iterable
+ 
+ from dateutil import parser as dtparser
+ 
+ 
+ @dataclass
+ class Extracted:
+@@ -36,6 +37,21 @@ _ROUNDING_RE = re.compile(
+     re.IGNORECASE,
+ )
+ 
++_NUM_ONLY_RE = re.compile(r"^-?\d+(?:[.,]\d+)?$")
++_AMOUNT_ONLY_RE = re.compile(r"^-?\d[\d\s]*[.,]\d{2}\s*(?:Kč|CZK|EUR)?$", re.IGNORECASE)
++_KC_AMOUNT_ONLY_RE = re.compile(r"^-?\d[\d\s]*[.,]\d{2}\s*Kč$", re.IGNORECASE)
++_VAT_ONLY_RE = re.compile(r"^(\d{1,2})\s*%?$", re.IGNORECASE)
++_STOP_ITEMS_RE = re.compile(
++    r"^(Sleva|Základ|Zaklad|Cena celkem|Celkem|Rekapitulace|Součet|Soucet|Zbývá|Zbyva|Celkem k úhradě|CELKEM)\b",
++    re.IGNORECASE,
++)
++
+ 
+ def _extract_rounding_items(text: str) -> List[dict]:
+     items: List[dict] = []
+@@ -173,6 +189,16 @@ def _norm_amount(s: str) -> float:
+     s = s.replace(",", ".")
+     return float(s)
+ 
++def _parse_number(s: str) -> Optional[float]:
++    """
++    Tolerantní parser pro čísla (množství i částky bez měny).
++    Vrací None při nevalidním vstupu.
++    """
++    try:
++        return float(str(s).replace("\xa0", " ").strip().replace(" ", "").replace(",", "."))
++    except Exception:
++        return None
++
+ def _f(v, default: float = 0.0) -> float:
+     if v is None:
+         return float(default)
+@@ -240,6 +266,196 @@ def _normalize_ico_soft(ico: str | None) -> str | None:
+     return digits.zfill(8)
+ 
+ 
++def _looks_amount_line(ln: str) -> bool:
++    return bool(_AMOUNT_ONLY_RE.fullmatch((ln or "").strip().replace("\xa0", " ")))
++
++
++def _looks_kc_amount_line(ln: str) -> bool:
++    return bool(_KC_AMOUNT_ONLY_RE.fullmatch((ln or "").strip().replace("\xa0", " ")))
++
++
++def _parse_vat_only(ln: str) -> Optional[float]:
++    m = _VAT_ONLY_RE.fullmatch((ln or "").strip())
++    if not m:
++        return None
++    try:
++        v = float(m.group(1))
++    except Exception:
++        return None
++    if v > 30:
++        return None
++    return v
++
++
++def _strip_currency(s: str) -> str:
++    return re.sub(r"\s*(Kč|CZK|EUR)\s*$", "", (s or "").strip(), flags=re.IGNORECASE)
++
++
++def _parse_items_rohlik_vertical(text: str) -> List[dict]:
++    """
++    Rohlík / Velká Pecka PDF: pypdf často vrací tabulku po buňkách (každý sloupec na vlastním řádku):
++      <název...>
++      <qty>
++      <ks>
++      <cena/jed vč DPH> Kč
++      <vat> %
++      <bez DPH> Kč
++      <DPH> Kč
++      <vč DPH> Kč
++    """
++    raw = text or ""
++    u = raw.upper()
++    if ("VELKÁ PECKA" not in u) and ("ROHLIK" not in u) and ("ROHLÍK" not in u):
++        return []
++
++    lines = [ln.strip().replace("\xa0", " ") for ln in raw.splitlines()]
++    # najdi hlavičku tabulky
++    start = None
++    for i, ln in enumerate(lines):
++        if ln.lower() in {"položka", "polozka"}:
++            start = i
++            break
++    if start is None:
++        return []
++
++    i = start + 1
++    headers = {
++        "množství", "mnozstvi",
++        "cena za jed. vč. dph", "cena za jed. vc. dph",
++        "sazba dph",
++        "cena bez dph",
++        "dph",
++        "cena vč. dph", "cena vc. dph",
++    }
++    while i < len(lines) and ((lines[i].lower() in headers) or (lines[i] == "")):
++        i += 1
++
++    items: List[dict] = []
++    unit_re = re.compile(r"^(ks|kus|kg|g|l|ml)$", re.IGNORECASE)
++
++    while i < len(lines):
++        if _STOP_ITEMS_RE.search(lines[i]):
++            break
++
++        # 1) název (může být multi-line)
++        name_parts: List[str] = []
++        while i < len(lines) and lines[i] and (not _NUM_ONLY_RE.fullmatch(lines[i])) and (not _STOP_ITEMS_RE.search(lines[i])):
++            name_parts.append(lines[i])
++            i += 1
++
++        if i >= len(lines) or _STOP_ITEMS_RE.search(lines[i]):
++            break
++        if not _NUM_ONLY_RE.fullmatch(lines[i]):
++            i += 1
++            continue
++
++        # 2) qty
++        qty = _parse_number(lines[i])
++        i += 1
++        if qty is None:
++            continue
++
++        # 3) jednotka (volitelně)
++        if i < len(lines) and unit_re.match(lines[i] or ""):
++            i += 1
++
++        # 4) cena/jed vč DPH (musí být s Kč, aby to nebyla rekapitulace)
++        if i >= len(lines) or (not _looks_kc_amount_line(lines[i])):
++            break
++        unit_price = _norm_amount(_strip_currency(lines[i]))
++        i += 1
++
++        # 5) DPH %
++        if i >= len(lines):
++            break
++        vat = _parse_vat_only(lines[i])
++        if vat is None:
++            break
++        i += 1
++
++        # 6-8) bez DPH, DPH, vč DPH (vše s Kč)
++        if i + 2 >= len(lines):
++            break
++        if (not _looks_kc_amount_line(lines[i])) or (not _looks_kc_amount_line(lines[i + 1])) or (not _looks_kc_amount_line(lines[i + 2])):
++            break
++        # net = _norm_amount(_strip_currency(lines[i]))  # aktuálně nepotřebujeme
++        # vat_amt = _norm_amount(_strip_currency(lines[i + 1]))
++        gross = _norm_amount(_strip_currency(lines[i + 2]))
++        i += 3
++
++        name = " ".join(name_parts).strip()
++        if not name:
++            continue
++        items.append(
++            {
++                "name": name,
++                "quantity": float(qty),
++                "unit_price": float(unit_price),
++                "vat_rate": float(vat),
++                "line_total": float(gross),
++            }
++        )
++
++    return items
++
++
++def _parse_items_money_s3_vertical(text: str) -> List[dict]:
++    """
++    Money S3 faktura: pypdf často vrací sloupce jako samostatné řádky:
++      <qty> (např. 1 000,00)
++      <název...>
++      <vat> (např. 21)
++      <cena za m.j.>
++      <celkem> (gross)
++      <základ> (net)
++      <DPH>
++      %   (nebo prázdné/separátor)
++    """
++    raw = text or ""
++    lines = [ln.strip().replace("\xa0", " ") for ln in raw.splitlines()]
++    if not any(("Označení dodávky" in ln) or ("Označení dodavky" in ln) for ln in lines):
++        return []
++
++    # locate header
++    start = None
++    for idx, ln in enumerate(lines):
++        lnl = ln.lower()
++        if lnl.startswith("označení dodávky") or lnl.startswith("oznaceni dodavky"):
++            start = idx
++            break
++    if start is None:
++        return []
++
++    qty_re = re.compile(r"^-?\d[\d\s]*[.,]\d{2}$")
++    i = start + 1
++    while i < len(lines) and (not qty_re.fullmatch(lines[i] or "")):
++        i += 1
++
++    items: List[dict] = []
++    while i < len(lines):
++        if _STOP_ITEMS_RE.search(lines[i]):
++            break
++        if not qty_re.fullmatch(lines[i] or ""):
++            i += 1
++            continue
++
++        qty = _norm_amount(lines[i])
++        i += 1
++        if i >= len(lines):
++            break
++
++        # name until vat-only line
++        name_parts: List[str] = []
++        while i < len(lines) and lines[i] and (_parse_vat_only(lines[i]) is None) and (not qty_re.fullmatch(lines[i] or "")) and (not _STOP_ITEMS_RE.search(lines[i])):
++            name_parts.append(lines[i])
++            i += 1
++        if i >= len(lines) or _STOP_ITEMS_RE.search(lines[i]):
++            break
++
++        vat = _parse_vat_only(lines[i]) or 0.0
++        i += 1
++        if i >= len(lines) or (not _looks_amount_line(lines[i])):
++            continue
++        unit_price = _norm_amount(_strip_currency(lines[i]))
++        i += 1
++        if i >= len(lines) or (not _looks_amount_line(lines[i])):
++            continue
++        gross = _norm_amount(_strip_currency(lines[i]))
++        i += 1
++
++        # skip net + vat amount if present
++        if i < len(lines) and _looks_amount_line(lines[i]):
++            i += 1
++        if i < len(lines) and _looks_amount_line(lines[i]):
++            i += 1
++        # skip percent markers/separators
++        if i < len(lines) and (lines[i].strip() == "%" or lines[i].strip().endswith("%")):
++            i += 1
++
++        name = " ".join(name_parts).strip() or "Položka"
++        items.append(
++            {
++                "name": name,
++                "quantity": float(qty),
++                "unit_price": float(unit_price),
++                "vat_rate": float(vat),
++                "line_total": float(gross),
++            }
++        )
++    return items
++
++
++def _parse_items_ks_line_based(text: str) -> List[dict]:
++    """
++    Řádky typu SIKO: "... 1,000 KS  1 590,00  1 314,05 21  1 590,00  1 590,00"
++    Fallback parser: vezme qty+KS, poslední částku jako line_total, první částku po KS jako unit_price,
++    a první rozumnou sazbu DPH (0/10/12/15/21) v okolí.
++    """
++    items: List[dict] = []
++    if not text:
++        return items
++    vat_candidates = {"0", "10", "12", "15", "21"}
++    for ln in (text or "").splitlines():
++        s = (ln or "").replace("\xa0", " ").strip()
++        if not s or len(s) < 10:
++            continue
++        if "KS" not in s.upper():
++            continue
++        if re.search(r"\b(CELKEM|DPH|ZÁKLAD|ZAKLAD|SOUBĚH|SOUCET|SOUČET)\b", s, re.IGNORECASE):
++            continue
++
++        # qty + KS
++        m = re.search(r"(?P<qty>-?\d+(?:[.,]\d+)?)\s*KS\b", s, re.IGNORECASE)
++        if not m:
++            continue
++        qty = _parse_number(m.group("qty")) or 0.0
++        if qty == 0.0:
++            continue
++
++        # find all amounts in line
++        amts = [a for a in _amount_re.findall(s)]
++        if len(amts) < 2:
++            continue
++        try:
++            line_total = _norm_amount(amts[-1])
++            unit_price = _norm_amount(amts[0])
++        except Exception:
++            continue
++
++        # VAT: first small integer token in line
++        vat = 0.0
++        toks = re.findall(r"\b\d{1,2}\b", s)
++        for t in toks:
++            if t in vat_candidates:
++                vat = float(t)
++                break
++
++        # name: everything before qty match
++        name = s[: m.start()].strip(" -:\t")
++        if not name or len(re.findall(r"[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]", name)) < 2:
++            continue
++        items.append({"name": name, "quantity": float(qty), "unit_price": float(unit_price), "vat_rate": float(vat), "line_total": float(line_total)})
++    return items
++
++
+ def _parse_date(s: str) -> Optional[dt.date]:
+     s = s.strip()
+     try:
+@@ -269,6 +485,7 @@ def extract_from_text(text: str) -> Extracted:
+     doc_no = _find_first([
+         re.compile(r"Č[ií]slo\s+faktury\s*[: ]\s*([\w-]+)", re.IGNORECASE),
++        re.compile(r"Faktura\s+č[ií]slo\s*[: ]\s*([\w-]+)", re.IGNORECASE),
+         re.compile(r"Faktura\s*#\s*(\d+)", re.IGNORECASE),
+         re.compile(r"Č[ií]slo\s+objednávky\s*[: ]\s*([\w-]+)", re.IGNORECASE),
+         # Daňové doklady často mají číslo hned pod nadpisem bez "č."
+@@ -328,48 +545,40 @@ def extract_from_text(text: str) -> Extracted:
+             total = None
+ 
+     items: List[dict] = []
+-    # attempt parse tabular items (e.g., Rohlik PDF text)
+-    # pattern: <name> <qty> ks <unit> Kč <vat%> % <...> <line_total> Kč
+-    line_pat = re.compile(
+-        r"^(?P<name>.+?)\s+(?P<qty>-?\d+(?:[.,]\d+)?)\s*(?:ks|x)?\s+(?P<unit>\d+[\s\d]*[.,]\d{2})\s*Kč\s+(?P<vat>\d{1,2})\s*%\s+.*?\s+(?P<total>-?\d+[\s\d]*[.,]\d{2})\s*Kč\s*$",
+-        re.IGNORECASE
+-    )
+-
+-    for ln in t.splitlines():
+-        ln = ln.strip()
+-        if not ln or len(ln) < 6:
+-            continue
+-        m = line_pat.match(ln)
+-        if m:
+-            try:
+-                name = m.group("name").strip()
+-                qty = _safe_float(m.group("qty"))
+-                unit_price = _norm_amount(m.group("unit"))
+-                vat = float(m.group("vat"))
+-                line_total = _norm_amount(m.group("total"))
+-                items.append({"name": name, "quantity": qty, "unit_price": unit_price, "vat_rate": vat, "line_total": line_total})
+-            except Exception:
+-                continue
++    # 1) Special-case: vertical table extraction (pypdf) for Rohlik / Money S3
++    #    This fixes the common failure mode where each table cell is on its own line.
++    items = _parse_items_rohlik_vertical(t)
++    if not items:
++        items = _parse_items_money_s3_vertical(t)
++
++    # 2) Fallback: SIKO-like "KS" single-line items
++    if not items:
++        items = _parse_items_ks_line_based(t)
+ 
+      
+     # Wolt faktury: řádky typu "<název> 12% 2 214,90 429,80" (bez "Kč" u čísel)
+     if not items:
+         wolt_pat = re.compile(
+             r"^(?P<name>.+?)\s+(?P<vat>\d{1,2})%\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>\d+[\s\d]*[.,]\d{2})\s+(?P<total>-?\d+[\s\d]*[.,]\d{2})\s*$"
+         )
+         for ln in t.splitlines():
+             ln = ln.strip()
+             if not ln or len(ln) < 6:
+                 continue
+             m = wolt_pat.match(ln)
+             if not m:
+                 continue
+             try:
+                 name = m.group("name").strip()
+                 qty = _safe_float(m.group("qty"))
+                 unit_price = _norm_amount(m.group("unit"))
+                 vat = float(m.group("vat"))
+                 line_total = _norm_amount(m.group("total"))
+                 items.append({"name": name, "quantity": qty, "unit_price": unit_price, "vat_rate": vat, "line_total": line_total})
+             except Exception:
+                 continue
+ 
+     # Better-hotel / Mevris: popis položky je často na 1-2 řádcích a ceny jsou ve formátu "... 294.14 CZK 1 294.14 CZK 355.91 CZK"
+     if not items:
+@@ -433,7 +642,7 @@ def extract_from_text(text: str) -> Extracted:
+                 name = (msl.group("name") or "").strip(" -:").strip()
+                 qty = _parse_number(msl.group("qty"))
+                 unit = _parse_number(msl.group("unit"))
+                 line_total = _parse_number(msl.group("total"))
+                 if name and qty and unit and line_total:
+                     items.append({"name": name, "quantity": qty, "unit_price": unit, "vat_rate": 0.0, "line_total": line_total})
+                     pending_name = None
+                     continue
