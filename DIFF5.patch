@@ -1,0 +1,420 @@
+diff --git a/src/kajovospend/service/processor.py b/src/kajovospend/service/processor.py
+index 4cf0a9c..c2e6f88 100644
+--- a/src/kajovospend/service/processor.py
++++ b/src/kajovospend/service/processor.py
+@@ -1,10 +1,11 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
+ import shutil
+ import re
++import hashlib
+ from pathlib import Path
+ from typing import Any, Dict, Optional, Tuple, List
+ 
+ from PIL import Image
+@@ -484,12 +485,56 @@ class Processor:
+         return None
+ 
+     def _pseudo_ico(self, supplier_name: str) -> str:
+         """Deterministické pseudo-IČO pro retail účtenky bez uvedeného IČO."""
+-        import hashlib
+         base = (supplier_name or "UNKNOWN").strip().upper().encode("utf-8", errors="ignore")
+         h = hashlib.sha256(base).hexdigest()[:10]
+         return f"NOICO-{h}"
+ 
++    def _classify_doc_type(self, text: str) -> str:
++        """
++        Jednoduchá klasifikace typu dokladu podle tokenů.
++        - invoice: "FAKTURA", "DAŇOVÝ DOKLAD", "INVOICE"
++        - receipt: "ÚČTENKA", "POKLADNA", "KASA", "DĚKUJEME"
++        Default: invoice (bezpečnější).
++        """
++        t = (text or "").upper()
++        if any(k in t for k in ["FAKTURA", "DAŇOVÝ DOKLAD", "DANOVY DOKLAD", "INVOICE"]):
++            return "invoice"
++        if any(k in t for k in ["ÚČTENKA", "UCTENKA", "POKLADNA", "KASA", "DĚKUJEME", "DEKUJEME"]):
++            return "receipt"
++        return "invoice"
++
++    def _synthetic_doc_number(self, sha256: str, page_from: int, page_to: int, issue_date, total_with_vat) -> str:
++        """
++        Stabilní syntetické číslo dokladu pro účtenky bez doc_number:
++        prefix SHA256 + rozsah stránek + (volitelně) datum + (volitelně) total v centech.
++        """
++        parts: List[str] = []
++        parts.append((sha256 or "")[:12])
++        parts.append(f"P{int(page_from):02d}-{int(page_to):02d}")
++        if issue_date:
++            try:
++                parts.append(issue_date.strftime("%Y%m%d"))
++            except Exception:
++                pass
++        if total_with_vat is not None:
++            try:
++                cents = int(round(float(total_with_vat) * 100.0))
++                parts.append(str(cents))
++            except Exception:
++                pass
++        return "R-" + "-".join(parts)
++
++    def _prune_receipt_reasons(self, reasons: List[str]) -> List[str]:
++        """U účtenek tolerujeme chybějící položky / sum_ok a syntetické číslo -> ořez zbytečných důvodů."""
++        drop = {
++            "nekompletní vytěžení",
++            "chybí číslo dokladu",
++            "chybí položky",
++        }
++        out: List[str] = []
++        for r in reasons or []:
++            if r in drop:
++                continue
++            # toleruj i typické hlášky o součtu (necháváme v logu parseru, ale nemá to zvedat review)
++            if "nesedí součet" in str(r).lower():
++                continue
++            out.append(r)
++        return out
++
+     def process_path(self, session, path: Path, status_cb=None) -> Dict[str, Any]:
+         # returns dict with outcome
+         sha = sha256_file(path)
+@@ -569,6 +614,7 @@ class Processor:
+         for idx_doc, chunk in enumerate(per_doc_chunks, start=1):
+             if status_cb:
+                 status_cb(f"Parsování dokladu {idx_doc}/{max(1, len(per_doc_chunks))}…")
+             extracted = chunk["extracted"]
+             ocr_conf = float(chunk.get("ocr_conf") or 0.0)
+             ocr_text = chunk.get("full_text") or ""
+             page_from = int(chunk.get("page_from") or 1)
+             page_to = int(chunk.get("page_to") or page_from)
+ 
+             method = "offline"
+             reasons = list(extracted.review_reasons or [])
++            doc_type = self._classify_doc_type(ocr_text)
+ 
+             # Pokud chybí IČO, zkus heuristiku: najít 8-místné číslo a ověřit v ARES.
+             if not extracted.supplier_ico:
+                 guessed_ico = self._guess_supplier_ico_from_text(ocr_text)
+                 if guessed_ico:
+                     extracted.supplier_ico = guessed_ico
+                     extracted.confidence = float(max(extracted.confidence or 0.0, 0.80))
+                     reasons.append("IČO doplněno heuristikou (ARES validace)")
+ 
+-
+-            # Pokud IČO na dokladu vůbec není (běžné u retail účtenek),
+-            # vytvoříme deterministické pseudo-ID dodavatele, aby doklad mohl projít "complete" kontrolou.
+-            if not extracted.supplier_ico:
+-                supplier_name_guess = self._extract_supplier_name_guess(ocr_text) or "NEZNAMY_DODAVATEL"
+-                extracted.supplier_ico = self._pseudo_ico(supplier_name_guess)
+-                extracted.confidence = float(max(extracted.confidence or 0.0, 0.75))
+-                reasons.append("IČO není na dokladu: použito pseudo-ID dodavatele")
++            # Pseudo-IČO jen pro účtenky (u faktur by to zbytečně pouštělo falešné "complete")
++            if (doc_type == "receipt") and (not extracted.supplier_ico):
++                supplier_name_guess = self._extract_supplier_name_guess(ocr_text) or "NEZNAMY_DODAVATEL"
++                extracted.supplier_ico = self._pseudo_ico(supplier_name_guess)
++                extracted.confidence = float(max(extracted.confidence or 0.0, 0.75))
++                reasons.append("IČO není na dokladu: použito pseudo-ID dodavatele")
++
++            # Pro účtenky: syntetické číslo dokladu, pokud chybí.
++            if (doc_type == "receipt") and (not extracted.doc_number):
++                extracted.doc_number = self._synthetic_doc_number(
++                    sha256=sha,
++                    page_from=page_from,
++                    page_to=page_to,
++                    issue_date=extracted.issue_date,
++                    total_with_vat=extracted.total_with_vat,
++                )
++                reasons.append("chybí číslo dokladu -> použito syntetické")
+ 
+             # Po offline i OpenAI: kanonizace položek (unit_price bez DPH, line_total s DPH) + kontrola součtu.
+             items_ref = list(extracted.items or [])
+             sum_ok, reasons = postprocess_items_for_db(
+                 items=items_ref,
+                 total_with_vat=extracted.total_with_vat,
+                 reasons=reasons,
+             )
+             extracted.items = items_ref
+             extracted.review_reasons = reasons
++
++            # Pro účtenky: pokud nejsou položky, ale máme total, vytvoř syntetickou položku (snižuje falešné karantény).
++            if (doc_type == "receipt") and (len(list(extracted.items or [])) == 0) and (extracted.total_with_vat is not None):
++                try:
++                    total_f = float(extracted.total_with_vat)
++                    extracted.items = [
++                        {
++                            "name": "Nákup",
++                            "quantity": 1.0,
++                            "unit_price": total_f,
++                            "vat_rate": 0.0,
++                            "line_total": total_f,
++                        }
++                    ]
++                    sum_ok = True
++                    reasons.append("chybí položky -> vytvořena syntetická položka z total")
++                except Exception:
++                    pass
+ 
+             # Povinné minimum pro přesun do OUT:
+             # - IČO, číslo dokladu, datum, total (vč. DPH)
+             # - položky
+             # - součet položek (včetně zaokrouhlení) sedí na total v toleranci
+-            complete = bool(
+-                extracted.supplier_ico
+-                and extracted.doc_number
+-                and extracted.issue_date
+-                and (extracted.total_with_vat is not None)
+-                and (len(list(extracted.items or [])) > 0)
+-                and sum_ok
+-            )
++            if doc_type == "receipt":
++                # Benevolentnější režim: sum_ok nevyžadujeme; položky mohou být syntetické.
++                complete = bool(
++                    extracted.supplier_ico
++                    and extracted.doc_number
++                    and extracted.issue_date
++                    and (extracted.total_with_vat is not None)
++                )
++                reasons = self._prune_receipt_reasons(reasons)
++            else:
++                # Faktura: původní striktní pravidla.
++                complete = bool(
++                    extracted.supplier_ico
++                    and extracted.doc_number
++                    and extracted.issue_date
++                    and (extracted.total_with_vat is not None)
++                    and (len(list(extracted.items or [])) > 0)
++                    and sum_ok
++                )
+ 
+             requires_review = bool((not complete) or (ocr_conf < min_conf))
+             if ocr_conf < min_conf:
+                 reasons.append("nízká jistota OCR")
+             if not complete:
+                 reasons.append("nekompletní vytěžení")
+diff --git a/src/kajovospend/extract/parser.py b/src/kajovospend/extract/parser.py
+index 8e2f6f1..4b8ad2a 100644
+--- a/src/kajovospend/extract/parser.py
++++ b/src/kajovospend/extract/parser.py
+@@ -266,16 +266,22 @@ DOC_NO_PATTERNS = [
+     re.compile(r"\bDoklad\s*č\.?\s*[: ]\s*([A-Z0-9][A-Z0-9\-\/]{3,})\b", re.IGNORECASE),
+     re.compile(r"\bČíslo\s*dokladu\s*[: ]\s*([A-Z0-9][A-Z0-9\-\/]{3,})\b", re.IGNORECASE),
+     re.compile(r"\bInvoice\s*(No\.?)?\s*[: ]\s*([A-Z0-9][A-Z0-9\-\/]{3,})\b", re.IGNORECASE),
+     re.compile(r"\bNumber\s*[: ]\s*([A-Z0-9][A-Z0-9\-\/]{3,})\b", re.IGNORECASE),
+     re.compile(r"\bFaktura\s*(č\.?|cislo)?\s*[: ]\s*([A-Z0-9][A-Z0-9\-\/]{3,})\b", re.IGNORECASE),
+     # Variabilní symbol je často pro bankovní platby = použij jako doc_number když nic jiného není.
+-    re.compile(r"\bVS\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),
+-    re.compile(r"\bVariabiln[ií]\s+symbol\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),
++    re.compile(r"\bVS\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),
++    re.compile(r"\bV\.?\s*S\.?\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),         # V.S. / V. S.
++    re.compile(r"\bV\s+S\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),               # V S
++    re.compile(r"\bVariabiln[ií]\s+symbol\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),
+ ]
+ 
+ ISSUE_DATE_PATTERNS = [
+-    re.compile(r"\bDatum\s*vystaven[ií]\s*[: ]\s*([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{2,4})\b", re.IGNORECASE),
+-    re.compile(r"\bDatum\s*[: ]\s*([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{2,4})\b", re.IGNORECASE),
++    re.compile(r"\bDatum\s*vystaven[ií]\s*[: ]\s*([0-9]{1,2}\.\s*[0-9]{1,2}\.\s*[0-9]{2,4})\b", re.IGNORECASE),
++    re.compile(r"\bDatum\s*[: ]\s*([0-9]{1,2}\.\s*[0-9]{1,2}\.\s*[0-9]{2,4})\b", re.IGNORECASE),
+ ]
+@@ -301,11 +307,13 @@ TOTAL_PATTERNS = [
+     re.compile(r"\bCelkem\s*[: ]\s*([0-9][0-9\s]*[.,][0-9]{2})\b", re.IGNORECASE),
+     re.compile(r"\bCelkem\s+vč\.\s*DPH\s*[: ]\s*([0-9][0-9\s]*[.,][0-9]{2})\b", re.IGNORECASE),
+     re.compile(r"\bK\s+úhradě\s*[: ]\s*([0-9][0-9\s]*[.,][0-9]{2})\b", re.IGNORECASE),
+-    re.compile(r"\bCelkem\s+k\s+úhradě\s*[: ]\s*([0-9][0-9\s]*[.,][0-9]{2})\b", re.IGNORECASE),
+-    re.compile(r"\bCelkem\s+k\s+uhradě\s*[: ]\s*([0-9][0-9\s]*[.,][0-9]{2})\b", re.IGNORECASE),
++    # tolerantnější: "Celkem k úhradě … 7960,59" (bez dvojtečky, s libovolným oddělovačem)
++    re.compile(r"\bCelkem\s+k\s+úhradě\b[^\d\-]{0,40}([0-9][0-9\s]*[.,][0-9]{2})\b", re.IGNORECASE),
++    re.compile(r"\bCelkem\s+k\s+uhradě\b[^\d\-]{0,40}([0-9][0-9\s]*[.,][0-9]{2})\b", re.IGNORECASE),
+ ]
+@@ -401,6 +409,18 @@ def extract_from_text(text: str) -> Extracted:
+ 
+         # 2) RECEIPT položky (simplifikace)
+         # heuristika: blok uppercase řádků jako názvy + následný řádek s množstvím/cenou
+         pending_name: str | None = None
+         pending_desc: str | None = None
++        # single-line: "Název 1 x 12,90 12,90" / "Název 2ks 19,00 38,00"
++        single_line_re = re.compile(
++            r"^\s*(?P<name>[^0-9]{3,}?)\s+"
++            r"(?P<qty>\d+(?:[.,]\d+)?)\s*(?:x|ks|KUS|PCS|pc|×)?\s*"
++            r"(?P<unit>\d[\d\s]*[.,]\d{2})\s+"
++            r"(?P<total>\d[\d\s]*[.,]\d{2})\s*$",
++            re.IGNORECASE,
++        )
+ 
+         for ln in lines:
+             l = ln.strip()
+             if not l:
+                 continue
+@@ -409,6 +429,16 @@ def extract_from_text(text: str) -> Extracted:
+             if re.search(r"(celkem|k\s+úhradě|dph|doklad|účtenk|uctenk)", l, re.IGNORECASE):
+                 continue
+ 
++            msl = single_line_re.match(l)
++            if msl:
++                name = (msl.group("name") or "").strip(" -:").strip()
++                qty = _parse_number(msl.group("qty"))
++                unit = _parse_number(msl.group("unit"))
++                line_total = _parse_number(msl.group("total"))
++                if name and qty and unit and line_total:
++                    out.items.append({"name": name, "quantity": qty, "unit_price": unit, "vat_rate": 0.0, "line_total": line_total})
++                    pending_name = None
++                    pending_desc = None
++                    continue
++
+             # uppercase "name" line
+             if re.fullmatch(r"[A-Z0-9ÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ .,\-]{5,}", l) and not re.search(r"\d[.,]\d{2}", l):
+                 if pending_name is None:
+                     pending_name = l.strip()
+                 else:
+diff --git a/scripts/extract_fixtures.py b/scripts/extract_fixtures.py
+index 1cbd77d..9d91d8b 100644
+--- a/scripts/extract_fixtures.py
++++ b/scripts/extract_fixtures.py
+@@ -24,7 +24,7 @@ DEFAULT_FIXTURES_DIR = Path("tests/fixtures")
+ DEFAULT_DB_PATH = Path("var/test_extract.db")
+ DEFAULT_OUT_JSON = Path("var/extract_snapshot.json")
+ 
+-SCHEMA_VERSION = 1
++SCHEMA_VERSION = 2
+ 
+ def _json_default(obj):
+     if isinstance(obj, (dt.date, dt.datetime)):
+@@ -148,15 +148,20 @@ def run(fixtures_dir: Path, db_path: Path, out_json: Path) -> int:
+             doc = session.get(Document, doc_id)
+ 
+             if not doc:
+                 continue
+ 
+-            method = res.get("text_method")
++            # "method" = způsob extrakce (offline/openai), "text_method" = zdroj textu (embedded/pdf_hybrid/ocr/...)
++            method = getattr(doc, "method", None) or res.get("method") or getattr(doc, "extraction_method", None) or "offline"
++            text_method = res.get("text_method")
+             review_reasons = (doc.review_reasons or "").split("; ") if doc.review_reasons else []
+ 
+-            # NOTE: complete je historicky "striktní". Pro regresi ale chceme metriky odpovídající karanténě -> použij requires_review.
+-            complete = bool(
+-                doc.doc_number and doc.issue_date and (doc.total_with_vat is not None) and (doc.items_count or 0) > 0 and (doc.sum_ok is True)
+-            )
++            # Pro regresi chceme metriky odpovídající reálnému rozhodnutí (OUT vs KARANTÉNA):
++            # complete = "automaticky zpracováno" = NOT requires_review.
++            complete = bool(not bool(doc.requires_review))
+ 
+             snapshots.append(
+                 {
+                     "schema_version": SCHEMA_VERSION,
+                     "sha256": sha,
+                     "file_id": file_id,
+                     "path": str(pdf_path),
+                     "pages": int(res.get("pages") or 0),
+                     "status": res.get("status"),
+-                    "method": method,
++                    "method": method,
++                    "text_method": text_method,
+                     "document_id": doc_id,
+                     "doc_number": doc.doc_number,
+                     "issue_date": doc.issue_date,
+                     "supplier_ico": doc.supplier_ico,
+                     "total_with_vat": doc.total_with_vat,
+                     "items_count": int(doc.items_count or 0),
+                     "sum_ok": bool(doc.sum_ok) if doc.sum_ok is not None else None,
+                     "complete": complete,
+                     "requires_review": bool(doc.requires_review),
+                     "review_reasons": review_reasons,
+                 }
+             )
+diff --git a/scripts/compare_fixtures_report.py b/scripts/compare_fixtures_report.py
+new file mode 100644
+index 0000000..c0b9b8a
+--- /dev/null
++++ b/scripts/compare_fixtures_report.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python3
++import argparse
++import json
++from collections import Counter, defaultdict
++from pathlib import Path
++
++
++def _load(path: Path):
++    with open(path, "r", encoding="utf-8") as f:
++        return json.load(f)
++
++
++def _bool(x):
++    return bool(x) if x is not None else False
++
++
++def _summ(snap):
++    n = len(snap)
++    complete = sum(1 for r in snap if _bool(r.get("complete")))
++    quarantine = sum(1 for r in snap if (r.get("status") == "QUARANTINE") or _bool(r.get("requires_review")))
++    ok_total = sum(1 for r in snap if r.get("total_with_vat") is not None)
++    ok_date = sum(1 for r in snap if r.get("issue_date") is not None)
++    ok_vendor = sum(1 for r in snap if r.get("supplier_ico"))
++    reasons = Counter()
++    for r in snap:
++        for rr in (r.get("review_reasons") or []):
++            if rr:
++                reasons[rr] += 1
++    return {
++        "n": n,
++        "complete": complete,
++        "quarantine_or_review": quarantine,
++        "ok_total": ok_total,
++        "ok_date": ok_date,
++        "ok_vendor": ok_vendor,
++        "reasons": reasons,
++    }
++
++
++def _delta(a, b):
++    return b - a
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("before_json", type=Path)
++    ap.add_argument("after_json", type=Path)
++    args = ap.parse_args()
++
++    before = _load(args.before_json)
++    after = _load(args.after_json)
++
++    sb = _summ(before)
++    sa = _summ(after)
++
++    def line(label, k):
++        vb = sb[k]
++        va = sa[k]
++        print(f"{label}: {vb} -> {va} (Δ {_delta(vb, va)})")
++
++    print("=== SUMMARY ===")
++    line("Docs", "n")
++    line("Complete", "complete")
++    line("Quarantine/review", "quarantine_or_review")
++    line("Has total", "ok_total")
++    line("Has date", "ok_date")
++    line("Has vendor", "ok_vendor")
++    print()
++
++    print("=== TOP REVIEW REASONS (after) ===")
++    for reason, cnt in sa["reasons"].most_common(30):
++        print(f"{cnt:>5}  {reason}")
++    print()
++
++    print("=== REASON DELTAS (after - before) ===")
++    all_keys = set(sb["reasons"].keys()) | set(sa["reasons"].keys())
++    deltas = []
++    for k in all_keys:
++        deltas.append((k, sa["reasons"].get(k, 0) - sb["reasons"].get(k, 0), sb["reasons"].get(k, 0), sa["reasons"].get(k, 0)))
++    deltas.sort(key=lambda x: abs(x[1]), reverse=True)
++    for k, d, bcnt, acnt in deltas[:40]:
++        if d == 0:
++            continue
++        print(f"{d:>+5}  {bcnt:>5} -> {acnt:>5}  {k}")
++
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

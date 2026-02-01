@@ -34,3 +34,4 @@ src/kajovospend/utils/config.py
 src/kajovospend/utils/hashing.py
 src/kajovospend/utils/logging_setup.py
 src/kajovospend/utils/paths.py
+src/kajovospend/utils/text_quality.py

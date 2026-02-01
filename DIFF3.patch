@@ -1,0 +1,215 @@
+diff --git a/src/kajovospend/service/processor.py b/src/kajovospend/service/processor.py
+index 2bcb3a1..c7a9c2a 100644
+--- a/src/kajovospend/service/processor.py
++++ b/src/kajovospend/service/processor.py
+@@ -1,10 +1,9 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
+ import shutil
+-import io
+ import re
+ from pathlib import Path
+ from typing import Any, Dict, Optional, Tuple, List
+ 
+@@ -318,22 +317,112 @@ class Processor:
+         except Exception:
+             pass
+         return t, c, 1
+ 
+     def _guess_supplier_ico_from_text(self, text: str) -> Optional[str]:
+-        """Best-effort: pokud OCR nevyčetl IČO pomocí kontextu, zkus najít 8místné kandidáty.
+-
+-        Strategie:
+-        - vytáhne všechny 8-místné sekvence číslic
+-        - zkusí je ověřit přes ARES (rychlý timeout)
+-        - když vyjde právě 1, vrátí ji
+-
+-        Pozn.: cíleně nevrací víc kandidátů, abychom nevytvářeli falešně pozitivní dodavatele.
+-        """
+-        if not text:
+-            return None
++        """
++        Best-effort self-healing IČO:
++        - primárně zkusí explicitní výskyty "IČO/ICO" + 8 číslic
++        - jinak sbírá 8místné kandidáty (\b\d{8}\b), filtruje typické falešné vzory (PSČ, tel, EAN)
++        - validuje přes ARES (rychlý timeout)
++        - pokud vyjde přesně 1 validní kandidát, vrátí jej
++        """
++        if not text:
++            return None
++
++        t = str(text)
++
++        def _is_false_pattern_line(line: str) -> bool:
++            ln = (line or "").strip().lower()
++            if not ln:
++                return False
++            # Filtr podle kontextu řádku (typické falešné pozitivy)
++            if ("psč" in ln) or ("psc" in ln) or ("zip" in ln):
++                return True
++            if ("tel" in ln) or ("telefon" in ln) or ("mobil" in ln) or ("phone" in ln):
++                return True
++            if ("ean" in ln) or ("barcode" in ln) or ("čárov" in ln) or ("carov" in ln):
++                return True
++            return False
++
++        def _line_for_pos(pos: int) -> str:
++            start = t.rfind("\n", 0, pos)
++            start = 0 if start < 0 else start + 1
++            end = t.find("\n", pos)
++            end = len(t) if end < 0 else end
++            return t[start:end]
++
++        def _validate_candidate(raw_ico: str) -> Optional[str]:
++            try:
++                ico_n = normalize_ico(raw_ico)
++            except Exception:
++                return None
++            try:
++                rec = fetch_by_ico(ico_n, timeout=4)
++                return getattr(rec, "ico", ico_n)
++            except Exception:
++                return None
++
++        # 1) explicitní IČO/ICO patterny (vyšší priorita)
++        #    - podporuje "IČO: 12345678", "ICO 12345678", "IČO#12345678" apod.
++        label_re = re.compile(r"(?i)\b(ič[o0]|ico)\b\s*[:#]?\s*(\d{8})\b")
++        for m in label_re.finditer(t):
++            cand = m.group(2)
++            ico = _validate_candidate(cand)
++            if ico:
++                return ico
++
++        # 2) obecné 8místné kandidáty + filtrování falešných vzorů
++        cands: List[str] = []
++        for m in re.finditer(r"\b\d{8}\b", t):
++            cand = m.group(0)
++            line = _line_for_pos(m.start())
++            if _is_false_pattern_line(line):
++                continue
++            if cand not in cands:
++                cands.append(cand)
++            if len(cands) >= 20:
++                break
++
++        if not cands:
++            return None
++
++        valid: List[str] = []
++        for cand in cands:
++            ico = _validate_candidate(cand)
++            if ico:
++                valid.append(ico)
++            if len(valid) > 1:
++                break
++
++        # bezpečné chování: vrátíme jen když je jednoznačný výsledek
++        if len(valid) == 1:
++            return valid[0]
++        return None
+ 
+     def _looks_like_ico(self, ico: str | None) -> bool:
+         if not ico:
+             return False
+@@ -369,38 +458,9 @@ class Processor:
+     def _pseudo_ico(self, supplier_name: str) -> str:
+         """Deterministické pseudo-IČO pro retail účtenky bez uvedeného IČO."""
+         import hashlib
+         base = (supplier_name or "UNKNOWN").strip().upper().encode("utf-8", errors="ignore")
+         h = hashlib.sha256(base).hexdigest()[:10]
+         return f"NOICO-{h}"
+-        cands = []
+-        for m in re.finditer(r"\b\d{8}\b", text):
+-            cands.append(m.group(0))
+-        # de-dup, stabilní pořadí
+-        seen = set()
+-        uniq = []
+-        for c in cands:
+-            if c not in seen:
+-                uniq.append(c)
+-                seen.add(c)
+-
+-        valid: List[str] = []
+-        for c in uniq[:20]:
+-            try:
+-                ico_n = normalize_ico(c)
+-            except Exception:
+-                continue
+-            try:
+-                # rychlá validace přes ARES
+-                fetch_by_ico(ico_n, timeout=4)
+-                valid.append(ico_n)
+-            except Exception:
+-                continue
+-            if len(valid) > 1:
+-                break
+-        if len(valid) == 1:
+-            return valid[0]
+-        return None
+ 
+diff --git a/tests/unit/__init__.py b/tests/unit/__init__.py
+new file mode 100644
+index 0000000..cbbe3f6
+--- /dev/null
++++ b/tests/unit/__init__.py
+@@ -0,0 +1 @@
++# package marker
+diff --git a/tests/unit/test_ico_self_healing.py b/tests/unit/test_ico_self_healing.py
+new file mode 100644
+index 0000000..5b7f1db
+--- /dev/null
++++ b/tests/unit/test_ico_self_healing.py
+@@ -0,0 +1,77 @@
++from __future__ import annotations
++
++import logging
++import unittest
++from unittest.mock import patch
++
++from kajovospend.integrations.ares import AresError, AresRecord
++from kajovospend.service.processor import Processor
++
++
++class TestIcoSelfHealing(unittest.TestCase):
++    def _proc(self) -> Processor:
++        # Bypass __init__ (OCR init) – pro unit testy stačí log + cfg
++        p = Processor.__new__(Processor)
++        p.cfg = {}
++        p.paths = None
++        p.log = logging.getLogger("kajovospend_test_ico")
++        return p
++
++    def test_text_with_explicit_ico_label(self) -> None:
++        p = self._proc()
++        with patch("kajovospend.service.processor.fetch_by_ico") as fb:
++            fb.return_value = AresRecord(ico="12345678", name="ACME")
++            ico = p._guess_supplier_ico_from_text("Dodavatel ACME\nIČO: 12345678\nDIČ: CZ12345678")
++            self.assertEqual(ico, "12345678")
++
++    def test_text_without_ico_label_but_has_8_digits(self) -> None:
++        p = self._proc()
++        with patch("kajovospend.service.processor.fetch_by_ico") as fb:
++            fb.return_value = AresRecord(ico="12345678", name="ACME")
++            ico = p._guess_supplier_ico_from_text("ACME s.r.o.\nVodičkova 1\n12345678\nPraha\n")
++            self.assertEqual(ico, "12345678")
++
++    def test_multiple_candidates_choose_valid(self) -> None:
++        p = self._proc()
++
++        def _fake_fetch(ico: str, *args, **kwargs):
++            if ico == "87654321":
++                raise AresError("not found")
++            if ico == "12345678":
++                return AresRecord(ico="12345678", name="ACME")
++            raise AresError("unexpected")
++
++        with patch("kajovospend.service.processor.fetch_by_ico", side_effect=_fake_fetch):
++            # 2 kandidáti, jen jeden validní v ARES
++            txt = "Číslo dokladu: 87654321\nDodavatel: ACME s.r.o. 12345678\n"
++            ico = p._guess_supplier_ico_from_text(txt)
++            self.assertEqual(ico, "12345678")
++
++
++if __name__ == "__main__":
++    unittest.main()
