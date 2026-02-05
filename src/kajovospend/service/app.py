@@ -25,7 +25,8 @@ class ServiceApp:
         self.log = logger
         self._stop = threading.Event()
         self._watcher = DirectoryWatcher(Path(cfg["paths"]["input_dir"]), self.enqueue_path)
-        self._max_workers = int(cfg["service"].get("workers", 2))
+        # Vynuceně sekvenční zpracování (1 worker)
+        self._max_workers = 1
         self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
         self._inflight_lock = threading.Lock()
         self._inflight: set[Future] = set()

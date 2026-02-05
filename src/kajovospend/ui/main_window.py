@@ -3336,19 +3336,24 @@ class MainWindow(QMainWindow):
             current = Path(st.current_path).name if st.current_path else "-"
 
             running_txt = "Zapnuto" if bool(st.running) else "Vypnuto"
+            if self._import_running:
+                running_txt = "Zapnuto (ruční import)"
             if getattr(st, "stuck", False):
                 running_txt += " (zaseknuto)"
             _set("import_power", running_txt)
 
             prog = ""
-            if st.current_progress is not None:
-                try:
-                    prog = f"{float(st.current_progress):.0f} %"
-                except Exception:
-                    prog = ""
-            now_txt = f"{phase} • {current}" if current and current != "-" else phase
-            if prog:
-                now_txt += f" • {prog}"
+            if self._import_running:
+                now_txt = self._import_status
+            else:
+                if st.current_progress is not None:
+                    try:
+                        prog = f"{float(st.current_progress):.0f} %"
+                    except Exception:
+                        prog = ""
+                now_txt = f"{phase} • {current}" if current and current != "-" else phase
+                if prog:
+                    now_txt += f" • {prog}"
             _set("import_activity", now_txt)
 
             if remaining <= 0:
