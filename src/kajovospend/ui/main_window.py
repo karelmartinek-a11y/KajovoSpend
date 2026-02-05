@@ -24,6 +24,7 @@ from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
 from sqlalchemy import select, text
 
+import sip
 from kajovospend.utils.config import load_yaml, save_yaml, deep_set
 import requests
 import requests
@@ -560,8 +561,14 @@ class _SilentRunner:
         window._threads.append(th)
 
         def _dispatch_ui(cb) -> None:
-            if QThread.currentThread() != window.thread():
-                QTimer.singleShot(0, window, cb)
+            try:
+                if sip.isdeleted(window):
+                    return
+                win_thread = window.thread()
+            except RuntimeError:
+                return
+            if QThread.currentThread() != win_thread:
+                QTimer.singleShot(0, cb)
                 return
             cb()
 
@@ -842,8 +849,14 @@ class MainWindow(QMainWindow):
         self._workers.append(wk)
 
         def _dispatch_ui(fn) -> None:
-            if QThread.currentThread() != self.thread():
-                QTimer.singleShot(0, self, fn)
+            try:
+                if sip.isdeleted(self):
+                    return
+                self_thread = self.thread()
+            except RuntimeError:
+                return
+            if QThread.currentThread() != self_thread:
+                QTimer.singleShot(0, fn)
                 return
             fn()
 
