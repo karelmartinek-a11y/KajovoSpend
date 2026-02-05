@@ -727,6 +727,7 @@ class MainWindow(QMainWindow):
         self._import_stop_event = threading.Event()
         self._last_run_error: str | None = None
         self._last_run_success: str | None = None
+        self._ops_last_snapshot: Optional[Tuple[Tuple[str, ...], ...]] = None
 
         # selection model guards to prevent duplicate signal connections after model resets
         self._docs_sel_model = None
@@ -3494,6 +3495,11 @@ class MainWindow(QMainWindow):
             "Výsledek",
             "Důvod",
         ]
+        snapshot: Tuple[Tuple[str, ...], ...] = tuple(tuple(str(x) for x in r) for r in rows)
+        if snapshot == self._ops_last_snapshot:
+            return
+        self._ops_last_snapshot = snapshot
+
         self.ops_table.setModel(TableModel(headers, rows))
         try:
             self.ops_table.resizeColumnsToContents()
