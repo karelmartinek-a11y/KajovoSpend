@@ -50,13 +50,13 @@ class DirectoryWatcher:
         self.directory.mkdir(parents=True, exist_ok=True)
         handler = _Handler(self.on_file)
         try:
-            self._observer.schedule(handler, str(self.directory), recursive=False)
+            self._observer.schedule(handler, str(self.directory), recursive=True)
             self._observer.start()
         except TypeError as exc:
             # Fallback for environments where the native observer breaks (see above).
             logging.getLogger(__name__).warning("watchdog native observer failed (%s), falling back to polling", exc)
             self._observer = PollingObserver()
-            self._observer.schedule(handler, str(self.directory), recursive=False)
+            self._observer.schedule(handler, str(self.directory), recursive=True)
             self._observer.start()
 
     def stop(self):
@@ -70,7 +70,6 @@ class DirectoryWatcher:
 def scan_directory(directory: Path) -> Iterable[Path]:
     if not directory.exists():
         return []
-    for name in os.listdir(directory):
-        p = directory / name
+    for p in directory.rglob("*"):
         if p.is_file() and is_supported(p):
             yield p

@@ -13,8 +13,8 @@ from sqlalchemy import select
 
 from kajovospend.db.models import ImportJob, ServiceState
 from kajovospend.db.queries import update_service_state, queue_size
-from kajovospend.service.watcher import DirectoryWatcher, scan_directory
-from kajovospend.service.processor import Processor
+from kajovospend.service.watcher import DirectoryWatcher
+from kajovospend.service.processor import Processor, safe_move
 
 
 class ServiceApp:
@@ -30,6 +30,7 @@ class ServiceApp:
         self._inflight_lock = threading.Lock()
         self._inflight: set[Future] = set()
         self._processor = Processor(cfg, paths, logger)
+        self._supported_ext = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
     def _drop_future(self, fut: Future) -> None:
         # callback runs in worker thread; keep it tiny and safe
@@ -45,6 +46,39 @@ class ServiceApp:
             # prune done futures (in case callback didn't run for any reason)
             self._inflight = {f for f in self._inflight if not f.done()}
             return len(self._inflight)
+
+    def _collect_input_files(self) -> list[Path]:
+        input_dir = Path(self.cfg["paths"]["input_dir"])
+        out_base = Path(self.cfg["paths"]["output_dir"])
+        quarantine_dir = out_base / self.cfg["paths"].get("quarantine_dir_name", "KARANTENA")
+
+        files: list[Path] = []
+        try:
+            if not input_dir.exists():
+                return files
+            for p in input_dir.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() in self._supported_ext:
+                    files.append(p)
+                else:
+                    try:
+                        moved = safe_move(p, quarantine_dir, p.name)
+                        self.log.warning("Nepodporovaný soubor %s přesunut do karantény jako %s", p, moved)
+                    except Exception as exc:
+                        self.log.exception("Nelze přesunout nepodporovaný soubor %s: %s", p, exc)
+            # vyčistit prázdné podsložky
+            dirs = sorted([d for d in input_dir.rglob("*") if d.is_dir()], key=lambda d: len(d.parts), reverse=True)
+            for d in dirs:
+                try:
+                    if not any(d.iterdir()):
+                        d.rmdir()
+                except Exception:
+                    pass
+            files.sort(key=lambda p: (p.stat().st_mtime, p.name, str(p)))
+        except Exception as exc:
+            self.log.exception("Chyba při skenování IN: %s", exc)
+        return files
 
     def _submit_job(self, job_id: int) -> None:
         fut = self._executor.submit(self._run_job, job_id)
@@ -228,9 +262,9 @@ class ServiceApp:
                         )
                     session.commit()
 
-                # scan for missed files
+                # scan for missed files (rekurzivně, včetně podadresářů)
                 phase = "scanning"
-                for p in scan_directory(Path(self.cfg["paths"]["input_dir"])):
+                for p in self._collect_input_files():
                     self.enqueue_path(p)
 
                 # claim jobs and dispatch

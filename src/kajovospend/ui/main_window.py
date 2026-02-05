@@ -38,7 +38,7 @@ from kajovospend.integrations.openai_fallback import (
     extract_with_openai_fallback,
     list_models,
 )
-from kajovospend.service.processor import Processor
+from kajovospend.service.processor import Processor, safe_move
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 
 from .styles import QSS
@@ -461,8 +461,23 @@ class _ImportWorker(QObject):
                 return
 
             exts = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
-            files = [p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
-            files.sort(key=lambda p: (p.stat().st_mtime, p.name))
+            out_base = Path(self.cfg["paths"]["output_dir"])
+            quarantine_dir = out_base / self.cfg["paths"].get("quarantine_dir_name", "KARANTENA")
+
+            files: list[Path] = []
+            for p in input_dir.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() in exts:
+                    files.append(p)
+                else:
+                    try:
+                        moved = safe_move(p, quarantine_dir, p.name)
+                        self.processor.log.warning("Nepodporovaný soubor %s přesunut do karantény jako %s", p, moved)
+                    except Exception as exc:
+                        self.processor.log.exception("Nelze přesunout nepodporovaný soubor %s: %s", p, exc)
+
+            files.sort(key=lambda p: (p.stat().st_mtime, p.name, str(p)))
 
             if not files:
                 self.done.emit({"imported": 0, "message": "V INPUT nejsou žádné soubory."})
@@ -501,6 +516,15 @@ class _ImportWorker(QObject):
                     except Exception:
                         pass
                     self.progress.emit(f"Chyba: {p.name}: {e}")
+
+            # vyčistit prázdné podadresáře
+            dirs = sorted([d for d in input_dir.rglob("*") if d.is_dir()], key=lambda d: len(d.parts), reverse=True)
+            for d in dirs:
+                try:
+                    if not any(d.iterdir()):
+                        d.rmdir()
+                except Exception:
+                    pass
 
             self.done.emit({"imported": imported, "total": total, "message": "Hotovo."})
         except Exception as e:
