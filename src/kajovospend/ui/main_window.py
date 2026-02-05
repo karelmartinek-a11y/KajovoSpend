@@ -764,6 +764,9 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(QSS)
         self.setStyleSheet(QSS)
 
+        # start maximized on primary monitor
+        self.showMaximized()
+
         self._build_ui()
         self._wire_timers()
         self.refresh_all_v2()
