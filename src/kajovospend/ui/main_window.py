@@ -1815,7 +1815,7 @@ class MainWindow(QMainWindow):
         self._items_total = int(total or 0)
         self._items_offset = len(self._items_rows)
 
-        headers = ["Datum", "Dodavatel", "Položka", "Množství", "DPH %", "Celkem", "Doklad", "IČO"]
+        headers = ["Datum", "Dodavatel", "Položka", "Množství", "DPH %", "Celkem s DPH", "Doklad", "IČO"]
         trows = []
         for r in self._items_rows:
             issue = r.get("issue_date")
@@ -3308,7 +3308,7 @@ class MainWindow(QMainWindow):
                     reason,
                     d.id,
                 ])
-        headers = ["Stav", "Status", "Zaregistrováno", "Dokončeno", "Datum", "IČO", "Číslo", "Celkem", "Soubor", "Důvod", "ID"]
+        headers = ["Stav", "Status", "Zaregistrováno", "Dokončeno", "Datum", "IČO", "Číslo", "Celkem s DPH", "Soubor", "Důvod", "ID"]
         self.unproc_table.setModel(TableModel(headers, rows))
         self.unproc_table.resizeColumnsToContents()
 
