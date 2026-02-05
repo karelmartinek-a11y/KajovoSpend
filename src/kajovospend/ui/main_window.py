@@ -568,7 +568,10 @@ class _SilentRunner:
             except RuntimeError:
                 return
             if QThread.currentThread() != win_thread:
-                QTimer.singleShot(0, cb)
+                try:
+                    QTimer.singleShot(0, window, cb)
+                except Exception:
+                    pass
                 return
             cb()
 
@@ -856,7 +859,10 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 return
             if QThread.currentThread() != self_thread:
-                QTimer.singleShot(0, fn)
+                try:
+                    QTimer.singleShot(0, self, fn)
+                except Exception:
+                    pass
                 return
             fn()
 
