@@ -24,7 +24,7 @@ from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
 from sqlalchemy import select, text
 
-import sip
+from shiboken6 import Shiboken
 from kajovospend.utils.config import load_yaml, save_yaml, deep_set
 import requests
 import requests
@@ -562,7 +562,7 @@ class _SilentRunner:
 
         def _dispatch_ui(cb) -> None:
             try:
-                if sip.isdeleted(window):
+                if not Shiboken.isValid(window):
                     return
                 win_thread = window.thread()
             except RuntimeError:
@@ -850,7 +850,7 @@ class MainWindow(QMainWindow):
 
         def _dispatch_ui(fn) -> None:
             try:
-                if sip.isdeleted(self):
+                if not Shiboken.isValid(self):
                     return
                 self_thread = self.thread()
             except RuntimeError:
