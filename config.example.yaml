@@ -1,38 +1,69 @@
 app:
-  data_dir: ""  # empty = default %LOCALAPPDATA%\\KajovoSpend
-  db_path: ""   # empty = <data_dir>/kajovospend.sqlite
-  log_dir: ""   # empty = <data_dir>/logs
-
+  data_dir: ''
+  db_path: ''
+  log_dir: ''
 paths:
-  input_dir: "C:/KajovoSpend/INPUT"
-  output_dir: "C:/KajovoSpend/OUTPUT"
-  quarantine_dir_name: "KARANTENA"
-  duplicate_dir_name: "DUPLICITY"
-
+  input_dir: C:/KajovoSpend/INPUT
+  output_dir: C:/KajovoSpend/OUTPUT
+  quarantine_dir_name: KARANTENA
+  duplicate_dir_name: DUPLICITY
 service:
-  host: "127.0.0.1"
+  host: 127.0.0.1
   port: 8765
   workers: 2
   scan_interval_sec: 2
   graceful_shutdown_sec: 10
-
 ocr:
-  engine: "rapidocr"
-  models_dir: ""  # empty = <data_dir>/models/rapidocr
+  engine: rapidocr
+  models_dir: ''
   pdf_dpi: 200
   min_confidence: 0.65
-
+  structured_first:
+    enabled: true
+    enable_pdf_attachments: true
+  force_ocr_on_parse_failure: true
+  ensemble:
+    enabled: true
+    dpis:
+    - 200
+    - 300
+    - 450
+    - 600
+    rotations:
+    - 0
+    - 90
+    - 180
+    - 270
+    include_reconstructed: true
+    max_candidates: 8
 openai:
   enabled: false
-  api_key: ""   # stored locally; not masked in UI
-  model: ""     # chosen model
-
+  auto_enable: true
+  api_key: ''
+  model: auto
+  fallback_model: ''
+  primary_enabled: true
+  use_json_schema: true
+  temperature: 0.0
+  max_output_tokens: 2000
+  timeout_sec: 60
+  image_dpi: 300
+  image_max_pages: 3
+  image_enhance: true
+  image_variants: 2
+  allow_synthetic_items: false
 performance:
-  # UI paging for large datasets (tens of thousands of documents)
   docs_page_size: 500
-  # Debounce supplier search (ms)
   supplier_debounce_ms: 250
-  # PDF preview render DPI (lower = faster)
   preview_dpi: 120
   image_max_px: 3000
   parallel_pages: 2
+features:
+  qr_spayd:
+    enabled: true
+  iban_validation:
+    enabled: true
+  vies_validation:
+    enabled: false
+  openai_fallback:
+    enabled: false

@@ -41,7 +41,7 @@ _AMOUNT_ONLY_RE = re.compile(r"^-?\d[\d\s]*[.,]\d{2}\s*(?:Kč|CZK|EUR)?$", re.IG
 _KC_AMOUNT_ONLY_RE = re.compile(r"^-?\d[\d\s]*[.,]\d{2}\s*Kč$", re.IGNORECASE)
 _VAT_ONLY_RE = re.compile(r"^(\d{1,2})\s*%?$", re.IGNORECASE)
 _STOP_ITEMS_RE = re.compile(
-    r"^(Sleva|Základ|Zaklad|Cena celkem|Celkem|Rekapitulace|Součet|Soucet|Zbývá|Zbyva|Celkem k úhradě|CELKEM)\b",
+    r"^(Základ|Zaklad|Cena celkem|Celkem|Rekapitulace|Součet|Soucet|Zbývá|Zbyva|Celkem k úhradě|CELKEM)\b",
     re.IGNORECASE,
 )
 
@@ -145,11 +145,15 @@ def _extract_doc_number(text: str) -> Optional[str]:
     t = text or ""
     doc_no = _find_first([
         # explicitní daňový doklad / faktura
+        re.compile(r"Variabiln[ií]\s+symbol\s*[: ]\s*(\d{3,})\b", re.IGNORECASE),
+        re.compile(r"Č[ií]slo\s+faktury[^:\n]{0,40}[: ]\s*(\d{3,})\b", re.IGNORECASE),
         re.compile(r"DAŇOVÝ\s+DOKLAD\s+č\.?\s*([A-Z0-9][A-Z0-9/-]{2,})\b", re.IGNORECASE),
         re.compile(r"DAŇOVÝ\s+DOKLAD\s*[-–]\s*(\d{4,})\b", re.IGNORECASE),
         re.compile(r"Č[ií]slo\s+faktury\s*[: ]\s*([A-Z0-9][\w/-]{2,})", re.IGNORECASE),
         re.compile(r"Faktura\s+č[ií]slo\s*[: ]\s*([A-Z0-9][\w/-]{2,})", re.IGNORECASE),
         re.compile(r"Faktura\s*-?\s*daňový\s+doklad\s+č\.?\s*([\w/-]+)", re.IGNORECASE),
+        re.compile(r"Faktura\s*#\s*(\d{6,})\b", re.IGNORECASE),
+
 
         # Money S3: "variabilní:\n24202896"
         re.compile(r"\bvariabiln[ií]\s*:\s*\n?\s*(\d{3,})\b", re.IGNORECASE),
@@ -669,14 +673,646 @@ def _parse_items_ks_line_based(text: str) -> List[dict]:
     return items
 
 
+
+
+
+
+def _parse_items_deus_inferis(text: str) -> List[dict]:
+    """
+    Deus Inferis (neplátce DPH): v PDF je jednoduchá tabulka:
+      MNOŽSTVÍ JEDNOTKOVÁ CENA ČÁSTKA
+      1 48 044,00 Kč 48 044,00 Kč
+    a popis je v sekci "POPIS".
+    """
+    raw = text or ""
+    if "DEUS INFERIS" not in raw.upper():
+        return []
+    lines = [ln.replace("\xa0", " ").strip() for ln in raw.splitlines()]
+    # popis (po "POPIS")
+    desc = ""
+    for i, ln in enumerate(lines):
+        if ln.strip().upper() == "POPIS":
+            # zbytek řádku/řádky po POPIS
+            tail = " ".join([l.strip() for l in lines[i + 1 : i + 4] if l.strip()])
+            desc = tail.strip()
+            break
+
+    row_re = re.compile(
+        r"^(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>\d+[\s\d]*[.,]\d{2})\s*Kč\s+(?P<total>\d+[\s\d]*[.,]\d{2})\s*Kč\s*$",
+        re.IGNORECASE,
+    )
+    for ln in lines:
+        m = row_re.match(ln)
+        if not m:
+            continue
+        try:
+            qty = _safe_float(m.group("qty"))
+            unit_price = _norm_amount(m.group("unit"))
+            line_total = _norm_amount(m.group("total"))
+            name = desc or "Služba"
+            return [{"name": name, "quantity": float(qty), "unit_price": float(unit_price), "vat_rate": 0.0, "line_total": float(line_total)}]
+        except Exception:
+            continue
+    return []
+
+
+def _parse_items_dobes(text: str) -> List[dict]:
+    """
+    Data-Design-Dobeš faktura: sekce "pro DPH 21 %", kde jsou často numeric řádky oddělené od popisu.
+    Heuristika:
+      - sbírá poslední "textový" popis
+      - numeric řádek: <qty> <unit> <total>
+      - ošetří chybu typu "177900 1779,00" (chybí desetinná čárka): 177900 -> 1779,00 pokud sedí.
+    """
+    raw = text or ""
+    if "DATA-DESIGN-DOBEŠ".upper() not in raw.upper() and "DATA-DESIGN-DOBEŠ".lower() not in raw.lower() and "Data-Design-Dobeš" not in raw:
+        # fallback: podle IBAN/email domény
+        if "ddatadesign" not in raw.lower():
+            return []
+    lines = [ln.replace("\xa0", " ").strip() for ln in raw.splitlines()]
+    # najdi start sekce
+    start = None
+    for i, ln in enumerate(lines):
+        if re.search(r"pro\s+DPH\s*21\s*%\s*:", ln, re.IGNORECASE) or re.fullmatch(r"pro\s+DPH\s*21\s*%\s*:", ln.strip(), re.IGNORECASE):
+            start = i
+            break
+        if re.fullmatch(r"pro\s+DPH\s*21\s*%\s*", ln.strip(), re.IGNORECASE):
+            start = i
+            break
+    if start is None:
+        # někdy bez dvojtečky
+        for i, ln in enumerate(lines):
+            if re.search(r"pro\s+DPH\s*21\s*%", ln, re.IGNORECASE):
+                start = i
+                break
+    if start is None:
+        return []
+
+    # stop at summary
+    stop_idx = len(lines)
+    for j in range(start, len(lines)):
+        if re.search(r"celkem\s+k\s+úhradě|celkem\s+\[Kč\]|celkem\s*:", lines[j], re.IGNORECASE):
+            stop_idx = j
+            break
+
+    num_re = re.compile(r"-?\d+[\d\s]*[.,]?\d*")
+    amt_re = re.compile(r"-?\d+[\d\s]*[.,]\d{2}")
+    pending_desc: List[str] = []
+    items: List[dict] = []
+
+    def _fix_amount_token(tok: str, next_tok: str | None) -> Optional[float]:
+        """
+        tok může být "177900" (bez desetinné čárky). Pokud next_tok je "1779,00", opravíme.
+        """
+        t = (tok or "").replace(" ", "")
+        if amt_re.fullmatch(t):
+            return _norm_amount(t)
+        if t.isdigit() and len(t) >= 4:
+            # zkus /100
+            try:
+                v = float(int(t)) / 100.0
+            except Exception:
+                return None
+            if next_tok:
+                nt = (next_tok or "").replace(" ", "")
+                if amt_re.fullmatch(nt):
+                    try:
+                        vn = _norm_amount(nt)
+                        if abs(v - vn) < 0.01:
+                            return vn
+                    except Exception:
+                        pass
+            return float(v)
+        return None
+
+    for ln in lines[start:stop_idx]:
+        if not ln:
+            continue
+        # text line: má písmena a málo čísel
+        if re.search(r"[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]", ln) and len(amt_re.findall(ln)) == 0 and not re.search(r"^\d+\s+\d", ln):
+            # vynech hlavičky
+            if re.search(r"počet|text|cena/jedn|celkem", ln, re.IGNORECASE):
+                continue
+            pending_desc.append(ln)
+            if len(pending_desc) > 3:
+                pending_desc = pending_desc[-3:]
+            continue
+
+        # numeric-ish line
+        toks = [t.strip() for t in re.split(r"\s+", ln) if t.strip()]
+        # pick numeric tokens that are amounts/ints
+        nums = [t for t in toks if re.fullmatch(r"-?\d+[\d\s]*[.,]?\d*", t)]
+        if len(nums) < 3:
+            continue
+        qty_tok = nums[0]
+        unit_tok = nums[1]
+        total_tok = nums[2]
+        try:
+            qty = _parse_number(qty_tok) or 0.0
+            unit = _fix_amount_token(unit_tok, total_tok)
+            total = _fix_amount_token(total_tok, None)
+            if qty <= 0 or unit is None or total is None:
+                continue
+            name = " ".join(pending_desc).strip() or ln
+            items.append({"name": name, "quantity": float(qty), "unit_price": float(unit), "vat_rate": 21.0, "line_total": float(total)})
+            pending_desc = []
+        except Exception:
+            continue
+
+    return items
+
+def _parse_items_wolt(text: str) -> List[dict]:
+    """
+    Wolt účtenky/faktury (Wolt Market apod.)
+
+    Typicky:
+      <název...> 12% 3  15,90  47,70
+    - názvy mohou být přes více řádků
+    - někdy chybí mezera před "12%" (např. "50 g12% ...")
+
+    Pozn.: Řádky "Sleva ..." (Wolt+ / order-level) se v praxi nevztahují k tabulce položek, a
+    u řady dokladů by rozbíjely součet vůči "Celkem v CZK". Proto je zde ignorujeme.
+    """
+    raw = text or ""
+    if "WOLT" not in raw.upper():
+        return []
+
+    lines = [ln.replace("\xa0", " ").strip() for ln in raw.splitlines()]
+    items: List[dict] = []
+
+    item_re = re.compile(
+        r"^(?P<name>.+?)\s*(?P<vat>\d{1,2})%\s*(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>\d+[\s\d]*[.,]\d{2})\s+(?P<total>-?\d+[\s\d]*[.,]\d{2})\s*$"
+    )
+
+    meta_re = re.compile(
+        r"^(Detaily|Zákazník|Zakaznik|Číslo objednávky|Cislo objednavky|Provozovna|Typ objednávky|Typ objednavky|Čas doručení|Cas doruceni|Způsob platby|Zpusob platby|Apple Pay|Google Pay)\b",
+        re.IGNORECASE,
+    )
+    header_re = re.compile(r"^(Položka\b|Polozka\b|Cena\s+DPH\s+Celkem\b|DPH\s+\d{1,2}%\b|Celkem\b|Detaily\s+prodejce\b)", re.IGNORECASE)
+
+    buf = ""
+    for ln in lines:
+        if not ln:
+            continue
+
+        if ln.strip().lower().startswith("sleva"):
+            # intentionally ignore order-level discounts
+            buf = ""
+            continue
+
+        if meta_re.match(ln) or header_re.match(ln) or ("Jednotková cena" in ln) or ("Jednotkova cena" in ln):
+            buf = ""
+            continue
+
+        # prefer direct match
+        m = item_re.match(ln)
+        if m:
+            try:
+                name = (m.group("name") or "").strip(" -:\t")
+                qty = _safe_float(m.group("qty"))
+                unit_price = _norm_amount(m.group("unit"))
+                vat = float(m.group("vat"))
+                line_total = _norm_amount(m.group("total"))
+                if name and qty:
+                    items.append({"name": name, "quantity": qty, "unit_price": unit_price, "vat_rate": vat, "line_total": line_total})
+            except Exception:
+                pass
+            buf = ""
+            continue
+
+        # multi-line name buffering
+        buf = (buf + " " + ln).strip() if buf else ln
+        if len(buf) > 260:
+            buf = buf[-260:]
+
+        m2 = item_re.match(buf)
+        if m2:
+            try:
+                name = (m2.group("name") or "").strip(" -:\t")
+                qty = _safe_float(m2.group("qty"))
+                unit_price = _norm_amount(m2.group("unit"))
+                vat = float(m2.group("vat"))
+                line_total = _norm_amount(m2.group("total"))
+                if name and qty:
+                    items.append({"name": name, "quantity": qty, "unit_price": unit_price, "vat_rate": vat, "line_total": line_total})
+            except Exception:
+                pass
+            buf = ""
+
+    return items
+
+
+def _parse_items_omv(text: str) -> List[dict]:
+    """
+    OMV účtenky / daňové doklady (typicky 1-2 palivové položky).
+    OCR bývá relativně spolehlivé, ale řádky mohou být rozbité.
+
+    Heuristika:
+      - detekuj OMV v textu
+      - najdi palivové názvy (Natural/Nafta/Diesel/LPG/MaxxMotion/AdBlue)
+      - kolem nich hledej množství (l) + jednotkovou cenu (Kč/l) + částku (Kč)
+      - pokud chybí některé části, vrátí prázdné (fallback pak může vytvořit syntetickou položku nebo OpenAI).
+    """
+    raw = text or ""
+    u = raw.upper()
+    if "OMV" not in u:
+        return []
+
+    lines = [ln.replace("\xa0", " ").strip() for ln in raw.splitlines()]
+    # odhad sazby DPH z dokumentu
+    vat_rate = 0.0
+    for ln in lines:
+        m = re.search(r"\bDPH\b.*?\b(\d{1,2})\s*%?", ln, re.IGNORECASE)
+        if m:
+            try:
+                v = float(m.group(1))
+                if 0 <= v <= 30:
+                    vat_rate = v
+                    break
+            except Exception:
+                pass
+
+    # kandidáti názvů paliva
+    fuel_re = re.compile(
+        r"\b(NATURAL|BENZIN|BENZÍN|DIESEL|NAFTA|MAXX?MOTION|LPG|ADBLUE|AD\-?BLUE)\b",
+        re.IGNORECASE,
+    )
+    qty_re = re.compile(r"(?P<qty>\d+(?:[.,]\d+)?)\s*(?:l|L)\b")
+    unit_re = re.compile(
+        r"(?P<unit>\d+(?:[.,]\d+)?)\s*(?:Kc|Kč|CZK)\s*/\s*(?:l|L)\b",
+        re.IGNORECASE,
+    )
+    amt_re = re.compile(r"(?P<amt>\d[\d\s]*[.,]\d{2})\s*(?:Kc|Kč|CZK)\b", re.IGNORECASE)
+
+    def _pick_amounts(s: str) -> List[str]:
+        return [a for a in _amount_re.findall(s)]
+
+    items: List[dict] = []
+    for i, ln in enumerate(lines):
+        if not ln:
+            continue
+        if not fuel_re.search(ln):
+            continue
+
+        # name: celý řádek, očisti drobnosti
+        name = re.sub(r"\s{2,}", " ", ln).strip(" -:\t")
+        if len(name) < 2:
+            continue
+
+        window = " ".join([lines[j] for j in range(i, min(len(lines), i + 4)) if lines[j]])
+        qty = None
+        unit_price = None
+        line_total = None
+
+        mq = qty_re.search(window)
+        if mq:
+            qty = _parse_number(mq.group("qty"))
+
+        mu = unit_re.search(window)
+        if mu:
+            unit_price = _parse_number(mu.group("unit"))
+
+        # částky: vezmeme největší částku v okně jako line_total
+        amts = _pick_amounts(window)
+        if amts:
+            try:
+                nums = [_norm_amount(a) for a in amts]
+                if nums:
+                    line_total = max(nums)
+            except Exception:
+                pass
+
+        # pokud jednotková cena není, a máme qty+total, dopočítej unit_price
+        try:
+            if (unit_price is None) and qty and line_total and qty > 0:
+                unit_price = float(line_total) / float(qty)
+        except Exception:
+            pass
+
+        if qty and unit_price and (line_total is not None):
+            items.append(
+                {
+                    "name": name,
+                    "quantity": float(qty),
+                    "unit_price": float(unit_price),
+                    "vat_rate": float(vat_rate),
+                    "line_total": float(line_total),
+                }
+            )
+
+    
+
+    # fallback: pokud OCR nevyčetlo název paliva, ale máme řádky s "l" + dvě částky
+    if not items:
+        pending = None
+        for i, ln in enumerate(lines):
+            if _STOP_ITEMS_RE.search(ln):
+                break
+            # kandidát názvu: řádek s písmeny bez částek
+            if re.search(r"[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]", ln) and not _amount_re.search(ln) and len(ln) >= 4:
+                pending = ln.strip(" -:\t")
+                continue
+            if "l" not in ln.lower() or "x" not in ln.lower():
+                continue
+            amts = _pick_amounts(ln)
+            mq = re.search(r"(\d+(?:[.,]\d+)?)\s*[lL]\b", ln)
+            mu = re.search(r"[xX×]\s*(\d+(?:[.,]\d+)?)", ln)
+            if mq and mu and len(amts) >= 1:
+                try:
+                    qty = _parse_number(mq.group(1))
+                    unit_price = _parse_number(mu.group(1))
+                    # total vezmi největší částku na řádku
+                    nums = [_norm_amount(a) for a in amts]
+                    line_total = max(nums) if nums else None
+                    if qty and unit_price and (line_total is not None):
+                        items.append({
+                            "name": pending or "OMV - palivo",
+                            "quantity": float(qty),
+                            "unit_price": float(unit_price),
+                            "vat_rate": float(vat_rate),
+                            "line_total": float(line_total),
+                        })
+                        pending = None
+                except Exception:
+                    continue
+
+    # dedupe (někdy OCR zdvojí řádky)
+    uniq: List[dict] = []
+    seen = set()
+    for it in items:
+        key = (it.get("name"), round(float(it.get("line_total", 0.0)), 2), round(float(it.get("quantity", 0.0)), 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(it)
+
+    return uniq
+
+
 def _parse_date(s: str) -> Optional[dt.date]:
-    s = s.strip()
+    s = (s or "").strip()
+    if not s:
+        return None
+
+    # české názvy měsíců (leden/ledna, únor/února, ...)
+    month_map = {
+        "leden": "01", "ledna": "01",
+        "únor": "02", "unor": "02", "února": "02", "unora": "02",
+        "březen": "03", "brezen": "03", "března": "03", "brezna": "03",
+        "duben": "04", "dubna": "04",
+        "květen": "05", "kveten": "05", "května": "05", "kvetna": "05",
+        "červen": "06", "cerven": "06", "června": "06", "cervna": "06",
+        "červenec": "07", "cervenec": "07", "července": "07", "cervence": "07",
+        "srpen": "08", "srpna": "08",
+        "září": "09", "zari": "09",
+        "říjen": "10", "rijen": "10", "října": "10", "rijna": "10",
+        "listopad": "11", "listopadu": "11",
+        "prosinec": "12", "prosince": "12",
+    }
+    m = re.search(r"\b(\d{1,2})\.?\s*([A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽáčďéěíňóřšťúůýž]+)\s*(\d{4})\b", s)
+    if m:
+        day = m.group(1).zfill(2)
+        mon = month_map.get(m.group(2).strip().lower())
+        year = m.group(3)
+        if mon:
+            s = f"{day}.{mon}.{year}"
+
     try:
-        # support dd.mm.yyyy and dd/mm/yyyy and ISO
         d = dtparser.parse(s, dayfirst=True).date()
         return d
     except Exception:
         return None
+
+
+
+
+def _parse_items_booking(text: str) -> List[dict]:
+    """Booking.com faktury (provize + poplatek za platební služby).
+    Typicky embedded text, měna EUR, a v položkách není klasická tabulka.
+    """
+    raw = text or ""
+    if "BOOKING.COM" not in raw.upper():
+        return []
+    lines = [ln.replace("\xa0"," ").strip() for ln in raw.splitlines() if ln.strip()]
+    items: List[dict] = []
+    # Rezervace ... Provize: "Rezervace EUR 15 760,91 EUR 3 625,00"
+    for ln in lines:
+        if ln.lower().startswith("rezervace"):
+            amts = _amount_re.findall(ln)
+            if amts:
+                try:
+                    prov = _norm_amount(amts[-1])
+                    items.append({
+                        "name": "Provize (rezervace)",
+                        "quantity": 1.0,
+                        "unit_price": float(prov),
+                        "vat_rate": 0.0,
+                        "line_total": float(prov),
+                    })
+                except Exception:
+                    pass
+        if "poplatek" in ln.lower() and "platebn" in ln.lower():
+            amts = _amount_re.findall(ln)
+            if amts:
+                try:
+                    fee = _norm_amount(amts[-1])
+                    items.append({
+                        "name": "Poplatek za platební služby",
+                        "quantity": 1.0,
+                        "unit_price": float(fee),
+                        "vat_rate": 0.0,
+                        "line_total": float(fee),
+                    })
+                except Exception:
+                    pass
+    # dedupe
+    uniq: List[dict] = []
+    seen=set()
+    for it in items:
+        key=(it["name"], round(float(it["line_total"]),2))
+        if key in seen: 
+            continue
+        seen.add(key)
+        uniq.append(it)
+    return uniq
+
+
+def _parse_items_organic_restaurant(text: str) -> List[dict]:
+    """Faktura Organic Restaurant (POHODA) – 2 řádky položek v tabulce.
+
+    OCR často rozbije tabulku, ale sazba DPH (%) a KČ celkem bývají na stejné řádce.
+    """
+    raw = text or ""
+    if "ORGANIC RESTAUR" not in raw.upper():
+        return []
+    lines = [ln.replace("\xa0"," ").strip() for ln in raw.splitlines()]
+    # najdi sekci tabulky
+    start = None
+    for i, ln in enumerate(lines):
+        if "OZNACENI" in ln.upper() and "DOD" in ln.upper():
+            start = i
+            break
+    if start is None:
+        start = 0
+
+    items: List[dict] = []
+    pending_name: Optional[str] = None
+    for i in range(start, len(lines)):
+        ln = lines[i]
+        if not ln:
+            continue
+        if ln.strip().startswith("-"):
+            nm = ln.strip().lstrip("-").strip()
+            if nm:
+                pending_name = nm
+            continue
+        if _STOP_ITEMS_RE.search(ln):
+            break
+        # řádek s čísly a % – např. "1 3 392,86 ... 12% ... 3 800,00"
+        mvat = re.search(r"\b(\d{1,2})\s*%\b", ln)
+        amts = _amount_re.findall(ln)
+        qty_m = re.match(r"^(\d+(?:[.,]\d+)?)\b", ln)
+        if mvat and len(amts) >= 2 and qty_m and pending_name:
+            try:
+                qty = _safe_float(qty_m.group(1))
+                unit_price = _norm_amount(amts[0])
+                line_total = _norm_amount(amts[-1])
+                vat = float(mvat.group(1))
+                items.append({
+                    "name": pending_name,
+                    "quantity": float(qty),
+                    "unit_price": float(unit_price),
+                    "vat_rate": float(vat),
+                    "line_total": float(line_total),
+                })
+                pending_name = None
+            except Exception:
+                continue
+    return items
+
+
+def _parse_items_albert(text: str) -> List[dict]:
+    """Albert účtenky (často sken s 2 účtenkami vedle sebe).
+
+    Cíl: vytěžit položky alespoň z jedné účtenky deterministicky i při rozbitém OCR.
+    Podporuje:
+      - kusové položky: "6 x 3,90 Kč"
+      - vážené položky: "0,875 kg x 29,90 Kč/kg 26,2"
+      - řádky kde je název zvlášť a kvantita/cena na dalším řádku
+    """
+    raw = text or ""
+    if "ALBERT" not in raw.lower():
+        return []
+
+    lines = [ln.replace("\xa0"," ").strip() for ln in raw.splitlines() if ln.strip()]
+    # pomocné regexy
+    count_line = re.compile(
+        r"^(?P<qty>\d+(?:[.,]\d+)?)\s*[xX×]\s*(?P<unit>\d+[\d\s]*[.,]\d{2})\s*(?:Kc|Kč|CZK)?\s*$",
+        re.IGNORECASE,
+    )
+    weight_line = re.compile(
+        r"^(?P<qty>\d+(?:[.,]\d+)?)\s*kg\s*[xX×]\s*(?P<unit>\d+[\d\s]*[.,]\d{2})\s*(?:Kc|Kč|CZK)?\s*/\s*kg\s*(?P<total>\d+[\d\s]*[.,]\d{2})?\s*(?P<vat_letter>[A-Z])?\s*$",
+        re.IGNORECASE,
+    )
+    inline_weight = re.compile(
+        r"^(?P<name>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s*kg\s*[xX×]\s*(?P<unit>\d+[\d\s]*[.,]\d{2}).*?(?P<total>\d+[\d\s]*[.,]\d{2})\s*(?P<vat_letter>[A-Z])?\s*$",
+        re.IGNORECASE,
+    )
+    inline_count = re.compile(
+        r"^(?P<name>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s*[xX×]\s*(?P<unit>\d+[\d\s]*[.,]\d{2}).*?(?P<total>\d+[\d\s]*[.,]\d{2})\s*(?P<vat_letter>[A-Z])?\s*$",
+        re.IGNORECASE,
+    )
+
+    def _vat_from_letter(letter: str | None) -> float:
+        if not letter:
+            return 0.0
+        return float(_VAT_LETTER_MAP.get(str(letter).upper(), 0.0))
+
+    items: List[dict] = []
+    pending_name: Optional[str] = None
+
+    for ln in lines:
+        if _STOP_ITEMS_RE.search(ln):
+            break
+        # skip obvious headers
+        if re.search(r"^(DATUM|DOKLAD|POKLADNA|VRATIT|KORUNA|CELKEM|BODY|AKTIVUJTE)\b", ln, re.IGNORECASE):
+            continue
+
+        # inline parsers first
+        m = inline_weight.match(ln)
+        if m:
+            try:
+                name = m.group("name").strip(" -:")
+                qty = _safe_float(m.group("qty"))
+                unit = _norm_amount(m.group("unit"))
+                total = _norm_amount(m.group("total"))
+                vat = _vat_from_letter(m.group("vat_letter"))
+                items.append({"name": name, "quantity": float(qty), "unit_price": float(unit), "vat_rate": float(vat), "line_total": float(total)})
+                pending_name = None
+                continue
+            except Exception:
+                pass
+
+        m = inline_count.match(ln)
+        if m:
+            try:
+                name = m.group("name").strip(" -:")
+                qty = _safe_float(m.group("qty"))
+                unit = _norm_amount(m.group("unit"))
+                total = _norm_amount(m.group("total"))
+                vat = _vat_from_letter(m.group("vat_letter"))
+                items.append({"name": name, "quantity": float(qty), "unit_price": float(unit), "vat_rate": float(vat), "line_total": float(total)})
+                pending_name = None
+                continue
+            except Exception:
+                pass
+
+        # name-only line
+        if re.fullmatch(r"[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ0-9 .,'/\-]{4,}", ln) and not re.search(r"\d+[\s\d]*[.,]\d{2}", ln):
+            pending_name = ln.strip()
+            continue
+
+        # weight line without name (use pending_name)
+        mw = weight_line.match(ln)
+        if mw and pending_name:
+            try:
+                qty = _safe_float(mw.group("qty"))
+                unit = _norm_amount(mw.group("unit"))
+                total_s = mw.group("total")
+                total = _norm_amount(total_s) if total_s else float(qty) * float(unit)
+                vat = _vat_from_letter(mw.group("vat_letter"))
+                items.append({"name": pending_name, "quantity": float(qty), "unit_price": float(unit), "vat_rate": float(vat), "line_total": float(total)})
+                pending_name = None
+                continue
+            except Exception:
+                pass
+
+        mc = count_line.match(ln)
+        if mc and pending_name:
+            try:
+                qty = _safe_float(mc.group("qty"))
+                unit = _norm_amount(mc.group("unit"))
+                total = float(qty) * float(unit)
+                items.append({"name": pending_name, "quantity": float(qty), "unit_price": float(unit), "vat_rate": 0.0, "line_total": float(total)})
+                pending_name = None
+                continue
+            except Exception:
+                pass
+
+    # filtruj nesmysly a dedupe
+    uniq: List[dict] = []
+    seen=set()
+    for it in items:
+        nm = str(it.get("name") or "").strip()
+        if len(nm) < 2:
+            continue
+        key=(nm, round(float(it.get("line_total") or 0.0),2), round(float(it.get("quantity") or 0.0),3))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(it)
+    return uniq
+
 
 
 def extract_from_text(text: str) -> Extracted:
@@ -697,6 +1333,7 @@ def extract_from_text(text: str) -> Extracted:
 
     date_s = _find_first([
         re.compile(r"Datum\s+vystaven[ií]\s*[: ]\s*([0-9]{1,2}\.\s*[0-9]{1,2}\.\s*[0-9]{2,4})", re.IGNORECASE),
+        re.compile(r"Datum\s+vystaven[ií]\s*[: ]\s*(\d{1,2}\.\s*[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽáčďéěíňóřšťúůýž]+\s*\d{4})", re.IGNORECASE),
         re.compile(r"Datum\s*[: ]\s*([0-9]{1,2}\.\s*[0-9]{1,2}\.\s*[0-9]{2,4})", re.IGNORECASE),
         # Účtenky často mají datum bez labelu, někdy i s časem (čas ignorujeme)
         re.compile(r"\b([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{2,4})\b"),
@@ -705,7 +1342,7 @@ def extract_from_text(text: str) -> Extracted:
     issue_date = _parse_date(date_s) if date_s else None
 
     # currency
-    currency = "CZK" if re.search(r"\bCZK\b|Kč", t) else "EUR" if re.search(r"\bEUR\b", t) else "CZK"
+    currency = "EUR" if re.search(r"\bEUR\b", t) else "CZK" if re.search(r"\bCZK\b|Kč", t) else "CZK"
 
     # total
     total_s = _find_first([
@@ -742,27 +1379,37 @@ def extract_from_text(text: str) -> Extracted:
         items = _parse_items_ks_line_based(t)
 
     
-    # Wolt faktury: řádky typu "<název> 12% 2 214,90 429,80" (bez "Kč" u čísel)
+    # Wolt faktury / účtenky (Wolt Market apod.)
+    if (not items) or ("WOLT" in t.upper() and len(items) < 3):
+        items = _parse_items_wolt(t)
+
+
+    # OMV účtenky (palivo) - typicky sken/OCR
     if not items:
-        wolt_pat = re.compile(
-            r"^(?P<name>.+?)\s+(?P<vat>\d{1,2})%\s+(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<unit>\d+[\s\d]*[.,]\d{2})\s+(?P<total>-?\d+[\s\d]*[.,]\d{2})\s*$"
-        )
-        for ln in t.splitlines():
-            ln = ln.strip()
-            if not ln or len(ln) < 6:
-                continue
-            m = wolt_pat.match(ln)
-            if not m:
-                continue
-            try:
-                name = m.group("name").strip()
-                qty = _safe_float(m.group("qty"))
-                unit_price = _norm_amount(m.group("unit"))
-                vat = float(m.group("vat"))
-                line_total = _norm_amount(m.group("total"))
-                items.append({"name": name, "quantity": qty, "unit_price": unit_price, "vat_rate": vat, "line_total": line_total})
-            except Exception:
-                continue
+        items = _parse_items_omv(t)
+
+
+    # Deus Inferis (neplátce DPH): 1 řádek tabulky + "POPIS"
+    if not items:
+        items = _parse_items_deus_inferis(t)
+
+    # Data-Design-Dobeš: numeric řádky oddělené od popisu (často rozbitá desetinná čárka)
+    if not items:
+        items = _parse_items_dobes(t)
+
+
+    # Booking.com faktury: provize + poplatek
+    if not items:
+        items = _parse_items_booking(t)
+
+    # Organic Restaurant (POHODA): tabulka 2 položek
+    if not items:
+        items = _parse_items_organic_restaurant(t)
+
+    # Albert účtenky (retail)
+    if not items:
+        items = _parse_items_albert(t)
+
 
     # Better-hotel / Mevris: popis položky je často na 1-2 řádcích a ceny jsou ve formátu "... 294.14 CZK 1 294.14 CZK 355.91 CZK"
     if not items:

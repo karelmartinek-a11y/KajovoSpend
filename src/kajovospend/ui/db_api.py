@@ -7,7 +7,7 @@ from sqlalchemy import select, text, func, case
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem, ImportJob
+from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem, ImportJob, ServiceState
 
 
 def counts(session: Session) -> Dict[str, int]:
@@ -624,3 +624,7 @@ def list_items(
 def service_jobs(session: Session, limit: int = 200) -> List[ImportJob]:
     stmt = select(ImportJob).order_by(ImportJob.created_at.desc()).limit(limit)
     return list(session.execute(stmt).scalars().all())
+
+
+def service_state(session: Session) -> ServiceState | None:
+    return session.execute(select(ServiceState).where(ServiceState.singleton == 1)).scalar_one_or_none()

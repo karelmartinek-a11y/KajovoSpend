@@ -39,7 +39,7 @@ copy config.example.yaml config.yaml
 ## Spuštění
 
 ```powershell
-.\.venv\Scripts\python.exe app_gui.py
+.\.venv\Scripts\python.exe -m app_gui
 ```
 
 ## Práce s importem
@@ -63,3 +63,14 @@ SQLite je v `%LOCALAPPDATA%\\KajovoSpend\\kajovospend.sqlite` (pokud v configu n
 ## Logy
 
 `%LOCALAPPDATA%\\KajovoSpend\\logs\\kajovospend_gui.log`.
+
+
+## Spuštění GUI
+
+Doporučené:
+
+- `py -m app_gui` (Windows)
+
+Alternativně lze spustit přímo skript:
+
+- `py run_gui.py`

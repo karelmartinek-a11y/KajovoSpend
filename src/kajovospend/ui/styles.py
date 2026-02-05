@@ -128,4 +128,25 @@ QProgressBar::chunk {
   border-radius: 8px;
   background: #2563EB;
 }
+
+
+QDialog, QMessageBox {
+  background: #0F172A;
+  color: #E5E7EB;
+  border: 1px solid #253041;
+  border-radius: 10px;
+}
+QMessageBox QLabel, QDialog QLabel { color: #E5E7EB; }
+QMessageBox QPushButton, QDialog QPushButton {
+  min-width: 88px;
+}
+
+QWidget#DashTile {
+  background: #111827;
+  border: 1px solid #253041;
+  border-radius: 12px;
+}
+QLabel#DashTitle { color: #E5E7EB; font-weight: 700; }
+QLabel#DashValue { color: #93C5FD; font-weight: 800; font-size: 22px; }
+QLabel#DashHeadline { color: #E5E7EB; font-size: 14px; font-weight: 700; }
 """

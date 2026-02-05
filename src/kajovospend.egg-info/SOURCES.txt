@@ -13,10 +13,12 @@ src/kajovospend/db/queries.py
 src/kajovospend/db/session.py
 src/kajovospend/extract/__init__.py
 src/kajovospend/extract/parser.py
+src/kajovospend/extract/structured_pdf.py
 src/kajovospend/integrations/__init__.py
 src/kajovospend/integrations/ares.py
 src/kajovospend/integrations/openai_fallback.py
 src/kajovospend/ocr/__init__.py
+src/kajovospend/ocr/geometry.py
 src/kajovospend/ocr/pdf_render.py
 src/kajovospend/ocr/rapidocr_engine.py
 src/kajovospend/service/__init__.py
@@ -32,6 +34,8 @@ src/kajovospend/ui/styles.py
 src/kajovospend/utils/__init__.py
 src/kajovospend/utils/config.py
 src/kajovospend/utils/hashing.py
+src/kajovospend/utils/iban.py
 src/kajovospend/utils/logging_setup.py
 src/kajovospend/utils/paths.py
+src/kajovospend/utils/qr_spayd.py
 src/kajovospend/utils/text_quality.py

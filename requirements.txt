@@ -22,3 +22,9 @@ openpyxl==3.1.5
 
 # editable install projektu
 -e .
+
+# Geometrické předzpracování (deskew/perspektiva)
+opencv-python-headless==4.10.0.84
+
+# QR (SPAYD) dekódování – preferováno, pokud jsou dostupné wheels
+zxing-cpp==2.3.0

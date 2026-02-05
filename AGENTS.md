@@ -17,7 +17,7 @@
 ## Project Structure & Modules
 - `src/kajovospend/`: aplikační kód – databázové modely, service (watcher/processor), UI (Qt/PySide6) a utilitky.
 - `service_main.py`: start služby (filesystem watcher + job queue).
-- `app_gui.py`: desktop GUI klient.
+- `app_gui/`: balíček se startem GUI pro `py -m app_gui` (interně volá `run_gui.py`).
 - `assets/`: ikony a grafika, `INPUT/` a `OUTPUT/` slouží jako pracovní adresáře.
 - `scripts/`: helpery (např. stažení OCR modelů, registrace služby).
 - `tests/`: připravené místo pro testy (zatím prázdné).
@@ -26,7 +26,7 @@
 - Vytvoř venv: `python -m venv .venv && .\\.venv\\Scripts\\activate` (Windows).
 - Závislosti: `pip install -r requirements.txt`.
 - Služba: `python service_main.py --config config.yaml` (watcher běží proti `paths.input_dir`).
-- GUI: `python app_gui.py` (načte/uloží `config.yaml`, komunikuje se službou).
+- GUI: `python -m app_gui` (načte/uloží `config.yaml`, komunikuje se službou; alternativně `py run_gui.py`).
 
 ## Coding Style & Naming
 - Python 3.13+, preferuj typové anotace a f-strings.

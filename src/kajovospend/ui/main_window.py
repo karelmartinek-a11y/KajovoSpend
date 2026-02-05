@@ -7,19 +7,23 @@ from pathlib import Path
 import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl, QPointF
+from PIL import Image, ImageFilter, ImageOps
+
+from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl, QPointF, QRectF
 from PySide6.QtGui import QIcon, QPixmap, QImage, QDesktopServices, QPainter, QPen, QColor, QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QTabWidget, QTableView,
     QLineEdit, QFormLayout, QSplitter, QTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QFileDialog,
     QMessageBox, QDateEdit, QDialog, QDialogButtonBox, QHeaderView, QAbstractItemView,
-    QCheckBox, QProgressDialog, QApplication, QInputDialog, QScrollArea,
+    QCheckBox, QProgressDialog, QApplication, QInputDialog, QScrollArea, QStyledItemDelegate,
 )
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
 from sqlalchemy import select, text
 
 from kajovospend.utils.config import load_yaml, save_yaml, deep_set
+import requests
+import requests
 from kajovospend.utils.paths import resolve_app_paths
 from kajovospend.utils.logging_setup import setup_logging
 from kajovospend.db.session import make_engine, make_session_factory
@@ -27,6 +31,11 @@ from kajovospend.db.migrate import init_db
 from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem, ImportJob
 from kajovospend.db.queries import upsert_supplier, rebuild_fts_for_document
 from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
+from kajovospend.integrations.openai_fallback import (
+    OpenAIConfig,
+    extract_with_openai_fallback,
+    list_models,
+)
 from kajovospend.service.processor import Processor
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 
@@ -82,6 +91,146 @@ class PdfPreviewView(QGraphicsView):
         super().wheelEvent(event)
 
 
+
+class TrafficLightDelegate(QStyledItemDelegate):
+    """Renders a simple traffic-light dot based on model value ('green'/'orange'/'red')."""
+
+    def paint(self, painter: QPainter, option, index):
+        v = index.data(Qt.DisplayRole)
+        # default color
+        col = QColor("#64748B")  # slate
+        if isinstance(v, str):
+            vv = v.lower()
+            if vv == "green":
+                col = QColor("#22C55E")
+            elif vv in ("orange", "amber", "yellow"):
+                col = QColor("#F59E0B")
+            elif vv == "red":
+                col = QColor("#EF4444")
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        r = option.rect
+        d = min(r.width(), r.height(), 18)
+        cx = r.x() + r.width() // 2
+        cy = r.y() + r.height() // 2
+        circle = QRectF(cx - d / 2, cy - d / 2, d, d)
+
+        painter.setPen(QPen(QColor("#0B1220"), 1))
+        painter.setBrush(col)
+        painter.drawEllipse(circle)
+        painter.restore()
+
+    def displayText(self, value, locale):
+        return ""
+
+
+def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
+    """Creates a small, consistent pictogram without external assets."""
+    img = QImage(size, size, QImage.Format_ARGB32)
+    img.fill(Qt.transparent)
+
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    stroke = QColor("#93C5FD")
+    fill = QColor("#1F2937")
+    accent = QColor("#2563EB")
+
+    def pen(w: int = 2, c: QColor | None = None) -> QPen:
+        q = QPen(c or stroke)
+        q.setWidth(w)
+        q.setCapStyle(Qt.RoundCap)
+        q.setJoinStyle(Qt.RoundJoin)
+        return q
+
+    s = size
+    if name == "inbox":
+        p.setPen(pen(2))
+        p.setBrush(fill)
+        p.drawRoundedRect(6, 10, s - 12, s - 16, 8, 8)
+        p.setBrush(Qt.NoBrush)
+        p.drawLine(10, 16, s - 10, 16)
+        p.setPen(pen(3, accent))
+        p.drawLine(s // 2, 6, s // 2, 18)
+        p.drawLine(s // 2, 18, s // 2 - 6, 12)
+        p.drawLine(s // 2, 18, s // 2 + 6, 12)
+    elif name == "quarantine":
+        p.setPen(pen(2))
+        p.setBrush(fill)
+        p.drawRoundedRect(8, 10, s - 16, s - 16, 8, 8)
+        p.setPen(pen(3, QColor("#F59E0B")))
+        p.drawLine(s // 2, 16, s // 2, s - 16)
+        p.drawPoint(s // 2, s - 12)
+    elif name == "duplicate":
+        p.setPen(pen(2))
+        p.setBrush(fill)
+        p.drawRoundedRect(10, 10, s - 18, s - 18, 8, 8)
+        p.drawRoundedRect(6, 6, s - 18, s - 18, 8, 8)
+    elif name == "status":
+        p.setPen(pen(2))
+        p.setBrush(fill)
+        p.drawRoundedRect(8, 8, s - 16, s - 16, 10, 10)
+        p.setPen(pen(3, QColor("#22C55E")))
+        p.drawLine(14, s // 2, s - 14, s // 2)
+    elif name == "clock":
+        p.setPen(pen(2))
+        p.setBrush(fill)
+        p.drawEllipse(8, 8, s - 16, s - 16)
+        p.setPen(pen(3, accent))
+        p.drawLine(s // 2, s // 2, s // 2, 14)
+        p.drawLine(s // 2, s // 2, s - 16, s // 2)
+    elif name == "db":
+        p.setPen(pen(2))
+        p.setBrush(fill)
+        p.drawRoundedRect(10, 10, s - 20, s - 20, 10, 10)
+        p.setPen(pen(2, accent))
+        p.drawLine(14, 18, s - 14, 18)
+        p.drawLine(14, 26, s - 14, 26)
+        p.drawLine(14, 34, s - 14, 34)
+    else:
+        p.setPen(pen(2))
+        p.setBrush(fill)
+        p.drawRoundedRect(8, 8, s - 16, s - 16, 10, 10)
+
+    p.end()
+    return QPixmap.fromImage(img)
+
+
+class DashboardTile(QWidget):
+    def __init__(self, title: str, *, icon: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("DashTile")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(12)
+
+        self.icon = QLabel()
+        self.icon.setFixedSize(46, 46)
+        self.icon.setPixmap(_make_icon_pixmap(icon, 44))
+        self.icon.setAlignment(Qt.AlignCenter)
+        self.icon.setObjectName("DashIcon")
+        lay.addWidget(self.icon)
+
+        mid = QVBoxLayout()
+        mid.setContentsMargins(0, 0, 0, 0)
+        mid.setSpacing(2)
+
+        self.lbl_title = QLabel(title)
+        self.lbl_title.setObjectName("DashTitle")
+        self.lbl_value = QLabel("-")
+        self.lbl_value.setObjectName("DashValue")
+        self.lbl_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        mid.addWidget(self.lbl_title)
+        mid.addWidget(self.lbl_value)
+        lay.addLayout(mid, 1)
+
+    def set_value(self, text: str) -> None:
+        self.lbl_value.setText(text)
+
+
 class TableModel(QAbstractTableModel):
     def __init__(self, headers: List[str], rows: List[List[Any]]):
         super().__init__()
@@ -120,7 +269,7 @@ class TableModel(QAbstractTableModel):
 
 class EditableItemsModel(QAbstractTableModel):
     """
-    Editovatelný model položek (LineItem) – používá se pro ÚČTY i NEROZPOZNANÉ.
+    Editovatelný model položek (LineItem) – používá se pro Účty i NEROZPOZNANÉ.
     Udržuje i interní ID položky, aby šlo ukládat změny zpět do DB.
     """
 
@@ -540,6 +689,8 @@ class MainWindow(QMainWindow):
         self._dash_last_counts: Dict[str, Any] | None = None
         self._import_running = False
         self._import_status = "Připraveno."
+        self._last_run_error: str | None = None
+        self._last_run_success: str | None = None
 
         # selection model guards to prevent duplicate signal connections after model resets
         self._docs_sel_model = None
@@ -554,7 +705,7 @@ class MainWindow(QMainWindow):
         self._items_rows: List[Dict[str, Any]] = []
         self._items_current_path: str | None = None
 
-        # current selections (ÚČTY / NEROZPOZNANÉ)
+        # current selections (Účty / NEROZPOZNANÉ)
         self._current_doc_id: int | None = None
         self._current_doc_file_id: int | None = None
         self._current_doc_path: str | None = None
@@ -582,6 +733,9 @@ class MainWindow(QMainWindow):
         if ico.exists():
             self.setWindowIcon(QIcon(str(ico)))
 
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(QSS)
         self.setStyleSheet(QSS)
 
         self._build_ui()
@@ -598,6 +752,24 @@ class MainWindow(QMainWindow):
         cfg.setdefault("paths", {})
         cfg.setdefault("ocr", {})
         cfg.setdefault("openai", {})
+        openai_cfg = cfg.get("openai") or {}
+        if isinstance(openai_cfg, dict):
+            openai_cfg.setdefault("enabled", False)
+            openai_cfg.setdefault("auto_enable", True)
+            openai_cfg.setdefault("primary_enabled", True)
+            openai_cfg.setdefault("fallback_enabled", True)
+            openai_cfg.setdefault("model", "auto")
+            openai_cfg.setdefault("fallback_model", "")
+            openai_cfg.setdefault("use_json_schema", True)
+            openai_cfg.setdefault("temperature", 0.0)
+            openai_cfg.setdefault("max_output_tokens", 2000)
+            openai_cfg.setdefault("timeout_sec", 60)
+            openai_cfg.setdefault("image_dpi", 300)
+            openai_cfg.setdefault("image_max_pages", 3)
+            openai_cfg.setdefault("image_enhance", True)
+            openai_cfg.setdefault("image_variants", 2)
+            openai_cfg.setdefault("allow_synthetic_items", False)
+            cfg["openai"] = openai_cfg
         cfg.setdefault("performance", {})
         return cfg
 
@@ -896,123 +1068,79 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         v.addWidget(self.tabs, 1)
 
-                # RUN
+                
+        # RUN
         self.tab_run = QWidget()
         rl = QVBoxLayout(self.tab_run)
+        rl.setContentsMargins(12, 12, 12, 12)
+        rl.setSpacing(12)
 
-        split_run = QSplitter(Qt.Vertical)
-        rl.addWidget(split_run, 1)
+        # Top row: Import button + high-level status
+        top = QWidget()
+        top_l = QHBoxLayout(top)
+        top_l.setContentsMargins(0, 0, 0, 0)
+        top_l.setSpacing(12)
 
-        # Top half: process info
-        top_run = QWidget()
-        top_run.setObjectName("Panel")
-        trl = QVBoxLayout(top_run)
-
-        row = QWidget()
-        rhl = QHBoxLayout(row)
-        rhl.setContentsMargins(0, 0, 0, 0)
-        rhl.setSpacing(14)
-
-        self.btn_import = QPushButton("IMPORTUJ")
+        self.btn_import = QPushButton("IMPORT")
         self.btn_import.setToolTip("Zařadí soubory z INPUT do fronty zpracování")
 
         self.lbl_run_status = QLabel(self._import_status)
         self.lbl_run_status.setWordWrap(True)
+        self.lbl_run_status.setObjectName("DashHeadline")
 
-        self.ico_quarantine = QLabel()
-        self.ico_quarantine.setPixmap(self._icon_pixmap("quarantine", 26))
-        self.lbl_quarantine_count = QLabel("0")
-        self.lbl_quarantine_count.setFont(self._stat_number_font(14, bold=True))
-        self.ico_quarantine.setToolTip("Počet účtů v karanténě")
-        self.lbl_quarantine_count.setToolTip("Počet účtů v karanténě")
+        top_l.addWidget(self.btn_import)
+        top_l.addWidget(self.lbl_run_status, 1)
 
-        self.ico_duplicates = QLabel()
-        self.ico_duplicates.setPixmap(self._icon_pixmap("duplicate", 26))
-        self.lbl_duplicates_count = QLabel("0")
-        self.lbl_duplicates_count.setFont(self._stat_number_font(14, bold=True))
-        self.ico_duplicates.setToolTip("Počet duplicitních účtů")
-        self.lbl_duplicates_count.setToolTip("Počet duplicitních účtů")
+        rl.addWidget(top)
 
-        rhl.addWidget(self.btn_import)
-        rhl.addWidget(self.lbl_run_status, 1)
+        # Dashboard grid (fills most of the RUN tab)
+        dash_wrap = QWidget()
+        dash_grid = QGridLayout(dash_wrap)
+        dash_grid.setContentsMargins(0, 0, 0, 0)
+        dash_grid.setHorizontalSpacing(12)
+        dash_grid.setVerticalSpacing(12)
 
-        rhl.addWidget(self.ico_quarantine)
-        rhl.addWidget(self.lbl_quarantine_count)
-        rhl.addSpacing(10)
-        rhl.addWidget(self.ico_duplicates)
-        rhl.addWidget(self.lbl_duplicates_count)
+        self._dash_tiles: dict[str, DashboardTile] = {}
+        self._stat_labels = {}  # reused by _apply_dashboard (DB stats)
 
-        trl.addWidget(row)
-        split_run.addWidget(top_run)
+        def add_tile(key: str, title: str, icon: str, r: int, c: int, rs: int = 1, cs: int = 1):
+            t = DashboardTile(title, icon=icon)
+            dash_grid.addWidget(t, r, c, rs, cs)
+            self._dash_tiles[key] = t
+            return t
 
-        # Bottom half: stats
-        bottom_run = QWidget()
-        bottom_run.setObjectName("Panel")
-        brl = QVBoxLayout(bottom_run)
+        add_tile("in_waiting", "IN čeká na zpracování", "inbox", 0, 0)
+        add_tile("quarantine_total", "Karanténa celkem", "quarantine", 0, 1)
+        add_tile("quarantine_dup", "Z toho duplicita", "duplicate", 0, 2)
+        add_tile("quarantine_fail", "Z toho nevytěženo", "quarantine", 1, 0)
 
-        self._stat_labels: Dict[str, QLabel] = {}
+        add_tile("import_power", "Import (zapnuto/vypnuto)", "status", 1, 1)
+        add_tile("import_activity", "Co se děje teď", "status", 1, 2)
 
-        stats_area = QScrollArea()
-        stats_area.setWidgetResizable(True)
-        stats_area.setFrameShape(QScrollArea.NoFrame)
+        add_tile("import_next", "Co následuje", "status", 2, 0)
+        add_tile("import_eta", "Odhad času do konce", "clock", 2, 1)
+        add_tile("queue", "Fronta / běží / zbývá", "status", 2, 2)
 
-        stats_wrap = QWidget()
-        grid = QGridLayout(stats_wrap)
-        grid.setContentsMargins(8, 8, 8, 8)
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(14)
+        t_docs = add_tile("receipts", "Kompletně vytěžené účty", "db", 3, 0)
+        t_sups = add_tile("suppliers", "Dodavatelé v DB", "db", 3, 1)
+        t_items = add_tile("items", "Položky v DB", "db", 3, 2)
+        t_sum = add_tile("sum_items_w_vat", "Hodnota položek s DPH", "db", 4, 0, 1, 2)
+        t_sum_wo = add_tile("sum_items_wo_vat", "Hodnota položek bez DPH", "db", 4, 2)
 
-        def add_stat(key: str, icon: str, tooltip: str, row: int, col: int):
-            card = QWidget()
-            card.setObjectName("Panel")
-            hl2 = QHBoxLayout(card)
-            hl2.setContentsMargins(10, 8, 10, 8)
-            hl2.setSpacing(10)
+        # Map tiles to old stat updater keys
+        self._stat_labels["receipts"] = t_docs.lbl_value
+        self._stat_labels["suppliers"] = t_sups.lbl_value
+        self._stat_labels["items"] = t_items.lbl_value
+        self._stat_labels["sum_items_w_vat"] = t_sum.lbl_value
+        self._stat_labels["sum_items_wo_vat"] = t_sum_wo.lbl_value
 
-            ico = QLabel()
-            ico.setPixmap(self._icon_pixmap(icon, 48))
-            ico.setToolTip(tooltip)
+        rl.addWidget(dash_wrap, 2)
 
-            val = QLabel("0")
-            val.setObjectName("CardValue")
-            val.setFont(self._stat_number_font(20, bold=True))
-            val.setToolTip(tooltip)
-
-            hl2.addWidget(ico)
-            hl2.addWidget(val, 1)
-
-            self._stat_labels[key] = val
-            grid.addWidget(card, row, col)
-
-        # 13 indicators, arranged 4 columns
-        add_stat("suppliers", "suppliers", "Počet dodavatelů (jen plně vytěžené účty)", 0, 0)
-        add_stat("receipts", "receipt", "Počet účtenek (jen plně vytěžené účty)", 0, 1)
-        add_stat("items", "items", "Počet položek (jen plně vytěžené účty)", 0, 2)
-
-        add_stat("pct_offline", "offline", "% úspěšně vytěžených účtenek offline", 1, 0)
-        add_stat("pct_api", "api", "% úspěšně vytěžených účtenek za pomoci API", 1, 1)
-        add_stat("pct_manual", "manual", "% ručně vytěžených účtenek", 1, 2)
-
-        add_stat("sum_items_wo_vat", "sum_wo_vat", "Celková částka položek bez DPH", 2, 0)
-        add_stat("sum_items_w_vat", "sum_w_vat", "Celková částka položek s DPH", 2, 1)
-        add_stat("avg_receipt", "avg_receipt", "Průměrná cena účtu", 2, 2)
-        add_stat("avg_item", "avg_item", "Průměrná cena položky", 2, 3)
-
-        add_stat("avg_items_per_receipt", "avg_items", "Průměrný počet položek na 1 účet", 3, 0)
-        add_stat("minmax_items_per_receipt", "minmax", "Min a max položek na 1 účtu", 3, 1)
-        add_stat("max_item_price", "max_item", "Nejdražší položka", 3, 2)
-
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
-        grid.setColumnStretch(3, 1)
-
-        stats_area.setWidget(stats_wrap)
-        brl.addWidget(stats_area, 1)
-
-        split_run.addWidget(bottom_run)
-        split_run.setStretchFactor(0, 1)
-        split_run.setStretchFactor(1, 2)
+        # Optional run log (keeps previous behaviour)
+        self.run_log = QTextEdit()
+        self.run_log.setReadOnly(True)
+        self.run_log.setPlaceholderText("Průběh zpracování…")
+        rl.addWidget(self.run_log, 1)
 
         self.tabs.addTab(self.tab_run, "RUN")
 
@@ -1024,19 +1152,35 @@ class MainWindow(QMainWindow):
         self.ops_table.setShowGrid(True)
         self.ops_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.ops_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ops_table.setItemDelegateForColumn(0, TrafficLightDelegate(self.ops_table))
+        self.ops_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.ops_table.setColumnWidth(0, 46)
         ol.addWidget(self.ops_table)
         self.tabs.addTab(self.tab_ops, "PROVOZNÍ PANEL")
 
-        # Podezřelé
-        self.tab_susp = QWidget()
-        sl = QVBoxLayout(self.tab_susp)
-        self.susp_table = QTableView()
-        self.susp_table.setAlternatingRowColors(True)
-        self.susp_table.setShowGrid(True)
-        self.susp_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.susp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        sl.addWidget(self.susp_table)
-        self.tabs.addTab(self.tab_susp, "PODEZŘELÉ DOKLADY")
+        # NEZPRACOVANÉ (sloučené podezřelé + nerozpoznané)
+        self.tab_unprocessed = QWidget()
+        ul = QVBoxLayout(self.tab_unprocessed)
+        self.unproc_table = QTableView()
+        self.unproc_table.setAlternatingRowColors(True)
+        self.unproc_table.setShowGrid(True)
+        self.unproc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.unproc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        ul.addWidget(self.unproc_table)
+
+        row_actions = QWidget()
+        rah = QHBoxLayout(row_actions)
+        rah.setContentsMargins(0, 0, 0, 0)
+        self.btn_unproc_openai = QPushButton("Odeslat na OpenAI")
+        self.btn_unproc_manual = QPushButton("Ručně vytěžit")
+        rah.addWidget(self.btn_unproc_openai)
+        rah.addWidget(self.btn_unproc_manual)
+        rah.addStretch(1)
+        ul.addWidget(row_actions)
+
+        self.tabs.addTab(self.tab_unprocessed, "NEZPRACOVANÉ")
+
+        # $
 
         # $
         self.tab_money = QWidget()
@@ -1046,6 +1190,7 @@ class MainWindow(QMainWindow):
         ml.addWidget(self.money_summary)
         self.tabs.addTab(self.tab_money, "$")
 
+        # Nastavení
         # Nastavení
         self.tab_settings = QWidget()
         stl = QVBoxLayout(self.tab_settings)
@@ -1064,10 +1209,201 @@ class MainWindow(QMainWindow):
         r4.addWidget(self.ed_output_dir, 1); r4.addWidget(self.btn_pick_output)
         form.addRow("Output adresář", row_out)
 
+        # OpenAI nastaveni
+        openai_cfg = self.cfg.get("openai", {}) if isinstance(self.cfg, dict) else {}
+        if not isinstance(openai_cfg, dict):
+            openai_cfg = {}
+        self.ed_api_key = QLineEdit(openai_cfg.get("api_key", ""))
+        self.ed_api_key.setEchoMode(QLineEdit.Password)
+        self.btn_api_show = QPushButton("Zobrazit")
+        self.btn_api_clear = QPushButton("Smazat")
+        self.btn_api_models = QPushButton("Načíst modely")
+        api_row = QWidget(); ar = QHBoxLayout(api_row); ar.setContentsMargins(0,0,0,0)
+        ar.addWidget(self.ed_api_key, 1); ar.addWidget(self.btn_api_show); ar.addWidget(self.btn_api_clear); ar.addWidget(self.btn_api_models)
+        form.addRow("OpenAI API key", api_row)
+
+        self.cb_openai_enabled = QCheckBox("Zapnout OpenAI")
+        self.cb_openai_enabled.setChecked(bool(openai_cfg.get("enabled", False)))
+        self.cb_openai_auto = QCheckBox("Auto-zapnout pri vyplnenem API key")
+        self.cb_openai_auto.setChecked(bool(openai_cfg.get("auto_enable", True)))
+        self.cb_openai_primary = QCheckBox("Primarni online extrakce (OpenAI)")
+        self.cb_openai_primary.setChecked(bool(openai_cfg.get("primary_enabled", True)))
+        self.cb_openai_fallback = QCheckBox("Povolit OpenAI fallback")
+        self.cb_openai_fallback.setChecked(bool(openai_cfg.get("fallback_enabled", True)))
+
+        self.ed_primary_model = QLineEdit(openai_cfg.get("model", "auto"))
+        self.ed_primary_model.setPlaceholderText("auto")
+        self.ed_fallback_model = QLineEdit(openai_cfg.get("fallback_model", ""))
+        self.ed_fallback_model.setPlaceholderText("auto / prazdne = stejny model")
+
+        self.cb_use_json_schema = QCheckBox("Vynutit JSON schema (strict)")
+        self.cb_use_json_schema.setChecked(bool(openai_cfg.get("use_json_schema", True)))
+
+        self.sp_temperature = QDoubleSpinBox()
+        self.sp_temperature.setDecimals(2)
+        self.sp_temperature.setSingleStep(0.05)
+        self.sp_temperature.setRange(0.0, 2.0)
+        self.sp_temperature.setValue(float(openai_cfg.get("temperature", 0.0) or 0.0))
+
+        self.sp_max_tokens = QSpinBox()
+        self.sp_max_tokens.setRange(200, 16000)
+        self.sp_max_tokens.setSingleStep(100)
+        self.sp_max_tokens.setValue(int(openai_cfg.get("max_output_tokens", 2000) or 2000))
+
+        self.sp_timeout = QSpinBox()
+        self.sp_timeout.setRange(10, 300)
+        self.sp_timeout.setSingleStep(5)
+        self.sp_timeout.setValue(int(openai_cfg.get("timeout_sec", 60) or 60))
+
+        self.sp_image_dpi = QSpinBox()
+        self.sp_image_dpi.setRange(100, 600)
+        self.sp_image_dpi.setSingleStep(50)
+        self.sp_image_dpi.setValue(int(openai_cfg.get("image_dpi", 300) or 300))
+
+        self.sp_image_max_pages = QSpinBox()
+        self.sp_image_max_pages.setRange(1, 5)
+        self.sp_image_max_pages.setValue(int(openai_cfg.get("image_max_pages", 3) or 3))
+
+        self.cb_image_enhance = QCheckBox("Zlepsit obraz pred odeslanim")
+        self.cb_image_enhance.setChecked(bool(openai_cfg.get("image_enhance", True)))
+
+        self.sp_image_variants = QSpinBox()
+        self.sp_image_variants.setRange(1, 3)
+        self.sp_image_variants.setValue(int(openai_cfg.get("image_variants", 2) or 2))
+
+        self.cb_allow_synth = QCheckBox("Povolit synteticke polozky jako posledni zachrana")
+        self.cb_allow_synth.setChecked(bool(openai_cfg.get("allow_synthetic_items", False)))
+
+        form.addRow("Primarni model", self.ed_primary_model)
+        form.addRow("Fallback model", self.ed_fallback_model)
+        form.addRow("Teplota", self.sp_temperature)
+        form.addRow("Max output tokens", self.sp_max_tokens)
+        form.addRow("Timeout (s)", self.sp_timeout)
+        form.addRow("Image DPI", self.sp_image_dpi)
+        form.addRow("Max stranky", self.sp_image_max_pages)
+        form.addRow("Varianta obrazu", self.sp_image_variants)
+        form.addRow(self.cb_use_json_schema)
+        form.addRow(self.cb_openai_enabled)
+        form.addRow(self.cb_openai_auto)
+        form.addRow(self.cb_openai_primary)
+        form.addRow(self.cb_openai_fallback)
+        form.addRow(self.cb_image_enhance)
+        form.addRow(self.cb_allow_synth)
+
+        # Tooltips (obsahle napovedy pro nastaveni)
+        self.ed_input_dir.setToolTip(
+            "Slozka pro nove dokumenty (skeny/uctenky).\n"
+            "Aplikace ji sleduje a nove soubory postupne zpracuje.\n"
+            "Pouzij stabilni cestu s pravem zapisu."
+        )
+        self.btn_pick_input.setToolTip("Vyber slozku pro vstupni dokumenty.")
+        self.ed_output_dir.setToolTip(
+            "Slozka pro vystupy z extrakce (napr. JSON, kopie, logy).\n"
+            "Program do ni zapisuje, musi byt zapisovatelna.\n"
+            "Doporuceno oddelit od vstupni slozky."
+        )
+        self.btn_pick_output.setToolTip("Vyber slozku pro vystupy zpracovani.")
+        self.ed_api_key.setToolTip(
+            "OpenAI API key pro online extrakci.\n"
+            "Ulozi se do lokalniho configu. Bez klice se online rezimy nespousti.\n"
+            "Vkladej cely klic, bez mezer."
+        )
+        self.btn_api_show.setToolTip(
+            "Prepina zobrazeni/skryti API key v poli.\n"
+            "Pozor na sdileni obrazovky."
+        )
+        self.btn_api_clear.setToolTip(
+            "Vymaze API key z pole (a po ulozeni i z configu)."
+        )
+        self.btn_api_models.setToolTip(
+            "Nacte seznam modelu z /v1/models pres zadany API key.\n"
+            "Vybrany model lze ulozit jako primarni nebo fallback."
+        )
+        self.ed_primary_model.setToolTip(
+            "Model pro primarni online extrakci.\n"
+            "Hodnota 'auto' vybere nejvhodnejsi dostupny model.\n"
+            "Muzes zadat i presny identifikator modelu."
+        )
+        self.ed_fallback_model.setToolTip(
+            "Model pro fallback pri nekompletni extrakci.\n"
+            "Prazdne = pouzije se primarni model.\n"
+            "Vhodne je nastavit robustnejsi (ale drazsi) model."
+        )
+        self.cb_openai_enabled.setToolTip(
+            "Manualni prepinac online extrakce.\n"
+            "Kdyz je zapnute auto-zapnuti, rozhoduje API key.\n"
+            "Kdyz auto vypnes, timto prepinacem OpenAI povolis/zakazes."
+        )
+        self.cb_openai_auto.setToolTip(
+            "Automaticky zapne OpenAI, pokud je vyplnen API key.\n"
+            "Vhodne pro bezobsluzny rezim bez rucniho prepinani."
+        )
+        self.cb_openai_primary.setToolTip(
+            "Primarni online extrakce pred heuristikami.\n"
+            "Zvyssuje presnost u tezko citelnych skenu, ale prodluzuje cas."
+        )
+        self.cb_openai_fallback.setToolTip(
+            "Druhe kolo OpenAI, kdyz data stale nejsou kompletni.\n"
+            "Typicky kdyz chybi polozky nebo soucty."
+        )
+        self.cb_use_json_schema.setToolTip(
+            "Vynuti striktni JSON schema pro vystup.\n"
+            "Zlepsuje spolehlivost struktury, ale muze byt prisnejsi."
+        )
+        self.sp_temperature.setToolTip(
+            "Teplota generovani (0.0-2.0).\n"
+            "Nizsi = deterministicke, vyssi = vice variace.\n"
+            "Prilis vysoka teplota muze zvysit riziko halucinaci."
+        )
+        self.sp_max_tokens.setToolTip(
+            "Limit velikosti odpovedi z OpenAI.\n"
+            "Prilis nizky limit muze orezat JSON.\n"
+            "Vyssi limit zvysuje cas i cenu."
+        )
+        self.sp_timeout.setToolTip(
+            "Maximalni doba cekani na OpenAI odpoved (sekundy).\n"
+            "Po vyprseni timeoutu se pouzije fallback/karantena."
+        )
+        self.sp_image_dpi.setToolTip(
+            "DPI pro rasterizaci PDF/obrazku pred odeslanim.\n"
+            "Vyssi DPI = lepsi cteni drobneho textu, ale vetsi data."
+        )
+        self.sp_image_max_pages.setToolTip(
+            "Maximalni pocet stranek odeslanych na OpenAI.\n"
+            "Zbytek stran se ignoruje (zrychleni a nizsi cena)."
+        )
+        self.cb_image_enhance.setToolTip(
+            "Aplikovat autokontrast a doostreni pred odeslanim.\n"
+            "Pomaha u bledych nebo zmuchlanych skenu."
+        )
+        self.sp_image_variants.setToolTip(
+            "Kolik variant obrazu poslat (1=jen original).\n"
+            "Vyssi hodnota = vice dat a vyssi sance na uspech."
+        )
         self.btn_save_settings = QPushButton("Uložit nastavení")
+
+        self.btn_reset_program = QPushButton("RESET PROGRAMU")
+        self.btn_reset_program.setToolTip(
+            "Smaže databázi i obsah adresářů IN/OUT a znovu ji inicializuje.\n"
+            "Vyžaduje heslo a potvrzení; akce je nevratná."
+        )
+        self.btn_reset_program.setStyleSheet(
+            "QPushButton {background-color:#b91c1c; color:white; font-weight:bold;} "
+            "QPushButton:hover {background-color:#dc2626;}"
+        )
+
+        self.cb_allow_synth.setToolTip(
+            "Povoli vytvoreni synteticke polozky z totalu jako posledni zachranu.\n"
+            "Pouzivej jen pokud je to akceptovatelne z pohledu kvality."
+        )
+        self.btn_save_settings.setToolTip(
+            "Ulozi nastaveni do configu.\n"
+            "Zmeny se projevi pro nove zpracovani."
+        )
 
         stl.addLayout(form)
         stl.addWidget(self.btn_save_settings)
+        stl.addWidget(self.btn_reset_program)
         self.tabs.addTab(self.tab_settings, "NASTAVENÍ")
 
         # Dodavatelé
@@ -1288,85 +1624,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
         dl2.addWidget(splitter, 1)
-        self.tabs.addTab(self.tab_docs, "ÚČTY")
-
-        # Nerozpoznané
-        self.tab_unrec = QWidget()
-        ul = QVBoxLayout(self.tab_unrec)
-
-        split_u = QSplitter()
-        split_u.setOrientation(Qt.Horizontal)
-
-        # Left: seznam + editace hlavičky (IČO/…)
-        left_u = QWidget(); lul = QVBoxLayout(left_u)
-        self.unrec_table = QTableView()
-        self.unrec_table.setAlternatingRowColors(True)
-        self.unrec_table.setShowGrid(True)
-        self.unrec_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.unrec_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.unrec_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        lul.addWidget(self.unrec_table, 2)
-
-        editor = QWidget(); el = QFormLayout(editor)
-        self.ed_u_ico = QLineEdit()
-        self.btn_u_apply_ico = QPushButton("Načíst z ARES")
-        ico_row_u = QWidget(); ico_l = QHBoxLayout(ico_row_u); ico_l.setContentsMargins(0, 0, 0, 0)
-        ico_l.addWidget(self.ed_u_ico, 1)
-        ico_l.addWidget(self.btn_u_apply_ico)
-
-        self.ed_u_docno = QLineEdit()
-        self.ed_u_bank = QLineEdit()
-        self.ed_u_date = QDateEdit(); self.ed_u_date.setCalendarPopup(True); self.ed_u_date.setDisplayFormat("dd.MM.yyyy")
-        self.ed_u_total = QDoubleSpinBox(); self.ed_u_total.setMaximum(1e12); self.ed_u_total.setDecimals(2)
-        self.btn_u_save = QPushButton("Uložit jako hotové (vyjmout z karantény)")
-        self.btn_u_save.setEnabled(False)
-
-        el.addRow("IČO", ico_row_u)
-        el.addRow("Číslo dokladu", self.ed_u_docno)
-        el.addRow("Číslo účtu", self.ed_u_bank)
-        el.addRow("Datum vystavení", self.ed_u_date)
-        el.addRow("Cena celkem vč. DPH", self.ed_u_total)
-        el.addRow(self.btn_u_save)
-        lul.addWidget(editor, 1)
-
-        split_u.addWidget(left_u)
-
-        # Right: náhled + položky
-        right_u = QWidget(); rul = QVBoxLayout(right_u)
-        srcrow_u = QWidget(); sur = QHBoxLayout(srcrow_u); sur.setContentsMargins(0, 0, 0, 0)
-        self.doc_src_line_u = QLineEdit(); self.doc_src_line_u.setReadOnly(True)
-        self.btn_open_source_u = QPushButton("Otevřít soubor")
-        self.btn_zoom_in_u = QPushButton("+"); self.btn_zoom_out_u = QPushButton("-"); self.btn_zoom_reset_u = QPushButton("Fit")
-        sur.addWidget(QLabel("Zdroj:")); sur.addWidget(self.doc_src_line_u, 1); sur.addWidget(self.btn_open_source_u)
-        sur.addWidget(self.btn_zoom_in_u); sur.addWidget(self.btn_zoom_out_u); sur.addWidget(self.btn_zoom_reset_u)
-        rul.addWidget(srcrow_u)
-
-        self.preview_view_u = PdfPreviewView()
-        rul.addWidget(self.preview_view_u, 3)
-
-        self.items_table_u = QTableView()
-        self.items_table_u.setAlternatingRowColors(True)
-        self.items_table_u.setShowGrid(True)
-        self.items_table_u.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.items_table_u.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        rul.addWidget(self.items_table_u, 2)
-
-        items_bar_u = QWidget()
-        iub = QHBoxLayout(items_bar_u); iub.setContentsMargins(0, 0, 0, 0)
-        self.btn_u_item_add = QPushButton("Přidat položku")
-        self.btn_u_item_del = QPushButton("Smazat položku")
-        for b in (self.btn_u_item_add, self.btn_u_item_del):
-            b.setEnabled(False)
-        iub.addWidget(self.btn_u_item_add)
-        iub.addWidget(self.btn_u_item_del)
-        iub.addStretch(1)
-        rul.addWidget(items_bar_u)
-
-        split_u.addWidget(right_u)
-        split_u.setStretchFactor(0, 2)
-        split_u.setStretchFactor(1, 3)
-        ul.addWidget(split_u, 1)
-        self.tabs.addTab(self.tab_unrec, "NEROZPOZNANÉ")
+        self.tabs.addTab(self.tab_docs, "Účty")
 
         self.setCentralWidget(root)
 
@@ -1377,6 +1635,10 @@ class MainWindow(QMainWindow):
         self.btn_pick_input.clicked.connect(lambda: self._pick_dir(self.ed_input_dir))
         self.btn_pick_output.clicked.connect(lambda: self._pick_dir(self.ed_output_dir))
         self.btn_save_settings.clicked.connect(self.on_save_settings)
+        self.btn_reset_program.clicked.connect(self._on_reset_program)
+        self.btn_api_show.clicked.connect(self._on_api_show_toggle)
+        self.btn_api_clear.clicked.connect(self._on_api_clear)
+        self.btn_api_models.clicked.connect(self._on_api_models)
 
         self.btn_sup_refresh.clicked.connect(self.refresh_suppliers)
         self._sup_filter_timer.timeout.connect(self.refresh_suppliers)
@@ -1388,6 +1650,9 @@ class MainWindow(QMainWindow):
         self.btn_sup_ares_detail.clicked.connect(self.on_supplier_ares)
         self.sup_table.clicked.connect(self.on_supplier_selected)
 
+        self.btn_unproc_openai.clicked.connect(self.on_unproc_openai)
+        self.btn_unproc_manual.clicked.connect(self.on_unproc_manual)
+
         # POLOŽKY (per-item search)
         self.btn_items_search.clicked.connect(self._items_new_search_v2)
         self.items_filter.returnPressed.connect(self._items_new_search_v2)
@@ -1395,7 +1660,7 @@ class MainWindow(QMainWindow):
         self.btn_items_open.clicked.connect(self._items_open_selected_v2)
         self.items_table.doubleClicked.connect(self._items_open_from_doubleclick_v2)
 
-        # ÚČTY – nová logika (plně editovatelný detail položek)
+        # Účty – nová logika (plně editovatelný detail položek)
         self.doc_filter.returnPressed.connect(self._docs_new_search_v2)
         self.btn_docs_search.clicked.connect(self._docs_new_search_v2)
         self.btn_docs_more.clicked.connect(self._docs_load_more_v2)
@@ -1410,17 +1675,6 @@ class MainWindow(QMainWindow):
         self.btn_items_del.clicked.connect(self._docs_item_del_v2)
         self.btn_items_save.clicked.connect(self._docs_items_save_v2)
 
-        # NEROZPOZNANÉ – stejná struktura + ruční dopisování položek + dodavatel podle IČO
-        self.unrec_table.clicked.connect(self._on_unrec_selected_v2)
-        self.btn_u_apply_ico.clicked.connect(self._unrec_apply_ico_v2)
-        self.btn_u_save.clicked.connect(self._unrec_save_done_v2)
-        self.btn_open_source_u.clicked.connect(self._open_selected_unrec_source_v2)
-        self.btn_zoom_in_u.clicked.connect(self.preview_view_u.zoom_in)
-        self.btn_zoom_out_u.clicked.connect(self.preview_view_u.zoom_out)
-        self.btn_zoom_reset_u.clicked.connect(self.preview_view_u.reset_zoom)
-        self.btn_u_item_add.clicked.connect(self._unrec_item_add_v2)
-        self.btn_u_item_del.clicked.connect(self._unrec_item_del_v2)
-
     def _docs_selection_changed_v2(self, *_args) -> None:
         try:
             sm = self.docs_table.selectionModel()
@@ -1429,17 +1683,6 @@ class MainWindow(QMainWindow):
             idx = sm.currentIndex()
             if idx and idx.isValid():
                 self._on_doc_selected_v2(idx)
-        except Exception:
-            pass
-
-    def _unrec_selection_changed_v2(self, *_args) -> None:
-        try:
-            sm = self.unrec_table.selectionModel()
-            if not sm:
-                return
-            idx = sm.currentIndex()
-            if idx and idx.isValid():
-                self._on_unrec_selected_v2(idx)
         except Exception:
             pass
 
@@ -1459,6 +1702,11 @@ class MainWindow(QMainWindow):
             self._refresh_dashboard_async()
         except Exception:
             pass
+        for fn in (self.refresh_run_state, self.refresh_ops, self.refresh_unprocessed):
+            try:
+                fn()
+            except Exception:
+                pass
 
     def _pick_dir(self, line_edit: QLineEdit):
         d = QFileDialog.getExistingDirectory(self, "Vyber adresář", line_edit.text() or str(Path.home()))
@@ -1596,7 +1844,7 @@ class MainWindow(QMainWindow):
         self._open_file_path(meta.get("current_path"))
 
     # ---------------------------
-    # V2: ÚČTY + NEROZPOZNANÉ
+    # V2: Účty + NEROZPOZNANÉ
     # ---------------------------
 
     def refresh_all_v2(self) -> None:
@@ -1614,7 +1862,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._docs_new_search_v2()
-        self._refresh_unrec_v2()
+        try:
+            self.refresh_unprocessed()
+        except Exception:
+            pass
+        try:
+            self.refresh_run_state()
+        except Exception:
+            pass
 
     def _safe_unique_path(self, target: Path) -> Path:
         if not target.exists():
@@ -1664,7 +1919,7 @@ class MainWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
 
-    # ---- ÚČTY (listing + detail) ----
+    # ---- Účty (listing + detail) ----
 
     def _docs_new_search_v2(self) -> None:
         self._doc_offset = 0
@@ -1921,321 +2176,11 @@ class MainWindow(QMainWindow):
     # ---- NEROZPOZNANÉ ----
 
     def _refresh_unrec_v2(self) -> None:
-        with self.sf() as session:
-            rows = db_api.list_quarantine(session)
-            doc_ids = [int(d.id) for d, _f in rows]
-            counts = {}
-            if doc_ids:
-                for did, c in session.execute(
-                    select(LineItem.document_id, text("COUNT(*)")).where(LineItem.document_id.in_(doc_ids)).group_by(LineItem.document_id)
-                ).all():
-                    counts[int(did)] = int(c)
+        """Zachováno kvůli zpětné kompatibilitě, aktuálně se nepoužívá."""
+        return
 
-        self._unrec_listing: List[Dict[str, Any]] = []
-        for d, f in rows:
-            did = int(d.id)
-            self._unrec_listing.append(
-                {
-                    "doc_id": did,
-                    "file_id": int(f.id),
-                    "path": f.current_path,
-                    "date": d.issue_date.isoformat() if d.issue_date else "",
-                    "total": float(d.total_with_vat or 0.0) if d.total_with_vat is not None else 0.0,
-                    "supplier_ico": (d.supplier_ico or "") or "",
-                    "items_count": counts.get(did, 0),
-                    "status": f.status or "",
-                }
-            )
-
-        headers = ["Datum", "Celkem vč. DPH", "Dodavatel (IČO)", "Počet položek", "Stav"]
-        trows = [[r["date"], r["total"], r["supplier_ico"], r["items_count"], r["status"]] for r in self._unrec_listing]
-        self.unrec_table.setModel(TableModel(headers, trows))
-
-        # clear detail
-        self._current_unrec_doc_id = None
-        self._current_unrec_file_id = None
-        self._current_unrec_path = None
-        self._current_unrec_items_model = None
-        self.doc_src_line_u.setText("")
-        self.preview_view_u.clear()
-        self.items_table_u.setModel(TableModel([], []))
-        self.btn_u_save.setEnabled(False)
-        for b in (self.btn_u_item_add, self.btn_u_item_del):
-            b.setEnabled(False)
-
-        # auto-select first row and hook selection change
-        try:
-            sm = self.unrec_table.selectionModel()
-            if sm:
-                if self._unrec_sel_model is not sm:
-                    if self._unrec_sel_connected and self._unrec_sel_model is not None:
-                        try:
-                            self._unrec_sel_model.selectionChanged.disconnect(self._unrec_selection_changed_v2)
-                        except Exception:
-                            pass
-                        self._unrec_sel_connected = False
-                    self._unrec_sel_model = sm
-                if not self._unrec_sel_connected:
-                    sm.selectionChanged.connect(self._unrec_selection_changed_v2)
-                    self._unrec_sel_connected = True
-            if self._unrec_listing:
-                idx = self.unrec_table.model().index(0, 0)
-                self.unrec_table.setCurrentIndex(idx)
-                self.unrec_table.selectRow(0)
-                self._on_unrec_selected_v2(idx)
-        except Exception:
-            pass
-
-    def _on_unrec_selected_v2(self, index: QModelIndex) -> None:
-        try:
-            row = int(index.row())
-        except Exception:
-            return
-        if not hasattr(self, "_unrec_listing") or row < 0 or row >= len(self._unrec_listing):
-            return
-        meta = self._unrec_listing[row]
-        doc_id = int(meta["doc_id"])
-        with self.sf() as session:
-            det = db_api.get_document_detail(session, doc_id)
-            doc: Document = det["doc"]
-            f: DocumentFile = det["file"]
-            items: List[LineItem] = det["items"]
-
-        self._current_unrec_doc_id = int(doc.id)
-        self._current_unrec_file_id = int(f.id) if f else None
-        self._current_unrec_path = f.current_path if f else None
-
-        # fill header fields (jen co se povedlo vytěžit)
-        self.ed_u_ico.setText(doc.supplier_ico or "")
-        self.ed_u_docno.setText(doc.doc_number or "")
-        self.ed_u_bank.setText(doc.bank_account or "")
-        if doc.issue_date:
-            try:
-                self.ed_u_date.setDate(doc.issue_date)
-            except Exception:
-                pass
-        self.ed_u_total.setValue(float(doc.total_with_vat or 0.0))
-
-        self.doc_src_line_u.setText(self._current_unrec_path or "")
-
-        rows = []
-        for it in items:
-            qty_val = float(it.quantity or 0.0)
-            denom = qty_val if qty_val else 1.0
-            try:
-                unit_price_val = float(getattr(it, "unit_price", None) or (float(it.line_total or 0.0) / denom))
-            except Exception:
-                unit_price_val = 0.0
-            rows.append(
-                {
-                    "id": int(it.id),
-                    "name": it.name or "",
-                    "quantity": float(it.quantity or 0.0),
-                    "unit_price": unit_price_val,
-                    "line_total": float(it.line_total or 0.0),
-                    "vat_rate": float(it.vat_rate or 0.0),
-                    "ean": getattr(it, "ean", "") or "",
-                    "item_code": getattr(it, "item_code", "") or "",
-                }
-            )
-        model = EditableItemsModel(rows)
-        self._current_unrec_items_model = model
-        self.items_table_u.setModel(model)
-        self.items_table_u.setSelectionMode(QAbstractItemView.SingleSelection)
-
-        self.btn_u_save.setEnabled(True)
-        for b in (self.btn_u_item_add, self.btn_u_item_del):
-            b.setEnabled(True)
-
-        QTimer.singleShot(0, lambda: self._load_preview(self.preview_view_u, self._current_unrec_path))
-
-    def _open_selected_unrec_source_v2(self) -> None:
-        self._open_file_path(self._current_unrec_path)
-
-    def _unrec_item_add_v2(self) -> None:
-        if not self._current_unrec_items_model:
-            return
-        self._current_unrec_items_model.insertRows(self._current_unrec_items_model.rowCount(), 1)
-
-    def _unrec_item_del_v2(self) -> None:
-        if not self._current_unrec_items_model:
-            return
-        sel = self.items_table_u.selectionModel()
-        if not sel or not sel.hasSelection():
-            return
-        row = int(sel.selectedRows()[0].row())
-        self._current_unrec_items_model.removeRows(row, 1)
-
-    def _unrec_apply_ico_v2(self) -> None:
-        if not self._current_unrec_doc_id:
-            return
-        ico_raw = (self.ed_u_ico.text() or "").strip()
-        if not ico_raw:
-            QMessageBox.warning(self, "Dodavatel", "Zadejte IČO.")
-            return
-        ico = normalize_ico(ico_raw) or ico_raw
-
-        def _fetch():
-            return fetch_by_ico(ico)
-
-        def _apply(data):
-            with self.sf() as session:
-                doc = session.get(Document, int(self._current_unrec_doc_id))
-                if not doc:
-                    return
-                sup = None
-                if data:
-                    sup = upsert_supplier(
-                        session,
-                        ico=ico,
-                        name=data.get("name"),
-                        dic=data.get("dic"),
-                        address=data.get("address"),
-                        is_vat_payer=data.get("is_vat_payer"),
-                        ares_last_sync=dt.datetime.utcnow(),
-                        legal_form=data.get("legal_form"),
-                        street=data.get("street"),
-                        street_number=data.get("street_number"),
-                        orientation_number=data.get("orientation_number"),
-                        city=data.get("city"),
-                        zip_code=data.get("zip_code"),
-                        overwrite=True,
-                    )
-                else:
-                    # minimální založení (pokud ARES nedá data)
-                    sup = upsert_supplier(session, ico=ico, overwrite=False)
-
-                doc.supplier_id = int(sup.id) if sup else None
-                doc.supplier_ico = ico
-                session.add(doc)
-                session.flush()
-
-                full_text = ""
-                try:
-                    if self._current_unrec_items_model:
-                        full_text = "\n".join(
-                            [(r.get("name") or "").strip() for r in self._current_unrec_items_model.rows() if (r.get("name") or "").strip()]
-                        )
-                except Exception:
-                    full_text = ""
-                rebuild_fts_for_document(session, int(doc.id), full_text=full_text)
-                session.commit()
-
-            QMessageBox.information(self, "Dodavatel", "Dodavatel byl aktualizován podle IČO.")
-            self._docs_new_search_v2()
-
-        self._run_with_busy("ARES", "Načítám dodavatele podle IČO…", _fetch, _apply)
-
-    def _unrec_save_done_v2(self) -> None:
-        if not self._current_unrec_doc_id or not self._current_unrec_file_id:
-            return
-        doc_id = int(self._current_unrec_doc_id)
-        file_id = int(self._current_unrec_file_id)
-        rows = self._current_unrec_items_model.rows() if self._current_unrec_items_model else []
-
-        with self.sf() as session:
-            doc = session.get(Document, doc_id)
-            f = session.get(DocumentFile, file_id)
-            if not doc or not f:
-                return
-
-            # update header fields
-            doc.supplier_ico = (normalize_ico((self.ed_u_ico.text() or "").strip()) or (self.ed_u_ico.text() or "").strip()) or None
-            doc.doc_number = (self.ed_u_docno.text() or "").strip() or None
-            doc.bank_account = (self.ed_u_bank.text() or "").strip() or None
-            try:
-                doc.issue_date = self.ed_u_date.date().toPython()
-            except Exception:
-                pass
-            doc.total_with_vat = float(self.ed_u_total.value())
-
-            # items: update/create/delete
-            existing = {int(it.id): it for it in session.execute(select(LineItem).where(LineItem.document_id == doc_id)).scalars().all()}
-            keep_ids = set()
-            line_no = 1
-            total_sum = 0.0
-            for r in rows:
-                rid = r.get("id")
-                name = (r.get("name") or "").strip() or f"Položka {line_no}"
-                qty = float(r.get("quantity") or 0.0)
-                up = float(r.get("unit_price") or 0.0)
-                lt = float(r.get("line_total") or 0.0)
-                if not lt and (qty or up):
-                    lt = qty * up
-                vr = float(r.get("vat_rate") or 0.0)
-                ean = (r.get("ean") or "").strip() or None
-                code = (r.get("item_code") or "").strip() or None
-                total_sum += float(lt or 0.0)
-
-                if rid and int(rid) in existing:
-                    it = existing[int(rid)]
-                    it.line_no = line_no
-                    it.name = name[:512]
-                    it.quantity = qty
-                    it.line_total = lt
-                    it.vat_rate = vr
-                    if hasattr(it, "ean"):
-                        it.ean = ean
-                    if hasattr(it, "item_code"):
-                        it.item_code = code
-                    session.add(it)
-                    keep_ids.add(int(it.id))
-                else:
-                    it = LineItem(
-                        document_id=doc_id,
-                        line_no=line_no,
-                        name=name[:512],
-                        quantity=qty,
-                        line_total=lt,
-                        vat_rate=vr,
-                    )
-                    if hasattr(it, "ean"):
-                        it.ean = ean
-                    if hasattr(it, "item_code"):
-                        it.item_code = code
-                    session.add(it)
-                line_no += 1
-
-            for it_id, it in existing.items():
-                if it_id not in keep_ids:
-                    session.delete(it)
-
-            if total_sum and (doc.total_with_vat is None or abs(float(doc.total_with_vat or 0.0) - total_sum) > 0.01):
-                doc.total_with_vat = float(total_sum)
-
-            session.add(doc)
-            session.flush()
-
-            # rebuild FTS
-            full_text = "\n".join([(r.get("name") or "").strip() for r in rows if (r.get("name") or "").strip()])
-            rebuild_fts_for_document(session, doc_id, full_text=full_text)
-
-            # move file out of quarantine to output_dir
-            src = Path(f.current_path or "")
-            out_dir = Path(self.cfg.get("paths", {}).get("output_dir") or "")
-            if not out_dir:
-                out_dir = self.paths.data_dir / "output"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            dst = self._safe_unique_path(out_dir / src.name)
-            try:
-                shutil.move(str(src), str(dst))
-            except Exception as exc:
-                QMessageBox.critical(self, "Karanténa", f"Nepodařilo se přesunout soubor:\n{exc}")
-                session.rollback()
-                return
-
-            f.current_path = str(dst)
-            f.status = "PROCESSED"
-            session.add(f)
-            session.commit()
-
-        QMessageBox.information(self, "Karanténa", "Doklad byl uložen jako hotový a přesunut z karantény.")
-        self._refresh_unrec_v2()
-        self._docs_new_search_v2()
-        try:
-            self._items_new_search_v2()
-        except Exception:
-            pass
+    def _on_unrec_selected_v2(self, index: QModelIndex) -> None:  # pragma: no cover - legacy stub
+        return
 
     def _render_pdf_preview_bytes(self, path: Path, dpi: int = 160) -> bytes | None:
         """
@@ -2278,8 +2223,168 @@ class MainWindow(QMainWindow):
     def on_save_settings(self):
         deep_set(self.cfg, ["paths", "input_dir"], self.ed_input_dir.text().strip())
         deep_set(self.cfg, ["paths", "output_dir"], self.ed_output_dir.text().strip())
+        deep_set(self.cfg, ["openai", "api_key"], "")  # API klíč se nikdy neukládá do YAML; použijte ENV KAJOVOSPEND_OPENAI_API_KEY
+        deep_set(self.cfg, ["openai", "enabled"], self.cb_openai_enabled.isChecked())
+        deep_set(self.cfg, ["openai", "auto_enable"], self.cb_openai_auto.isChecked())
+        deep_set(self.cfg, ["openai", "primary_enabled"], self.cb_openai_primary.isChecked())
+        deep_set(self.cfg, ["openai", "fallback_enabled"], self.cb_openai_fallback.isChecked())
+        deep_set(self.cfg, ["openai", "model"], self.ed_primary_model.text().strip())
+        deep_set(self.cfg, ["openai", "fallback_model"], self.ed_fallback_model.text().strip())
+        deep_set(self.cfg, ["openai", "use_json_schema"], self.cb_use_json_schema.isChecked())
+        deep_set(self.cfg, ["openai", "temperature"], float(self.sp_temperature.value()))
+        deep_set(self.cfg, ["openai", "max_output_tokens"], int(self.sp_max_tokens.value()))
+        deep_set(self.cfg, ["openai", "timeout_sec"], int(self.sp_timeout.value()))
+        deep_set(self.cfg, ["openai", "image_dpi"], int(self.sp_image_dpi.value()))
+        deep_set(self.cfg, ["openai", "image_max_pages"], int(self.sp_image_max_pages.value()))
+        deep_set(self.cfg, ["openai", "image_enhance"], self.cb_image_enhance.isChecked())
+        deep_set(self.cfg, ["openai", "image_variants"], int(self.sp_image_variants.value()))
+        deep_set(self.cfg, ["openai", "allow_synthetic_items"], self.cb_allow_synth.isChecked())
         save_yaml(self.config_path, self.cfg)
         QMessageBox.information(self, "Nastavení", "Uloženo.")
+
+    def _on_reset_program(self):
+        if self._import_running:
+            QMessageBox.warning(self, "RESET PROGRAMU", "Nejprve dokonči probíhající import.")
+            return
+
+        pwd, ok = QInputDialog.getText(self, "RESET PROGRAMU", "Zadej heslo pro reset:", QLineEdit.Password)
+        if not ok:
+            return
+        if pwd.strip() != "+Sin8glov8":
+            QMessageBox.warning(self, "RESET PROGRAMU", "Chybné heslo.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "RESET PROGRAMU",
+            "Tato akce smaže databázi a vyprázdní IN/OUT. Pokračovat?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        errors: list[str] = []
+
+        def _clear_dir(path_str: str) -> None:
+            if not path_str:
+                return
+            p = Path(path_str)
+            if not p.exists():
+                return
+            for child in p.iterdir():
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                except Exception as exc:
+                    errors.append(f"{child}: {exc}")
+
+        in_dir = self.ed_input_dir.text().strip() or str(self.cfg.get("paths", {}).get("input_dir") or "")
+        out_dir = self.ed_output_dir.text().strip() or str(self.cfg.get("paths", {}).get("output_dir") or "")
+
+        _clear_dir(in_dir)
+        _clear_dir(out_dir)
+
+        try:
+            self.engine.dispose()
+        except Exception as exc:
+            errors.append(f"DB dispose: {exc}")
+
+        try:
+            if self.paths.db_path.exists():
+                self.paths.db_path.unlink()
+        except Exception as exc:
+            errors.append(f"Smazání DB souboru: {exc}")
+
+        try:
+            self.paths.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.engine = make_engine(str(self.paths.db_path))
+            init_db(self.engine)
+            self.sf = make_session_factory(self.engine)
+            self.processor = Processor(self.cfg, self.paths, self.log)
+        except Exception as exc:
+            errors.append(f"Init nové DB: {exc}")
+
+        self._import_status = "Připraveno."
+        try:
+            self.lbl_run_status.setText(self._import_status)
+        except Exception:
+            pass
+
+        try:
+            self.refresh_all_v2()
+        except Exception as exc:
+            errors.append(f"Refresh UI: {exc}")
+
+        if errors:
+            QMessageBox.warning(self, "RESET PROGRAMU", "Hotovo s výjimkami:\n" + "\n".join(errors))
+        else:
+            QMessageBox.information(self, "RESET PROGRAMU", "Program byl vyresetován.")
+
+    def _on_api_show_toggle(self):
+        if self.ed_api_key.echoMode() == QLineEdit.Password:
+            self.ed_api_key.setEchoMode(QLineEdit.Normal)
+            self.btn_api_show.setText("Skrýt")
+        else:
+            self.ed_api_key.setEchoMode(QLineEdit.Password)
+            self.btn_api_show.setText("Zobrazit")
+
+    def _on_api_clear(self):
+        self.ed_api_key.clear()
+
+    def _on_api_models(self):
+        api_key = self.ed_api_key.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, "Modely OpenAI", "Nejdriv vypln API key.")
+            return
+        dlg = QProgressDialog("Nacitam modely...", "", 0, 0, self)
+        dlg.setWindowTitle("OpenAI")
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.show()
+        QApplication.processEvents()
+        try:
+            ids = list_models(api_key)
+        except Exception as e:
+            dlg.close()
+            QMessageBox.critical(self, "Modely OpenAI", f"Nelze nacist modely: {e}")
+            return
+        dlg.close()
+        if not ids:
+            QMessageBox.information(self, "Modely OpenAI", "Zadne modely nenalezeny.")
+            return
+        items = [i for i in ids if i.startswith("gpt")]
+        if not items:
+            items = ids
+        choice, ok = QInputDialog.getItem(self, "Modely OpenAI", "Vyber model:", items, 0, False)
+        if not ok or not choice:
+            return
+
+        target = None
+        if self.ed_primary_model.hasFocus():
+            target = "primary"
+        elif self.ed_fallback_model.hasFocus():
+            target = "fallback"
+        if target is None:
+            tchoice, tok = QInputDialog.getItem(
+                self,
+                "Pouzit model",
+                "Kam model ulozit?",
+                ["Primarni model", "Fallback model"],
+                0,
+                False,
+            )
+            if not tok:
+                return
+            target = "primary" if "Primarni" in tchoice else "fallback"
+
+        if target == "fallback":
+            self.ed_fallback_model.setText(choice)
+        else:
+            self.ed_primary_model.setText(choice)
 
     def _on_import_progress(self, msg: str) -> None:
         self._import_status = msg
@@ -2307,7 +2412,7 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.refresh_ops()
-            self.refresh_suspicious()
+            self.refresh_unprocessed()
             self.refresh_money()
         except Exception:
             pass
@@ -2356,6 +2461,10 @@ class MainWindow(QMainWindow):
             nonlocal cleaned
             if cleaned:
                 return
+            # nikdy nečekej na sebe sama; přeposlat do UI vlákna, pokud běžíme v pracovním vlákně
+            if QThread.currentThread() is th:
+                QTimer.singleShot(0, self, _cleanup_thread)
+                return
             cleaned = True
             try:
                 th.quit()
@@ -2381,141 +2490,35 @@ class MainWindow(QMainWindow):
 
         th.start()
 
-    def refresh_all(self):
-        self.refresh_dashboard()
-        self.refresh_suppliers()
-        self.refresh_documents()
-        self.refresh_unrecognized()
-        self.refresh_ops()
-        self.refresh_suspicious()
-        self.refresh_money()
-
-    def refresh_dashboard(self):
-        # Keep API compatibility, but do not block UI thread.
-        self._refresh_dashboard_async()
-
-    def _apply_dashboard(self, c: Dict[str, Any] | None, rs: Dict[str, Any] | None) -> None:
-        try:
-            self.lbl_run_status.setText(self._import_status)
-        except Exception:
-            pass
-
-        if c:
-            try:
-                self.lbl_quarantine_count.setText(str(int(c.get("quarantine", 0) or 0)))
-                self.lbl_duplicates_count.setText(str(int(c.get("duplicates", 0) or 0)))
-            except Exception:
-                pass
-
-        if not rs:
-            return
-
-        def fmt_int(n: int) -> str:
-            return f"{int(n):,}".replace(",", " ")
-
-        def fmt_money(x: float) -> str:
-            return f"{float(x):,.2f}".replace(",", " ")
-
-        def fmt_pct(x: float) -> str:
-            return f"{float(x):.1f} %"
-
-        try:
-            if "suppliers" in self._stat_labels:
-                self._stat_labels["suppliers"].setText(fmt_int(rs.get("suppliers", 0) or 0))
-            if "receipts" in self._stat_labels:
-                self._stat_labels["receipts"].setText(fmt_int(rs.get("receipts", 0) or 0))
-            if "items" in self._stat_labels:
-                self._stat_labels["items"].setText(fmt_int(rs.get("items", 0) or 0))
-
-            if "pct_offline" in self._stat_labels:
-                self._stat_labels["pct_offline"].setText(fmt_pct(rs.get("pct_offline", 0.0) or 0.0))
-            if "pct_api" in self._stat_labels:
-                self._stat_labels["pct_api"].setText(fmt_pct(rs.get("pct_api", 0.0) or 0.0))
-            if "pct_manual" in self._stat_labels:
-                self._stat_labels["pct_manual"].setText(fmt_pct(rs.get("pct_manual", 0.0) or 0.0))
-
-            if "sum_items_wo_vat" in self._stat_labels:
-                self._stat_labels["sum_items_wo_vat"].setText(fmt_money(rs.get("sum_items_wo_vat", 0.0) or 0.0))
-            if "sum_items_w_vat" in self._stat_labels:
-                self._stat_labels["sum_items_w_vat"].setText(fmt_money(rs.get("sum_items_w_vat", 0.0) or 0.0))
-            if "avg_receipt" in self._stat_labels:
-                self._stat_labels["avg_receipt"].setText(fmt_money(rs.get("avg_receipt", 0.0) or 0.0))
-            if "avg_item" in self._stat_labels:
-                self._stat_labels["avg_item"].setText(fmt_money(rs.get("avg_item", 0.0) or 0.0))
-
-            if "avg_items_per_receipt" in self._stat_labels:
-                self._stat_labels["avg_items_per_receipt"].setText(f"{float(rs.get('avg_items_per_receipt', 0.0) or 0.0):.2f}")
-
-            if "minmax_items_per_receipt" in self._stat_labels:
-                mi = int(rs.get("min_items_per_receipt", 0) or 0)
-                ma = int(rs.get("max_items_per_receipt", 0) or 0)
-                self._stat_labels["minmax_items_per_receipt"].setText(f"{mi}–{ma}")
-
-            if "max_item_price" in self._stat_labels:
-                mx = float(rs.get("max_item_price", 0.0) or 0.0)
-                self._stat_labels["max_item_price"].setText(fmt_money(mx))
-                nm = rs.get("max_item_name")
-                if nm:
-                    self._stat_labels["max_item_price"].setToolTip(f"Nejdražší položka: {nm}")
-        except Exception:
-            pass
-
-    def _refresh_dashboard_async(self) -> None:
-        # prevent overlapping refreshes
-        if self._dash_refresh_inflight:
-            return
-        self._dash_refresh_inflight = True
-
-        def work():
-            c = None
-            rs = None
-            try:
-                with self.sf() as session:
-                    c = db_api.counts(session)
-                    rs = db_api.run_stats(session)
-            except Exception as e:
-                c = None
-                rs = None
-                try:
-                    self.log.debug("run tab stats failed: %s", e)
-                except Exception:
-                    pass
-            return (c, rs)
-
-        def done(res):
-            try:
-                c, rs = res
-                self._dash_last_counts = c
-                self._apply_dashboard(c, rs)
-            finally:
-                self._dash_refresh_inflight = False
-
-        def err(_msg: str):
-            # do not show modal dialog; just release inflight and keep last known state
-            self._dash_refresh_inflight = False
-
-        _SilentRunner.run(self, work, done, err, timeout_ms=12000)
-
     def refresh_suppliers(self):
         q = self.sup_filter.text()
         try:
             with self.sf() as session:
                 sups = db_api.list_suppliers(session, q=q)
-        except Exception as e:
-            QMessageBox.critical(self, "Dodavatelé", f"Nepodařilo se načíst seznam dodavatelů: {e}")
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Dodavatelé",
+                f"Nepodařilo se načíst seznam dodavatelů: {exc}",
+            )
             return
 
         keep_id = self._selected_supplier_id()
         rows: List[List[str]] = []
         for s in sups:
-            rows.append([
-                str(s.id),
-                s.name or "",
-                s.ico,
-                s.dic or "",
-                s.city or "",
-            ])
-        self.sup_model = TableModel(["ID", "Název", "IČO", "DIČ", "Místo sídla"], rows)
+            rows.append(
+                [
+                    str(s.id),
+                    s.name or "",
+                    s.ico,
+                    s.dic or "",
+                    s.city or "",
+                ]
+            )
+        self.sup_model = TableModel(
+            ["ID", "Název", "IČO", "DIČ", "Místo sídla"],
+            rows,
+        )
         self.sup_table.setModel(self.sup_model)
         self.sup_table.setColumnHidden(0, True)
 
@@ -2531,6 +2534,27 @@ class MainWindow(QMainWindow):
         else:
             self._on_sup_selection_changed()
 
+    def _on_sup_filter_changed(self, _=None):
+        ms = int(self.cfg.get("performance", {}).get("supplier_debounce_ms", 250) or 250)
+        try:
+            self._sup_filter_timer.stop()
+        except Exception:
+            pass
+        self._sup_filter_timer.start(ms)
+
+    def refresh_all(self):
+        self.refresh_dashboard()
+        self.refresh_suppliers()
+        self.refresh_documents()
+        self.refresh_unprocessed()
+        self.refresh_ops()
+        self.refresh_money()
+
+    def refresh_dashboard(self):
+        # Keep API compatibility, but do not block UI thread.
+        self._refresh_dashboard_async()
+
+    
     def _selected_supplier_ids(self) -> List[int]:
         sm = self.sup_table.selectionModel()
         if sm is None:
@@ -2771,14 +2795,6 @@ class MainWindow(QMainWindow):
         self.sup_vat.setChecked(False)
         self._set_supplier_editing(False)
 
-    def _on_sup_filter_changed(self, _=None):
-        ms = int(self.cfg.get("performance", {}).get("supplier_debounce_ms", 250) or 250)
-        try:
-            self._sup_filter_timer.stop()
-        except Exception:
-            pass
-        self._sup_filter_timer.start(ms)
-
     def _current_doc_filters(self):
         q = (self.doc_filter.text() or "").strip()
         if self.cb_all_dates.isChecked():
@@ -2836,7 +2852,7 @@ class MainWindow(QMainWindow):
         else:
             model = self.docs_table.model()
             try:
-                model.rows.extend(new_rows)  # type: ignore[attr-defined]
+                model.rows.extend(new_rows)
                 model.layoutChanged.emit()
             except Exception:
                 model = TableModel(headers, new_rows)
@@ -2885,7 +2901,7 @@ class MainWindow(QMainWindow):
         if not idx.isValid():
             return
         try:
-            doc_id = int(model.rows[idx.row()][0])  # type: ignore[attr-defined]
+            doc_id = int(model.rows[idx.row()][0])
         except Exception:
             return
 
@@ -2923,71 +2939,384 @@ class MainWindow(QMainWindow):
             if px and not px.isNull():
                 self.preview_view.set_pixmap(px)
 
-    def refresh_unrecognized(self):
+    def refresh_unprocessed(self):
+        """Sloučený seznam nedokončených dokladů (duplikáty, karanténa, requires_review, chyby)."""
         with self.sf() as session:
-            ql = db_api.list_quarantine(session)
+            data = db_api.list_pending(session)
             rows = []
-            for d, f in ql:
-                rows.append([d.id, d.issue_date.isoformat() if d.issue_date else "", d.supplier_ico or "", d.doc_number or "", d.total_with_vat or "", f.current_path, d.review_reasons or ""]) 
-        self.unrec_model = TableModel(["ID", "Datum", "IČO", "Číslo", "Celkem", "Soubor", "Důvod"], rows)
-        self.unrec_table.setModel(self.unrec_model)
+            for d, f in data:
+                status = f.status
+                if status == "PROCESSED" and d.requires_review:
+                    status = "REVIEW"
+                if status == "PROCESSED":
+                    badge = "🟢"
+                elif status in ("NEW", "QUEUED", "RUNNING", "REVIEW"):
+                    badge = "🟠"
+                else:
+                    badge = "🔴"
+                registered = f.created_at.isoformat(sep=" ", timespec="seconds") if getattr(f, "created_at", None) else ""
+                finished = f.processed_at.isoformat(sep=" ", timespec="seconds") if getattr(f, "processed_at", None) else ""
+                reason = d.review_reasons or f.last_error or ""
+                rows.append([
+                    badge,
+                    status,
+                    registered,
+                    finished,
+                    d.issue_date.isoformat() if d.issue_date else "",
+                    d.supplier_ico or "",
+                    d.doc_number or "",
+                    d.total_with_vat or 0.0,
+                    f.current_path,
+                    reason,
+                    d.id,
+                ])
+        headers = ["Stav", "Status", "Zaregistrováno", "Dokončeno", "Datum", "IČO", "Číslo", "Celkem", "Soubor", "Důvod", "ID"]
+        self.unproc_table.setModel(TableModel(headers, rows))
+        self.unproc_table.resizeColumnsToContents()
 
-    def on_unrec_selected(self, index):
-        try:
-            doc_id = int(self.unrec_model.rows[index.row()][0])
-        except Exception:
-            return
-        with self.sf() as session:
-            detail = db_api.get_document_detail(session, doc_id)
-            d: Document = detail["doc"]
-        self._current_unrec_doc_id = doc_id
-        self.ed_u_ico.setText(d.supplier_ico or "")
-        self.ed_u_docno.setText(d.doc_number or "")
-        self.ed_u_bank.setText(d.bank_account or "")
-        if d.issue_date:
-            self.ed_u_date.setDate(d.issue_date)
-        self.ed_u_total.setValue(float(d.total_with_vat or 0.0))
+    
 
-    def on_unrec_save(self):
-        doc_id = getattr(self, "_current_unrec_doc_id", None)
-        if not doc_id:
-            return
+    def refresh_run_state(self):
         with self.sf() as session:
-            d = session.get(Document, doc_id)
-            if not d:
-                return
-            f = session.get(DocumentFile, d.file_id)
-            if not f:
-                return
-            d.supplier_ico = self.ed_u_ico.text().strip() or None
-            d.doc_number = self.ed_u_docno.text().strip() or None
-            d.bank_account = self.ed_u_bank.text().strip() or None
-            d.issue_date = self.ed_u_date.date().toPython()
-            d.total_with_vat = float(self.ed_u_total.value())
-            d.extraction_method = "manual"
-            d.extraction_confidence = 1.0
-            d.requires_review = False
-            d.review_reasons = None
-            # move file from quarantine to output root
-            out_dir = Path(self.cfg["paths"]["output_dir"])
-            p = Path(f.current_path)
+            st = db_api.service_state(session)
+        if not st:
+            return
+
+        def _set(key: str, val: str) -> None:
             try:
-                out_dir.mkdir(parents=True, exist_ok=True)
-                new_p = out_dir / p.name
-                if new_p.exists():
-                    new_p = out_dir / f"{p.stem}_{f.sha256[:8]}{p.suffix}"
-                os.rename(p, new_p)
-                f.current_path = str(new_p)
-                f.status = "PROCESSED"
-                session.add(f)
-            except Exception as e:
-                QMessageBox.critical(self, "Chyba", f"Přesun selhal: {e}")
-                return
-            session.add(d)
+                t = getattr(self, "_dash_tiles", {}).get(key)
+                if t:
+                    t.set_value(val)
+            except Exception:
+                pass
+
+        try:
+            queue = int(st.queue_size or 0)
+            inflight = int(st.inflight or 0)
+            remaining = max(0, queue + inflight)
+
+            phase = (st.current_phase or "idle").strip()
+            current = Path(st.current_path).name if st.current_path else "-"
+
+            running_txt = "Zapnuto" if bool(st.running) else "Vypnuto"
+            if getattr(st, "stuck", False):
+                running_txt += " (zaseknuto)"
+            _set("import_power", running_txt)
+
+            prog = ""
+            if st.current_progress is not None:
+                try:
+                    prog = f"{float(st.current_progress):.0f} %"
+                except Exception:
+                    prog = ""
+            now_txt = f"{phase} • {current}" if current and current != "-" else phase
+            if prog:
+                now_txt += f" • {prog}"
+            _set("import_activity", now_txt)
+
+            if remaining <= 0:
+                next_txt = "Nic. Fronta je prázdná."
+            elif inflight > 0:
+                next_txt = "Dokončení běžících úloh a pokračování dalšími soubory z fronty."
+            else:
+                next_txt = "Start dalšího souboru z fronty."
+            _set("import_next", next_txt)
+
+            _set("queue", f"{queue} / {inflight} / {remaining}")
+
+            avg = float(getattr(self, "_avg_job_seconds", 0.0) or 0.0)
+            if remaining > 0 and avg > 1.0:
+                eta_sec = int(remaining * avg)
+                mm, ss = divmod(eta_sec, 60)
+                hh, mm = divmod(mm, 60)
+                if hh:
+                    eta_txt = f"{hh} h {mm} min"
+                elif mm:
+                    eta_txt = f"{mm} min"
+                else:
+                    eta_txt = f"{ss} s"
+            elif remaining > 0:
+                eta_txt = "–"
+            else:
+                eta_txt = "0"
+            _set("import_eta", eta_txt)
+
+            if remaining == 0 and not st.running:
+                self.lbl_run_status.setText("Vše hotovo.")
+            elif st.running:
+                self.lbl_run_status.setText("Import běží.")
+            else:
+                self.lbl_run_status.setText("Import je vypnutý.")
+
+            if st.last_error:
+                last_msg = f"Chyba: {st.last_error}"
+                if st.last_error != self._last_run_error:
+                    self._last_run_error = st.last_error
+                    self._last_run_success = None
+                    self.run_log.append(last_msg)
+            elif st.last_success:
+                last_ok = st.last_success.isoformat(sep=" ", timespec="seconds") if isinstance(st.last_success, dt.datetime) else str(st.last_success)
+                last_msg = f"OK: {last_ok}"
+                if last_ok != self._last_run_success:
+                    self._last_run_success = last_ok
+                    self._last_run_error = None
+                    self.run_log.append(last_msg)
+        except Exception:
+            pass
+
+
+    def refresh_ops(self):
+        # Provozní panel: 1 řádek = 1 soubor (ImportJob), doplněno o velikost/mtime + semafor.
+        with self.sf() as session:
+            jobs = session.execute(
+                select(ImportJob)
+                .order_by(ImportJob.created_at.desc())
+                .limit(500)
+            ).scalars().all()
+
+        rows = []
+        for j in jobs:
+            status = str(j.status or "").upper()
+            if status == "PROCESSED":
+                light = "green"
+                result = "Kompletně vytěženo"
+            elif status in ("NEW", "QUEUED", "RUNNING"):
+                light = "orange"
+                result = "Čeká / zpracovává se"
+            else:
+                light = "red"
+                if status == "DUPLICATE":
+                    result = "Duplicita (odloženo)"
+                elif status == "QUARANTINE":
+                    result = "Nekompletní – karanténa"
+                else:
+                    result = "Chyba"
+
+            size = ""
+            mtime = ""
+            doc_path = Path(str(j.path or ""))
+            try:
+                if doc_path.exists():
+                    st = doc_path.stat()
+                    size = (
+                        f"{st.st_size/1024.0:.0f} KB"
+                        if st.st_size < 1024 * 1024
+                        else f"{st.st_size/1024/1024:.2f} MB"
+                    )
+                    mtime = dt.datetime.fromtimestamp(st.st_mtime).isoformat(sep=" ", timespec="seconds")
+                else:
+                    out_base = Path(self.cfg.get("paths", {}).get("output_dir", "") or "")
+                    qdir = out_base / self.cfg.get("paths", {}).get("quarantine_dir_name", "KARANTENA")
+                    ddir = out_base / self.cfg.get("paths", {}).get("duplicate_dir_name", "DUPLICITY")
+                    for cand in (out_base / doc_path.name, qdir / doc_path.name, ddir / doc_path.name):
+                        if cand.exists():
+                            st = cand.stat()
+                            size = (
+                                f"{st.st_size/1024.0:.0f} KB"
+                                if st.st_size < 1024 * 1024
+                                else f"{st.st_size/1024/1024:.2f} MB"
+                            )
+                            mtime = dt.datetime.fromtimestamp(st.st_mtime).isoformat(sep=" ", timespec="seconds")
+                            break
+            except Exception:
+                pass
+
+            started = j.started_at.isoformat(sep=" ", timespec="seconds") if j.started_at else ""
+            finished = j.finished_at.isoformat(sep=" ", timespec="seconds") if j.finished_at else ""
+            err = (j.error or "").strip()
+
+            rows.append(
+                [
+                    light,
+                    doc_path.name,
+                    size,
+                    mtime,
+                    started,
+                    finished,
+                    status,
+                    result,
+                    err,
+                ]
+            )
+
+        headers = [
+            "",
+            "Soubor",
+            "Velikost",
+            "Posl. úprava",
+            "Start",
+            "Konec",
+            "Status",
+            "Výsledek",
+            "Důvod",
+        ]
+        self.ops_table.setModel(TableModel(headers, rows))
+        try:
+            self.ops_table.resizeColumnsToContents()
+        except Exception:
+            pass
+
+
+
+    def on_unproc_openai(self):
+        ids = self._unproc_selected_ids()
+        if not ids:
+            QMessageBox.information(self, "OpenAI", "Vyber řádky v tabulce.")
+            return
+        api_key = self.ed_api_key.text().strip()
+        model = self.ed_fallback_model.text().strip() or self.ed_primary_model.text().strip() or "auto"
+        if not api_key:
+            QMessageBox.warning(self, "OpenAI", "Není vyplněn API key (Nastavení).")
+            return
+        success_ids: list[int] = []
+        errors: list[str] = []
+        with self.sf() as session:
+            for doc_id in ids:
+                d = session.get(Document, doc_id)
+                if not d:
+                    continue
+                f = session.get(DocumentFile, d.file_id)
+                if not f or not Path(f.current_path).exists():
+                    errors.append(f"ID {doc_id}: soubor nenalezen")
+                    continue
+                try:
+                    ok, raw_resp, used_model = self._call_openai_responses(api_key, model, Path(f.current_path))
+                    if ok:
+                        f.status = "PROCESSED"
+                        f.processed_at = dt.datetime.utcnow()
+                        d.requires_review = False
+                        d.review_reasons = None
+                        d.extraction_method = "openai"
+                        d.extraction_confidence = max(0.7, float(d.extraction_confidence or 0.0))
+                        d.openai_model = used_model or model
+                        d.openai_raw_response = raw_resp
+                        session.add(f)
+                        session.add(d)
+                        success_ids.append(doc_id)
+                    else:
+                        errors.append(f"ID {doc_id}: OpenAI odpověď není úspěšná")
+                except Exception as e:
+                    errors.append(f"ID {doc_id}: {e}")
             session.commit()
-        QMessageBox.information(self, "Uloženo", "Doklad uložen a vyjmut z karantény.")
-        self.refresh_unrecognized()
-        self.refresh_documents()
+        self.refresh_unprocessed()
+        if success_ids:
+            QMessageBox.information(self, "OpenAI", f"Odesláno a zpracováno: {len(success_ids)} dokladů.")
+        if errors:
+            QMessageBox.warning(self, "OpenAI", "\n".join(errors))
+
+    def on_unproc_manual(self):
+        ids = self._unproc_selected_ids()
+        if not ids:
+            QMessageBox.information(self, "Ruční vytěžení", "Vyber řádky v tabulce.")
+            return
+        with self.sf() as session:
+            for doc_id in ids:
+                d = session.get(Document, doc_id)
+                if not d:
+                    continue
+                f = session.get(DocumentFile, d.file_id)
+                if f:
+                    f.status = "PROCESSED"
+                    f.processed_at = dt.datetime.utcnow()
+                    session.add(f)
+                d.requires_review = False
+                d.review_reasons = None
+                d.extraction_method = "manual"
+                d.extraction_confidence = 1.0
+                session.add(d)
+            session.commit()
+        self.refresh_unprocessed()
+        QMessageBox.information(self, "Ruční vytěžení", "Označeno jako ručně zpracované.")
+
+    def _unproc_selected_ids(self) -> list[int]:
+        model = self.unproc_table.model()
+        sm = self.unproc_table.selectionModel()
+        if not model or not sm:
+            return []
+        ids = []
+        for idx in sm.selectedRows():
+            try:
+                doc_id = int(model.rows[idx.row()][10])
+                ids.append(doc_id)
+            except Exception:
+                continue
+        return ids
+
+    def _enhance_for_openai(self, image: Image.Image) -> Image.Image:
+        img = image.convert("RGB")
+        img = ImageOps.autocontrast(img)
+        img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+        return img
+
+    def _prepare_openai_images(self, file_path: Path) -> List[Tuple[str, bytes]]:
+        cfg = self.cfg.get("openai") if isinstance(self.cfg, dict) else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        dpi = int(cfg.get("image_dpi", 300) or 300)
+        max_pages = int(cfg.get("image_max_pages", 3) or 3)
+        enhance = bool(cfg.get("image_enhance", True))
+        variants = int(cfg.get("image_variants", 2) or 2)
+        if variants < 1:
+            variants = 1
+
+        images_payload: List[Tuple[str, bytes]] = []
+        try:
+            if file_path.suffix.lower() == ".pdf":
+                imgs = render_pdf_to_images(file_path, dpi=dpi, max_pages=max_pages, start_page=0)
+            else:
+                with Image.open(file_path) as im:
+                    imgs = [im.convert("RGB")]
+        except Exception:
+            return images_payload
+
+        for im in imgs[:max_pages]:
+            try:
+                bio = BytesIO()
+                im.convert("RGB").save(bio, format="PNG")
+                images_payload.append(("image/png", bio.getvalue()))
+                if enhance and variants > 1:
+                    enh = self._enhance_for_openai(im)
+                    bio2 = BytesIO()
+                    enh.save(bio2, format="PNG")
+                    images_payload.append(("image/png", bio2.getvalue()))
+            except Exception:
+                continue
+        return images_payload
+
+    def _call_openai_responses(self, api_key: str, model: str, file_path: Path) -> tuple[bool, str, str]:
+        """
+        Sync volani OpenAI /v1/responses s JSON vystupem.
+        """
+        cfg = self.cfg.get("openai") if isinstance(self.cfg, dict) else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        timeout = int(cfg.get("timeout_sec", 60) or 60)
+        use_json_schema = bool(cfg.get("use_json_schema", True))
+        temperature = float(cfg.get("temperature", 0.0) or 0.0)
+        max_output_tokens = int(cfg.get("max_output_tokens", 2000) or 2000)
+        fallback_model = str(cfg.get("fallback_model") or "").strip() or None
+
+        images_payload = self._prepare_openai_images(file_path)
+        oai_cfg = OpenAIConfig(
+            api_key=api_key,
+            model=model or "auto",
+            fallback_model=fallback_model,
+            use_json_schema=use_json_schema,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+        try:
+            obj, raw, used_model = extract_with_openai_fallback(
+                oai_cfg,
+                ocr_text="",
+                images=images_payload,
+                timeout=timeout,
+            )
+            if isinstance(obj, dict):
+                return True, raw, used_model
+            return False, raw, used_model
+        except Exception as exc:
+            return False, str(exc), ""
 
     def closeEvent(self, event):
         # Make sure background threads are stopped to avoid PySide warnings.
@@ -3000,22 +3329,10 @@ class MainWindow(QMainWindow):
                 pass
         super().closeEvent(event)
 
-    def refresh_ops(self):
-        with self.sf() as session:
-            jobs = db_api.service_jobs(session, limit=200)
-            rows = []
-            for j in jobs:
-                rows.append([j.created_at.isoformat(sep=" ", timespec="seconds"), j.status, j.path, j.error or "", j.finished_at.isoformat(sep=" ", timespec="seconds") if j.finished_at else ""]) 
-        self.ops_table.setModel(TableModel(["Vytvořeno", "Status", "Soubor", "Chyba", "Dokončeno"], rows))
-
+    
     def refresh_suspicious(self):
-        with self.sf() as session:
-            stmt = select(Document, DocumentFile).join(DocumentFile, DocumentFile.id == Document.file_id).where(Document.requires_review == True)  # noqa
-            data = session.execute(stmt).all()
-            rows = []
-            for d, f in data:
-                rows.append([d.id, d.issue_date.isoformat() if d.issue_date else "", d.supplier_ico or "", d.doc_number or "", d.total_with_vat or "", f.status, d.review_reasons or ""]) 
-        self.susp_table.setModel(TableModel(["ID", "Datum", "IČO", "Číslo", "Celkem", "Status", "Důvod"], rows))
+        # Zachováno pro zpětnou kompatibilitu volání; přesměrováno na nový sjednocený seznam.
+        self.refresh_unprocessed()
 
     def refresh_money(self):
         with self.sf() as session:
@@ -3127,3 +3444,128 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export", f"Export selhal: {e}")
             return
         QMessageBox.information(self, "Export", f"Uloženo: {path}")
+
+    def _apply_dashboard(self, c: Dict[str, Any] | None, rs: Dict[str, Any] | None) -> None:
+        # RUN dashboard values (DB + filesystem + status)
+        try:
+            # keep original import status string if used elsewhere
+            self.lbl_run_status.setText(self._import_status)
+        except Exception:
+            pass
+
+        if c:
+            try:
+                q = int(c.get("quarantine", 0) or 0)
+                d = int(c.get("duplicates", 0) or 0)
+                total = q + d
+                try:
+                    self._dash_tiles["quarantine_total"].set_value(str(total))
+                    self._dash_tiles["quarantine_dup"].set_value(str(d))
+                    self._dash_tiles["quarantine_fail"].set_value(str(q))
+                except Exception:
+                    pass
+
+                in_wait = int(getattr(self, "_dash_in_waiting", 0) or 0)
+                try:
+                    self._dash_tiles["in_waiting"].set_value(str(in_wait))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        if not rs:
+            return
+
+        def fmt_int(n: int) -> str:
+            return f"{int(n):,}".replace(",", " ")
+
+        def fmt_money(x: float) -> str:
+            return f"{float(x):,.2f}".replace(",", " ")
+
+        try:
+            if "suppliers" in self._stat_labels:
+                self._stat_labels["suppliers"].setText(fmt_int(rs.get("suppliers", 0) or 0))
+            if "receipts" in self._stat_labels:
+                self._stat_labels["receipts"].setText(fmt_int(rs.get("receipts", 0) or 0))
+            if "items" in self._stat_labels:
+                self._stat_labels["items"].setText(fmt_int(rs.get("items", 0) or 0))
+
+            if "sum_items_wo_vat" in self._stat_labels:
+                self._stat_labels["sum_items_wo_vat"].setText(fmt_money(rs.get("sum_items_wo_vat", 0.0) or 0.0))
+            if "sum_items_w_vat" in self._stat_labels:
+                self._stat_labels["sum_items_w_vat"].setText(fmt_money(rs.get("sum_items_w_vat", 0.0) or 0.0))
+        except Exception:
+            pass
+
+
+    def _refresh_dashboard_async(self) -> None:
+        # prevent overlapping refreshes
+        if self._dash_refresh_inflight:
+            return
+        self._dash_refresh_inflight = True
+
+        def work():
+            c = None
+            rs = None
+            in_waiting = 0
+            avg_job_seconds = 0.0
+            try:
+                # filesystem: INPUT waiting
+                try:
+                    input_dir = Path(self.cfg.get("paths", {}).get("input_dir", "") or "")
+                    if input_dir.exists():
+                        exts = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+                        in_waiting = len([p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
+                except Exception:
+                    in_waiting = 0
+
+                with self.sf() as session:
+                    c = db_api.counts(session)
+                    rs = db_api.run_stats(session)
+
+                    # recent average processing time (PROCESSED only; best-effort)
+                    try:
+                        jobs = session.execute(
+                            select(ImportJob.started_at, ImportJob.finished_at)
+                            .where(ImportJob.status == "PROCESSED")
+                            .where(ImportJob.started_at.is_not(None))
+                            .where(ImportJob.finished_at.is_not(None))
+                            .order_by(ImportJob.finished_at.desc())
+                            .limit(50)
+                        ).all()
+                        durs: list[float] = []
+                        for s, f in jobs:
+                            try:
+                                sec = (f - s).total_seconds()
+                                if 1 <= sec <= 60 * 60:
+                                    durs.append(float(sec))
+                            except Exception:
+                                pass
+                        if durs:
+                            avg_job_seconds = float(sum(durs) / len(durs))
+                    except Exception:
+                        avg_job_seconds = 0.0
+            except Exception as e:
+                c = None
+                rs = None
+                try:
+                    self.log.debug("run tab stats failed: %s", e)
+                except Exception:
+                    pass
+            return (c, rs, in_waiting, avg_job_seconds)
+
+        def done(res):
+            try:
+                c, rs, in_waiting, avg_job_seconds = res
+                self._dash_last_counts = c
+                self._dash_in_waiting = int(in_waiting or 0)
+                self._avg_job_seconds = float(avg_job_seconds or 0.0)
+                self._apply_dashboard(c, rs)
+            finally:
+                self._dash_refresh_inflight = False
+
+        def err(_msg: str):
+            self._dash_refresh_inflight = False
+
+        _SilentRunner.run(self, work, done, err, timeout_ms=12000)
+
