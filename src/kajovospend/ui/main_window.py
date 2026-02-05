@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import threading
 from io import BytesIO
 from pathlib import Path
 import shutil
 import tempfile
 import zipfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageFilter, ImageOps
 
@@ -446,11 +447,12 @@ class _ImportWorker(QObject):
     done = Signal(dict)
     error = Signal(str)
 
-    def __init__(self, cfg: Dict[str, Any], sf, processor: Processor):
+    def __init__(self, cfg: Dict[str, Any], sf, processor: Processor, stop_cb: Callable[[], bool]):
         super().__init__()
         self.cfg = cfg
         self.sf = sf
         self.processor = processor
+        self.stop_cb = stop_cb
 
     @Slot()
     def run(self):
@@ -487,6 +489,9 @@ class _ImportWorker(QObject):
             total = len(files)
 
             for i, p in enumerate(files, start=1):
+                if self.stop_cb():
+                    self.done.emit({"imported": imported, "total": total, "message": "Zastaveno uživatelem."})
+                    return
                 self.progress.emit(f"Zpracovávám {i}/{total}: {p.name}")
                 try:
                     with self.sf() as session:
@@ -516,6 +521,10 @@ class _ImportWorker(QObject):
                     except Exception:
                         pass
                     self.progress.emit(f"Chyba: {p.name}: {e}")
+
+            if self.stop_cb():
+                self.done.emit({"imported": imported, "total": total, "message": "Zastaveno uživatelem."})
+                return
 
             # vyčistit prázdné podadresáře
             dirs = sorted([d for d in input_dir.rglob("*") if d.is_dir()], key=lambda d: len(d.parts), reverse=True)
@@ -715,6 +724,7 @@ class MainWindow(QMainWindow):
         self._dash_last_counts: Dict[str, Any] | None = None
         self._import_running = False
         self._import_status = "Připraveno."
+        self._import_stop_event = threading.Event()
         self._last_run_error: str | None = None
         self._last_run_success: str | None = None
 
@@ -1117,12 +1127,16 @@ class MainWindow(QMainWindow):
 
         self.btn_import = QPushButton("IMPORT")
         self.btn_import.setToolTip("Zařadí soubory z INPUT do fronty zpracování")
+        self.btn_import_stop = QPushButton("ZASTAVIT IMPORT")
+        self.btn_import_stop.setToolTip("Okamžitě zastaví aktuální import ze složky IN. Nedokončené soubory se ztratí.")
+        self.btn_import_stop.setEnabled(False)
 
         self.lbl_run_status = QLabel(self._import_status)
         self.lbl_run_status.setWordWrap(True)
         self.lbl_run_status.setObjectName("DashHeadline")
 
         top_l.addWidget(self.btn_import)
+        top_l.addWidget(self.btn_import_stop)
         top_l.addWidget(self.lbl_run_status, 1)
 
         rl.addWidget(top)
@@ -1677,6 +1691,7 @@ class MainWindow(QMainWindow):
         # Actions
         self.btn_exit.clicked.connect(self.close)
         self.btn_import.clicked.connect(self.on_import_clicked)
+        self.btn_import_stop.clicked.connect(self.on_import_stop)
 
         self.btn_pick_input.clicked.connect(lambda: self._pick_dir(self.ed_input_dir))
         self.btn_pick_output.clicked.connect(lambda: self._pick_dir(self.ed_output_dir))
@@ -1739,7 +1754,7 @@ class MainWindow(QMainWindow):
         # Periodic lightweight refresh for RUN tab.
         interval = int(self.cfg.get("performance", {}).get("ui_refresh_ms") or 1000)
         # keep it reasonable even if config is too aggressive
-        interval = max(2000, interval)
+        interval = max(1000, interval)
         self.timer.setInterval(interval)
         self.timer.timeout.connect(self._refresh_from_queue)
         self.timer.start()
@@ -2704,8 +2719,10 @@ class MainWindow(QMainWindow):
         msg = str(res.get("message") or "Hotovo.")
         self._import_status = f"{msg} ({imported}/{total})"
         self._import_running = False
+        self._import_stop_event.clear()
         try:
             self.btn_import.setEnabled(True)
+            self.btn_import_stop.setEnabled(False)
             self.lbl_run_status.setText(self._import_status)
         except Exception:
             pass
@@ -2724,9 +2741,11 @@ class MainWindow(QMainWindow):
 
     def _on_import_error(self, msg: str) -> None:
         self._import_running = False
+        self._import_stop_event.clear()
         self._import_status = f"Chyba: {msg}"
         try:
             self.btn_import.setEnabled(True)
+            self.btn_import_stop.setEnabled(False)
             self.lbl_run_status.setText(self._import_status)
         except Exception:
             pass
@@ -2745,15 +2764,17 @@ class MainWindow(QMainWindow):
             deep_set(self.cfg, ["paths", "output_dir"], output_dir_val)
 
         self._import_running = True
+        self._import_stop_event.clear()
         self._import_status = "Načítám INPUT…"
         try:
             self.btn_import.setEnabled(False)
+            self.btn_import_stop.setEnabled(True)
             self.lbl_run_status.setText(self._import_status)
         except Exception:
             pass
 
         th = QThread(self)
-        wk = _ImportWorker(self.cfg, self.sf, self.processor)
+        wk = _ImportWorker(self.cfg, self.sf, self.processor, self._import_stop_event.is_set)
         wk.moveToThread(th)
         th.started.connect(wk.run)
         wk.progress.connect(self._on_import_progress)
@@ -2794,6 +2815,17 @@ class MainWindow(QMainWindow):
         self._workers.append(wk)  # type: ignore
 
         th.start()
+
+    def on_import_stop(self) -> None:
+        if not self._import_running:
+            return
+        self._import_stop_event.set()
+        self._import_status = "Zastavuji import…"
+        try:
+            self.btn_import_stop.setEnabled(False)
+            self.lbl_run_status.setText(self._import_status)
+        except Exception:
+            pass
 
     def refresh_suppliers(self):
         q = self.sup_filter.text()
@@ -3820,7 +3852,7 @@ class MainWindow(QMainWindow):
                     input_dir = Path(self.cfg.get("paths", {}).get("input_dir", "") or "")
                     if input_dir.exists():
                         exts = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
-                        in_waiting = len([p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
+                        in_waiting = len([p for p in input_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
                 except Exception:
                     in_waiting = 0
 
