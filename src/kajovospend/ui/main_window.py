@@ -3328,32 +3328,34 @@ class MainWindow(QMainWindow):
                 pass
 
         try:
+            # default from service state
             queue = int(st.queue_size or 0)
             inflight = int(st.inflight or 0)
-            remaining = max(0, queue + inflight)
-
             phase = (st.current_phase or "idle").strip()
             current = Path(st.current_path).name if st.current_path else "-"
-
             running_txt = "Zapnuto" if bool(st.running) else "Vypnuto"
+            prog = ""
+            now_txt = f"{phase} • {current}" if current and current != "-" else phase
+            if st.current_progress is not None:
+                try:
+                    prog = f"{float(st.current_progress):.0f} %"
+                except Exception:
+                    prog = ""
+            if prog:
+                now_txt += f" • {prog}"
+
+            # override for ruční import (GUI)
             if self._import_running:
+                queue = int(getattr(self, "_dash_in_waiting", 0) or 0)
+                inflight = 1
                 running_txt = "Zapnuto (ruční import)"
+                now_txt = self._import_status
+
+            remaining = max(0, queue + inflight)
+
             if getattr(st, "stuck", False):
                 running_txt += " (zaseknuto)"
             _set("import_power", running_txt)
-
-            prog = ""
-            if self._import_running:
-                now_txt = self._import_status
-            else:
-                if st.current_progress is not None:
-                    try:
-                        prog = f"{float(st.current_progress):.0f} %"
-                    except Exception:
-                        prog = ""
-                now_txt = f"{phase} • {current}" if current and current != "-" else phase
-                if prog:
-                    now_txt += f" • {prog}"
             _set("import_activity", now_txt)
 
             if remaining <= 0:
