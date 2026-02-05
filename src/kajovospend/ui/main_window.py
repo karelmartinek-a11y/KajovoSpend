@@ -5,6 +5,8 @@ import os
 from io import BytesIO
 from pathlib import Path
 import shutil
+import tempfile
+import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageFilter, ImageOps
@@ -1382,6 +1384,16 @@ class MainWindow(QMainWindow):
         )
         self.btn_save_settings = QPushButton("Uložit nastavení")
 
+        self.btn_backup_program = QPushButton("ZÁLOHOVAT PROGRAM")
+        self.btn_backup_program.setToolTip(
+            "Vytvoří kompletní zálohu (IN, OUT, databáze, config) do jednoho souboru."
+        )
+
+        self.btn_restore_program = QPushButton("OBNOVIT PROGRAM")
+        self.btn_restore_program.setToolTip(
+            "Načte dříve vytvořenou zálohu a přepíše aktuální data (vyžaduje heslo)."
+        )
+
         self.btn_reset_program = QPushButton("RESET PROGRAMU")
         self.btn_reset_program.setToolTip(
             "Smaže databázi i obsah adresářů IN/OUT a znovu ji inicializuje.\n"
@@ -1403,6 +1415,8 @@ class MainWindow(QMainWindow):
 
         stl.addLayout(form)
         stl.addWidget(self.btn_save_settings)
+        stl.addWidget(self.btn_backup_program)
+        stl.addWidget(self.btn_restore_program)
         stl.addWidget(self.btn_reset_program)
         self.tabs.addTab(self.tab_settings, "NASTAVENÍ")
 
@@ -1635,6 +1649,8 @@ class MainWindow(QMainWindow):
         self.btn_pick_input.clicked.connect(lambda: self._pick_dir(self.ed_input_dir))
         self.btn_pick_output.clicked.connect(lambda: self._pick_dir(self.ed_output_dir))
         self.btn_save_settings.clicked.connect(self.on_save_settings)
+        self.btn_backup_program.clicked.connect(self._on_backup_program)
+        self.btn_restore_program.clicked.connect(self._on_restore_program)
         self.btn_reset_program.clicked.connect(self._on_reset_program)
         self.btn_api_show.clicked.connect(self._on_api_show_toggle)
         self.btn_api_clear.clicked.connect(self._on_api_clear)
@@ -2242,17 +2258,226 @@ class MainWindow(QMainWindow):
         save_yaml(self.config_path, self.cfg)
         QMessageBox.information(self, "Nastavení", "Uloženo.")
 
+    # --- Backup / restore / reset ---
+
+    def _ask_password(self, title: str, prompt: str) -> bool:
+        pwd, ok = QInputDialog.getText(self, title, prompt, QLineEdit.Password)
+        return bool(ok and pwd.strip() == "+Sin8glov8")
+
+    def _db_files(self) -> List[Path]:
+        files = [self.paths.db_path]
+        for suf in (".wal", ".shm"):
+            cand = self.paths.db_path.with_suffix(self.paths.db_path.suffix + suf)
+            files.append(cand)
+        return files
+
+    def _clear_dir(self, path_str: str, errors: List[str]) -> None:
+        if not path_str:
+            return
+        p = Path(path_str)
+        if not p.exists():
+            return
+        for child in p.iterdir():
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            except Exception as exc:
+                errors.append(f"{child}: {exc}")
+
+    def _ask_backup_save_path(self, suffix: str = "") -> Optional[Path]:
+        ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = f"kajovospend-backup{('-' + suffix) if suffix else ''}-{ts}.zip"
+        path, _ = QFileDialog.getSaveFileName(self, "Uložit zálohu", base, "Záloha (*.zip)")
+        return Path(path) if path else None
+
+    def _backup_to_archive(self, dest: Path) -> Tuple[bool, str]:
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # uzavřít DB, aby se zapsal WAL
+            try:
+                self.engine.dispose()
+            except Exception:
+                pass
+
+            in_dir = Path(self.ed_input_dir.text().strip() or self.cfg.get("paths", {}).get("input_dir") or "")
+            out_dir = Path(self.ed_output_dir.text().strip() or self.cfg.get("paths", {}).get("output_dir") or "")
+
+            with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                if in_dir.exists():
+                    for p in in_dir.rglob("*"):
+                        if p.is_file():
+                            zf.write(p, Path("IN") / p.relative_to(in_dir))
+                if out_dir.exists():
+                    for p in out_dir.rglob("*"):
+                        if p.is_file():
+                            zf.write(p, Path("OUT") / p.relative_to(out_dir))
+                for db_file in self._db_files():
+                    if db_file.exists():
+                        zf.write(db_file, Path("DB") / db_file.name)
+                if self.config_path.exists():
+                    zf.write(self.config_path, Path("config") / self.config_path.name)
+            return True, f"Záloha uložena do {dest}"
+        except Exception as exc:
+            return False, str(exc)
+
+    def _restore_from_archive(self, archive: Path, errors: List[str]) -> None:
+        with tempfile.TemporaryDirectory(prefix="kajovospend_restore_") as tmp:
+            tmp_path = Path(tmp)
+            try:
+                with zipfile.ZipFile(archive, "r") as zf:
+                    zf.extractall(tmp_path)
+            except Exception as exc:
+                errors.append(f"Čtení zálohy selhalo: {exc}")
+                return
+
+            orig_in_dir = Path(self.ed_input_dir.text().strip() or self.cfg.get("paths", {}).get("input_dir") or "")
+            orig_out_dir = Path(self.ed_output_dir.text().strip() or self.cfg.get("paths", {}).get("output_dir") or "")
+            orig_db_files = list(self._db_files())
+
+            # zavřít DB
+            try:
+                self.engine.dispose()
+            except Exception as exc:
+                errors.append(f"DB dispose: {exc}")
+
+            # vrátit config (pokud je v záloze) dřív, aby se načetly nové cesty
+            cfg_src = tmp_path / "config" / self.config_path.name
+            if cfg_src.exists():
+                try:
+                    shutil.copy2(cfg_src, self.config_path)
+                except Exception as exc:
+                    errors.append(f"Obnova configu: {exc}")
+
+            # načti případně nové cesty
+            try:
+                self.cfg = self._load_or_create_config()
+            except Exception as exc:
+                errors.append(f"Načtení configu po obnově: {exc}")
+
+            self._apply_cfg_to_fields()
+            new_in_dir = Path(self.ed_input_dir.text().strip() or self.cfg.get("paths", {}).get("input_dir") or "")
+            new_out_dir = Path(self.ed_output_dir.text().strip() or self.cfg.get("paths", {}).get("output_dir") or "")
+
+            # vymazat staré i nové cesty, aby nic nezůstalo
+            for d in {orig_in_dir, orig_out_dir, new_in_dir, new_out_dir}:
+                self._clear_dir(str(d), errors)
+
+            # smazat staré DB soubory (původní i nové umístění)
+            db_paths_to_clear = set(orig_db_files)
+            # po reloadu configu můžou být jiné cesty
+            try:
+                self.paths = resolve_app_paths(
+                    self.cfg["app"].get("data_dir"),
+                    self.cfg["app"].get("db_path"),
+                    self.cfg["app"].get("log_dir"),
+                    self.cfg.get("ocr", {}).get("models_dir"),
+                )
+            except Exception as exc:
+                errors.append(f"Resolve paths po obnově: {exc}")
+            else:
+                db_paths_to_clear.update(self._db_files())
+
+            for db_file in db_paths_to_clear:
+                try:
+                    if db_file.exists():
+                        db_file.unlink()
+                except Exception as exc:
+                    errors.append(f"Smazání DB souboru {db_file}: {exc}")
+
+            # obnovit IN/OUT
+            for name, target_dir in (("IN", new_in_dir), ("OUT", new_out_dir)):
+                src = tmp_path / name
+                if src.exists():
+                    try:
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        for p in src.rglob("*"):
+                            if p.is_file():
+                                dest = target_dir / p.relative_to(src)
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(p, dest)
+                    except Exception as exc:
+                        errors.append(f"Obnova {name}: {exc}")
+
+            # obnovit DB soubory
+            db_src_dir = tmp_path / "DB"
+            if db_src_dir.exists():
+                for p in db_src_dir.iterdir():
+                    try:
+                        self.paths.db_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(p, self.paths.db_path.parent / p.name)
+                    except Exception as exc:
+                        errors.append(f"Obnova DB {p.name}: {exc}")
+
+            # znovu inicializovat engine + processor
+            try:
+                self.engine = make_engine(str(self.paths.db_path))
+                init_db(self.engine)
+                self.sf = make_session_factory(self.engine)
+                self.processor = Processor(self.cfg, self.paths, self.log)
+            except Exception as exc:
+                errors.append(f"Reinit po obnově: {exc}")
+
+    def _has_existing_data(self) -> bool:
+        in_dir = Path(self.ed_input_dir.text().strip() or self.cfg.get("paths", {}).get("input_dir") or "")
+        out_dir = Path(self.ed_output_dir.text().strip() or self.cfg.get("paths", {}).get("output_dir") or "")
+        if in_dir.exists() and any(in_dir.iterdir()):
+            return True
+        if out_dir.exists() and any(out_dir.iterdir()):
+            return True
+        if self.paths.db_path.exists():
+            return True
+        return False
+
+    def _apply_cfg_to_fields(self) -> None:
+        paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
+        openai_cfg = self.cfg.get("openai", {}) if isinstance(self.cfg, dict) else {}
+        self.ed_input_dir.setText(str(paths_cfg.get("input_dir", "")))
+        self.ed_output_dir.setText(str(paths_cfg.get("output_dir", "")))
+
+        if isinstance(openai_cfg, dict):
+            self.cb_openai_enabled.setChecked(bool(openai_cfg.get("enabled", False)))
+            self.cb_openai_auto.setChecked(bool(openai_cfg.get("auto_enable", True)))
+            self.cb_openai_primary.setChecked(bool(openai_cfg.get("primary_enabled", True)))
+            self.cb_openai_fallback.setChecked(bool(openai_cfg.get("fallback_enabled", True)))
+            self.ed_primary_model.setText(openai_cfg.get("model", "auto"))
+            self.ed_fallback_model.setText(openai_cfg.get("fallback_model", ""))
+            self.cb_use_json_schema.setChecked(bool(openai_cfg.get("use_json_schema", True)))
+            self.sp_temperature.setValue(float(openai_cfg.get("temperature", 0.0) or 0.0))
+            self.sp_max_tokens.setValue(int(openai_cfg.get("max_output_tokens", 2000) or 2000))
+            self.sp_timeout.setValue(int(openai_cfg.get("timeout_sec", 60) or 60))
+            self.sp_image_dpi.setValue(int(openai_cfg.get("image_dpi", 300) or 300))
+            self.sp_image_max_pages.setValue(int(openai_cfg.get("image_max_pages", 3) or 3))
+            self.sp_image_variants.setValue(int(openai_cfg.get("image_variants", 2) or 2))
+            self.cb_image_enhance.setChecked(bool(openai_cfg.get("image_enhance", True)))
+            self.cb_allow_synth.setChecked(bool(openai_cfg.get("allow_synthetic_items", False)))
     def _on_reset_program(self):
         if self._import_running:
             QMessageBox.warning(self, "RESET PROGRAMU", "Nejprve dokonči probíhající import.")
             return
 
-        pwd, ok = QInputDialog.getText(self, "RESET PROGRAMU", "Zadej heslo pro reset:", QLineEdit.Password)
-        if not ok:
+        if not self._ask_password("RESET PROGRAMU", "Zadej heslo pro reset:"):
+            QMessageBox.warning(self, "RESET PROGRAMU", "Chybné heslo nebo zrušeno.")
             return
-        if pwd.strip() != "+Sin8glov8":
-            QMessageBox.warning(self, "RESET PROGRAMU", "Chybné heslo.")
-            return
+
+        # volitelná záloha před smazáním
+        backup_choice = QMessageBox.question(
+            self,
+            "RESET PROGRAMU",
+            "Chceš před resetem uložit kompletní data (IN, OUT, DB, config) do jednoho souboru?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if backup_choice == QMessageBox.Yes:
+            dest = self._ask_backup_save_path("pred-resetem")
+            if not dest:
+                QMessageBox.information(self, "RESET PROGRAMU", "Reset zrušen (nevybrán soubor pro zálohu).")
+                return
+            ok, msg = self._backup_to_archive(dest)
+            if not ok:
+                QMessageBox.critical(self, "RESET PROGRAMU", f"Záloha selhala: {msg}")
+                return
 
         confirm = QMessageBox.question(
             self,
@@ -2266,26 +2491,11 @@ class MainWindow(QMainWindow):
 
         errors: list[str] = []
 
-        def _clear_dir(path_str: str) -> None:
-            if not path_str:
-                return
-            p = Path(path_str)
-            if not p.exists():
-                return
-            for child in p.iterdir():
-                try:
-                    if child.is_dir():
-                        shutil.rmtree(child)
-                    else:
-                        child.unlink()
-                except Exception as exc:
-                    errors.append(f"{child}: {exc}")
-
         in_dir = self.ed_input_dir.text().strip() or str(self.cfg.get("paths", {}).get("input_dir") or "")
         out_dir = self.ed_output_dir.text().strip() or str(self.cfg.get("paths", {}).get("output_dir") or "")
 
-        _clear_dir(in_dir)
-        _clear_dir(out_dir)
+        self._clear_dir(in_dir, errors)
+        self._clear_dir(out_dir, errors)
 
         try:
             self.engine.dispose()
@@ -2322,6 +2532,69 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "RESET PROGRAMU", "Hotovo s výjimkami:\n" + "\n".join(errors))
         else:
             QMessageBox.information(self, "RESET PROGRAMU", "Program byl vyresetován.")
+
+    def _on_backup_program(self):
+        if self._import_running:
+            QMessageBox.warning(self, "ZÁLOHOVAT PROGRAM", "Nejprve dokonči probíhající import.")
+            return
+        dest = self._ask_backup_save_path()
+        if not dest:
+            return
+        ok, msg = self._backup_to_archive(dest)
+        if ok:
+            QMessageBox.information(self, "ZÁLOHOVAT PROGRAM", msg)
+        else:
+            QMessageBox.critical(self, "ZÁLOHOVAT PROGRAM", f"Záloha selhala: {msg}")
+
+    def _on_restore_program(self):
+        if self._import_running:
+            QMessageBox.warning(self, "OBNOVIT PROGRAM", "Nejprve dokonči probíhající import.")
+            return
+        if not self._ask_password("OBNOVIT PROGRAM", "Zadej heslo pro obnovu:"):
+            QMessageBox.warning(self, "OBNOVIT PROGRAM", "Chybné heslo nebo zrušeno.")
+            return
+
+        path_str, _ = QFileDialog.getOpenFileName(self, "Vyber zálohu", "", "Záloha (*.zip)")
+        if not path_str:
+            return
+        archive = Path(path_str)
+
+        if self._has_existing_data():
+            resp = QMessageBox.question(
+                self,
+                "OBNOVIT PROGRAM",
+                "Program obsahuje data, která budou přepsána. Uložit aktuální stav před obnovou?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if resp == QMessageBox.Yes:
+                backup_path = self._ask_backup_save_path("pred-obnovou")
+                if not backup_path:
+                    QMessageBox.information(self, "OBNOVIT PROGRAM", "Obnova zrušena (nevybrán soubor pro zálohu).")
+                    return
+                ok, msg = self._backup_to_archive(backup_path)
+                if not ok:
+                    QMessageBox.critical(self, "OBNOVIT PROGRAM", f"Záloha před obnovou selhala: {msg}")
+                    return
+
+        errors: list[str] = []
+        self._restore_from_archive(archive, errors)
+
+        self._import_status = "Připraveno."
+        try:
+            self.lbl_run_status.setText(self._import_status)
+        except Exception:
+            pass
+
+        try:
+            self.refresh_all_v2()
+        except Exception as exc:
+            errors.append(f"Refresh UI: {exc}")
+
+        if errors:
+            QMessageBox.warning(self, "OBNOVIT PROGRAM", "Obnova hotova s výjimkami:\n" + "\n".join(errors))
+        else:
+            QMessageBox.information(self, "OBNOVIT PROGRAM", "Program byl obnoven ze zálohy.")
 
     def _on_api_show_toggle(self):
         if self.ed_api_key.echoMode() == QLineEdit.Password:
