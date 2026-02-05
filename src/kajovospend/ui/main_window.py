@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image, ImageFilter, ImageOps
 
 from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl, QPointF, QRectF
-from PySide6.QtGui import QIcon, QPixmap, QImage, QDesktopServices, QPainter, QPen, QColor, QFont
+from PySide6.QtGui import QIcon, QPixmap, QImage, QDesktopServices, QPainter, QPen, QColor, QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QTabWidget, QTableView,
     QLineEdit, QFormLayout, QSplitter, QTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QFileDialog,
@@ -765,6 +765,11 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(QSS)
 
         # start maximized on primary monitor
+        primary = QGuiApplication.primaryScreen()
+        if primary is not None:
+            geom = primary.availableGeometry()
+            self.setGeometry(geom)
+            self.move(geom.topLeft())
         self.showMaximized()
 
         self._build_ui()
