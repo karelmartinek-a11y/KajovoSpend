@@ -33,7 +33,7 @@ from kajovospend.utils.logging_setup import setup_logging
 from kajovospend.db.session import make_engine, make_session_factory
 from kajovospend.db.migrate import init_db
 from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem, ImportJob
-from kajovospend.db.queries import upsert_supplier, rebuild_fts_for_document
+from kajovospend.db.queries import upsert_supplier, rebuild_fts_for_document, create_file_record, add_document
 from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
 from kajovospend.integrations.openai_fallback import (
     OpenAIConfig,
@@ -41,6 +41,7 @@ from kajovospend.integrations.openai_fallback import (
     list_models,
 )
 from kajovospend.service.processor import Processor, safe_move
+from kajovospend.utils.hashing import sha256_file
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 
 from .styles import QSS
@@ -192,6 +193,26 @@ def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
         p.drawLine(14, 18, s - 14, 18)
         p.drawLine(14, 26, s - 14, 26)
         p.drawLine(14, 34, s - 14, 34)
+    elif name == "check":
+        p.setPen(pen(3, QColor("#22C55E")))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(8, 8, s - 16, s - 16)
+        p.drawLine(int(s * 0.28), int(s * 0.55), int(s * 0.45), int(s * 0.7))
+        p.drawLine(int(s * 0.45), int(s * 0.7), int(s * 0.74), int(s * 0.35))
+    elif name == "factory":
+        p.setPen(pen(2))
+        p.setBrush(fill)
+        p.drawRect(8, 14, s - 16, s - 18)
+        p.setBrush(accent)
+        p.drawRect(s // 2 - 4, 6, 8, 8)
+        p.setBrush(Qt.NoBrush)
+        p.drawLine(12, s - 12, s - 12, s - 12)
+        p.drawLine(12, s - 8, s - 12, s - 8)
+    elif name == "list":
+        p.setPen(pen(3, accent))
+        for y in (12, 22, 32):
+            p.drawLine(18, y, s - 12, y)
+            p.drawPoint(10, y)
     else:
         p.setPen(pen(2))
         p.setBrush(fill)
@@ -202,34 +223,35 @@ def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
 
 
 class DashboardTile(QWidget):
-    def __init__(self, title: str, *, icon: str, parent=None):
+    def __init__(self, title: str, *, icon: str, pixmap: QPixmap | None = None, parent=None):
         super().__init__(parent)
         self.setObjectName("DashTile")
 
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 10, 12, 10)
-        lay.setSpacing(12)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
 
         self.icon = QLabel()
-        self.icon.setFixedSize(46, 46)
-        self.icon.setPixmap(_make_icon_pixmap(icon, 44))
+        # 3? p?vodn? velikosti (cca 46 px) ? 150 px
+        self.icon.setFixedSize(150, 150)
+        if pixmap is None:
+            pixmap = _make_icon_pixmap(icon, 150)
+        if not pixmap.isNull():
+            pixmap = pixmap.scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.icon.setPixmap(pixmap)
         self.icon.setAlignment(Qt.AlignCenter)
         self.icon.setObjectName("DashIcon")
-        lay.addWidget(self.icon)
+        lay.addWidget(self.icon, alignment=Qt.AlignCenter)
 
-        mid = QVBoxLayout()
-        mid.setContentsMargins(0, 0, 0, 0)
-        mid.setSpacing(2)
-
-        self.lbl_title = QLabel(title)
-        self.lbl_title.setObjectName("DashTitle")
         self.lbl_value = QLabel("-")
+        f: QFont = self.lbl_value.font()
+        f.setPointSize(72)
+        f.setBold(True)
+        self.lbl_value.setFont(f)
+        self.lbl_value.setAlignment(Qt.AlignCenter)
         self.lbl_value.setObjectName("DashValue")
         self.lbl_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
-        mid.addWidget(self.lbl_title)
-        mid.addWidget(self.lbl_value)
-        lay.addLayout(mid, 1)
+        lay.addWidget(self.lbl_value)
 
     def set_value(self, text: str) -> None:
         self.lbl_value.setText(text)
@@ -712,6 +734,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config_path = config_path
         self.assets_dir = assets_dir
+        self._icon_cache: Dict[str, QPixmap] = {}
         self.cfg = self._load_or_create_config()
         # keep threads/workers alive
         self._threads: List[QThread] = []
@@ -793,9 +816,33 @@ class MainWindow(QMainWindow):
             self.move(geom.topLeft())
         self.showMaximized()
 
+        # build UI and timers
         self._build_ui()
         self._wire_timers()
         self.refresh_all_v2()
+
+    def _tile_icon(self, name: str) -> QPixmap:
+        if name in self._icon_cache:
+            return self._icon_cache[name]
+        mapping = {
+            "inbox": "inbox.png",
+            "quarantine": "shield-warning.png",
+            "duplicate": "copy.png",
+            "check": "check-circle.png",
+            "factory": "factory.png",
+            "list": "list-ol.png",
+            "clock": "clock.png",
+            "status": "gear.png",
+            "db": "db.png",
+        }
+        fname = mapping.get(name, f"{name}.png")
+        p = self.assets_dir / fname
+        if p.exists():
+            px = QPixmap(str(p))
+        else:
+            px = _make_icon_pixmap(name, 44)
+        self._icon_cache[name] = px
+        return px
 
     def _load_or_create_config(self) -> Dict[str, Any]:
         if self.config_path.exists():
@@ -1172,37 +1219,43 @@ class MainWindow(QMainWindow):
         self._stat_labels = {}  # reused by _apply_dashboard (DB stats)
 
         def add_tile(key: str, title: str, icon: str, r: int, c: int, rs: int = 1, cs: int = 1):
-            t = DashboardTile(title, icon=icon)
+            t = DashboardTile(title, icon=icon, pixmap=self._tile_icon(icon))
             dash_grid.addWidget(t, r, c, rs, cs)
             self._dash_tiles[key] = t
             return t
 
-        add_tile("in_waiting", "IN čeká na zpracování", "inbox", 0, 0)
-        add_tile("quarantine_total", "Karanténa celkem", "quarantine", 0, 1)
-        add_tile("quarantine_dup", "Z toho duplicita", "duplicate", 0, 2)
-        add_tile("quarantine_fail", "Z toho nevytěženo", "quarantine", 1, 0)
+        add_tile("in_waiting", "Čeká v IN", "inbox", 0, 0)
+        add_tile("quarantine_total", "Karanténa", "quarantine", 0, 1)
+        add_tile("quarantine_dup", "Duplicity", "duplicate", 0, 2)
 
-        add_tile("import_power", "Import (zapnuto/vypnuto)", "status", 1, 1)
-        add_tile("import_activity", "Co se děje teď", "status", 1, 2)
+        t_docs = add_tile("receipts", "Doklady OK", "check", 1, 0)
+        t_sups = add_tile("suppliers", "Dodavatelé", "factory", 1, 1)
+        t_items = add_tile("items", "Položky", "list", 1, 2)
 
-        add_tile("import_next", "Co následuje", "status", 2, 0)
-        add_tile("import_eta", "Odhad času do konce", "clock", 2, 1)
-        add_tile("queue", "Fronta / běží / zbývá", "status", 2, 2)
+        t_eta = add_tile("import_eta", "Odhad dokončení", "clock", 2, 0)
+        t_power = add_tile("import_power", "Stav služby", "status", 2, 1)
+        t_activity = add_tile("import_activity", "Co se děje teď", "status", 2, 2)
 
-        t_docs = add_tile("receipts", "Kompletně vytěžené účty", "db", 3, 0)
-        t_sups = add_tile("suppliers", "Dodavatelé v DB", "db", 3, 1)
-        t_items = add_tile("items", "Položky v DB", "db", 3, 2)
-        t_sum = add_tile("sum_items_w_vat", "Hodnota položek s DPH", "db", 4, 0, 1, 2)
-        t_sum_wo = add_tile("sum_items_wo_vat", "Hodnota položek bez DPH", "db", 4, 2)
+        t_sum = add_tile("sum_items_w_vat", "Hodnota s DPH", "db", 3, 0)
+        t_sum_wo = add_tile("sum_items_wo_vat", "Hodnota bez DPH", "db", 3, 1)
 
-        # Map tiles to old stat updater keys
+        # Map tiles pro aktualizaci
         self._stat_labels["receipts"] = t_docs.lbl_value
         self._stat_labels["suppliers"] = t_sups.lbl_value
         self._stat_labels["items"] = t_items.lbl_value
         self._stat_labels["sum_items_w_vat"] = t_sum.lbl_value
         self._stat_labels["sum_items_wo_vat"] = t_sum_wo.lbl_value
+        self._stat_labels["import_eta"] = t_eta.lbl_value
+        self._stat_labels["import_power"] = t_power.lbl_value
+        self._stat_labels["import_activity"] = t_activity.lbl_value
 
         rl.addWidget(dash_wrap, 2)
+
+        # Přehled klíčových nastavení
+        self.lbl_cfg_summary = QTextEdit()
+        self.lbl_cfg_summary.setReadOnly(True)
+        self.lbl_cfg_summary.setMaximumHeight(90)
+        rl.addWidget(self.lbl_cfg_summary)
 
         # Optional run log (keeps previous behaviour)
         self.run_log = QTextEdit()
@@ -1210,11 +1263,24 @@ class MainWindow(QMainWindow):
         self.run_log.setPlaceholderText("Průběh zpracování…")
         rl.addWidget(self.run_log, 1)
 
-        self.tabs.addTab(self.tab_run, "RUN")
+        self.tabs.addTab(self.tab_run, "DASHBOARD")
 
         # Provozní panel
         self.tab_ops = QWidget()
         ol = QVBoxLayout(self.tab_ops)
+
+        ops_top = QWidget()
+        ops_top_l = QHBoxLayout(ops_top)
+        ops_top_l.setContentsMargins(0, 0, 0, 0)
+        self.ops_filter = QLineEdit()
+        self.ops_filter.setPlaceholderText("Fulltext (název souboru, status, chyba)")
+        self.ops_refresh_btn = QPushButton("Obnovit")
+        self.ops_filter.textChanged.connect(self.refresh_ops)
+        self.ops_refresh_btn.clicked.connect(self.refresh_ops)
+        ops_top_l.addWidget(self.ops_filter, 1)
+        ops_top_l.addWidget(self.ops_refresh_btn)
+        ol.addWidget(ops_top)
+
         self.ops_table = QTableView()
         self.ops_table.setAlternatingRowColors(True)
         self.ops_table.setShowGrid(True)
@@ -1226,37 +1292,86 @@ class MainWindow(QMainWindow):
         ol.addWidget(self.ops_table)
         self.tabs.addTab(self.tab_ops, "PROVOZNÍ PANEL")
 
-        # NEZPRACOVANÉ (sloučené podezřelé + nerozpoznané)
+        # NEZPRACOVANÉ (karanténa + duplicitní vstupy mimo DB)
         self.tab_unprocessed = QWidget()
         ul = QVBoxLayout(self.tab_unprocessed)
+        self.unproc_split = QSplitter(Qt.Horizontal)
+
+        left_un = QWidget()
+        lul = QVBoxLayout(left_un)
+        lul.setContentsMargins(0, 0, 0, 0)
+
         self.unproc_table = QTableView()
         self.unproc_table.setAlternatingRowColors(True)
         self.unproc_table.setShowGrid(True)
         self.unproc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.unproc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        ul.addWidget(self.unproc_table)
+        self.unproc_table.clicked.connect(self.on_unproc_selected)
+        lul.addWidget(self.unproc_table)
 
         row_actions = QWidget()
         rah = QHBoxLayout(row_actions)
         rah.setContentsMargins(0, 0, 0, 0)
-        self.btn_unproc_openai = QPushButton("Odeslat na OpenAI")
-        self.btn_unproc_manual = QPushButton("Ručně vytěžit")
-        rah.addWidget(self.btn_unproc_openai)
-        rah.addWidget(self.btn_unproc_manual)
+        self.btn_unproc_refresh = QPushButton("Obnovit")
+        self.btn_unproc_save = QPushButton("Uložit ručně")
+        rah.addWidget(self.btn_unproc_refresh)
+        rah.addWidget(self.btn_unproc_save)
         rah.addStretch(1)
-        ul.addWidget(row_actions)
+        lul.addWidget(row_actions)
+
+        self.unproc_split.addWidget(left_un)
+
+        right_un = QWidget()
+        rur = QVBoxLayout(right_un)
+        rur.setContentsMargins(6, 0, 0, 0)
+        self.unproc_preview = PdfPreviewView()
+        self.unproc_preview.setMinimumHeight(180)
+        rur.addWidget(self.unproc_preview, 2)
+
+        form_box = QWidget()
+        fgl = QFormLayout(form_box)
+        fgl.setContentsMargins(0, 0, 0, 0)
+        self.unproc_supplier_name = QLineEdit()
+        self.unproc_ico = QLineEdit()
+        self.unproc_doc_number = QLineEdit()
+        self.unproc_issue_date = QDateEdit()
+        self.unproc_issue_date.setCalendarPopup(True)
+        self.unproc_issue_date.setDate(dt.date.today())
+        self.unproc_total = QDoubleSpinBox()
+        self.unproc_total.setMaximum(1_000_000_000)
+        self.unproc_total.setDecimals(2)
+        self.unproc_currency = QLineEdit("CZK")
+        fgl.addRow("Název dodavatele", self.unproc_supplier_name)
+        fgl.addRow("IČO", self.unproc_ico)
+        fgl.addRow("Číslo dokladu", self.unproc_doc_number)
+        fgl.addRow("Datum", self.unproc_issue_date)
+        fgl.addRow("Celkem s DPH", self.unproc_total)
+        fgl.addRow("Měna", self.unproc_currency)
+        rur.addWidget(form_box)
+
+        items_bar = QWidget()
+        ibl = QHBoxLayout(items_bar)
+        ibl.setContentsMargins(0, 0, 0, 0)
+        self.btn_unproc_item_add = QPushButton("Přidat položku")
+        self.btn_unproc_item_del = QPushButton("Smazat položku")
+        ibl.addWidget(self.btn_unproc_item_add)
+        ibl.addWidget(self.btn_unproc_item_del)
+        ibl.addStretch(1)
+        rur.addWidget(items_bar)
+
+        self.unproc_items_table = QTableView()
+        self.unproc_items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        rur.addWidget(self.unproc_items_table, 3)
+
+        self.unproc_split.addWidget(right_un)
+        self.unproc_split.setStretchFactor(0, 3)
+        self.unproc_split.setStretchFactor(1, 4)
+
+        ul.addWidget(self.unproc_split)
+        self._current_unproc = None
+        self._current_unproc_items_model: EditableItemsModel | None = None
 
         self.tabs.addTab(self.tab_unprocessed, "NEZPRACOVANÉ")
-
-        # $
-
-        # $
-        self.tab_money = QWidget()
-        ml = QVBoxLayout(self.tab_money)
-        self.money_summary = QTextEdit()
-        self.money_summary.setReadOnly(True)
-        ml.addWidget(self.money_summary)
-        self.tabs.addTab(self.tab_money, "$")
 
         # Nastavení
         # Nastavení
@@ -1733,8 +1848,10 @@ class MainWindow(QMainWindow):
         self.btn_sup_ares_detail.clicked.connect(self.on_supplier_ares)
         self.sup_table.clicked.connect(self.on_supplier_selected)
 
-        self.btn_unproc_openai.clicked.connect(self.on_unproc_openai)
-        self.btn_unproc_manual.clicked.connect(self.on_unproc_manual)
+        self.btn_unproc_refresh.clicked.connect(self.refresh_unprocessed)
+        self.btn_unproc_save.clicked.connect(self.on_unproc_save_manual)
+        self.btn_unproc_item_add.clicked.connect(self._unproc_item_add)
+        self.btn_unproc_item_del.clicked.connect(self._unproc_item_del)
 
         # POLOŽKY (per-item search)
         self.btn_items_search.clicked.connect(self._items_new_search_v2)
@@ -3297,39 +3414,90 @@ class MainWindow(QMainWindow):
                 self.preview_view.set_pixmap(px)
 
     def refresh_unprocessed(self):
-        """Sloučený seznam nedokončených dokladů (duplikáty, karanténa, requires_review, chyby)."""
-        with self.sf() as session:
-            data = db_api.list_pending(session)
-            rows = []
-            for d, f in data:
-                status = f.status
-                if status == "PROCESSED" and d.requires_review:
-                    status = "REVIEW"
-                if status == "PROCESSED":
-                    badge = "🟢"
-                elif status in ("NEW", "QUEUED", "RUNNING", "REVIEW"):
-                    badge = "🟠"
+        """Seznam karanténních souborů (FS + DB), řádek = jeden soubor."""
+        try:
+            exts = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+            paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
+            out_base = Path(paths_cfg.get("output_dir", "") or "")
+            qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
+
+            fs_rows = []
+            if qdir.exists():
+                for p in qdir.rglob("*"):
+                    if p.is_file() and p.suffix.lower() in exts:
+                        st = p.stat()
+                        fs_rows.append({
+                            "path": str(p),
+                            "file_id": None,
+                            "size": st.st_size,
+                            "mtime": dt.datetime.fromtimestamp(st.st_mtime),
+                            "source": "FS",
+                        })
+
+            with self.sf() as session:
+                db_files = session.execute(
+                    select(DocumentFile).where(DocumentFile.status == "QUARANTINE").order_by(DocumentFile.created_at.desc())
+                ).scalars().all()
+                db_rows = []
+                for f in db_files:
+                    p = Path(f.current_path or f.original_name or "")
+                    st = None
+                    try:
+                        if p.exists():
+                            st = p.stat()
+                        elif qdir.joinpath(p.name).exists():
+                            p = qdir.joinpath(p.name)
+                            st = p.stat()
+                    except Exception:
+                        st = None
+                    db_rows.append({
+                        "path": str(p),
+                        "file_id": int(f.id),
+                        "size": st.st_size if st else None,
+                        "mtime": dt.datetime.fromtimestamp(st.st_mtime) if st else f.created_at,
+                        "source": "DB",
+                    })
+
+            # merge by path/name to avoid dup rows
+            by_name = {}
+            for r in fs_rows + db_rows:
+                key = Path(r["path"]).name
+                by_name[key] = r
+            self._unproc_rows = list(by_name.values())
+
+            table_rows = []
+            for r in self._unproc_rows:
+                size = r.get("size")
+                if size is None:
+                    size_txt = ""
                 else:
-                    badge = "🔴"
-                registered = f.created_at.isoformat(sep=" ", timespec="seconds") if getattr(f, "created_at", None) else ""
-                finished = f.processed_at.isoformat(sep=" ", timespec="seconds") if getattr(f, "processed_at", None) else ""
-                reason = d.review_reasons or f.last_error or ""
-                rows.append([
-                    badge,
-                    status,
-                    registered,
-                    finished,
-                    d.issue_date.isoformat() if d.issue_date else "",
-                    d.supplier_ico or "",
-                    d.doc_number or "",
-                    d.total_with_vat or 0.0,
-                    f.current_path,
-                    reason,
-                    d.id,
+                    size_txt = f"{size/1024.0:.0f} KB" if size < 1024*1024 else f"{size/1024/1024:.2f} MB"
+                mtime = r.get("mtime")
+                mtime_txt = mtime.isoformat(sep=" ", timespec="seconds") if hasattr(mtime, "isoformat") else ""
+                table_rows.append([
+                    "🔴",
+                    Path(r["path"]).name,
+                    size_txt,
+                    mtime_txt,
+                    r.get("source") or "",
+                    r.get("file_id"),
+                    r.get("path"),
                 ])
-        headers = ["Stav", "Status", "Zaregistrováno", "Dokončeno", "Datum", "IČO", "Číslo", "Celkem s DPH", "Soubor", "Důvod", "ID"]
-        self.unproc_table.setModel(TableModel(headers, rows))
-        self.unproc_table.resizeColumnsToContents()
+
+            headers = ["Stav", "Soubor", "Velikost", "Čas", "Zdroj", "file_id", "path"]
+            self.unproc_table.setModel(TableModel(headers, table_rows))
+            self.unproc_table.resizeColumnsToContents()
+            # auto-select first
+            if table_rows:
+                idx = self.unproc_table.model().index(0, 0)
+                self.unproc_table.setCurrentIndex(idx)
+                self.unproc_table.selectRow(0)
+                self.on_unproc_selected(idx)
+        except Exception as e:
+            try:
+                self.log.error("refresh_unprocessed failed: %s", e)
+            except Exception:
+                pass
 
     
 
@@ -3378,16 +3546,6 @@ class MainWindow(QMainWindow):
             _set("import_power", running_txt)
             _set("import_activity", now_txt)
 
-            if remaining <= 0:
-                next_txt = "Nic. Fronta je prázdná."
-            elif inflight > 0:
-                next_txt = "Dokončení běžících úloh a pokračování dalšími soubory z fronty."
-            else:
-                next_txt = "Start dalšího souboru z fronty."
-            _set("import_next", next_txt)
-
-            _set("queue", f"{queue} / {inflight} / {remaining}")
-
             avg = float(getattr(self, "_avg_job_seconds", 0.0) or 0.0)
             if remaining > 0 and avg > 1.0:
                 eta_sec = int(remaining * avg)
@@ -3430,92 +3588,72 @@ class MainWindow(QMainWindow):
 
 
     def refresh_ops(self):
-        # Provozní panel: 1 řádek = 1 soubor (ImportJob), doplněno o velikost/mtime + semafor.
+        # Provozní panel: historie z tabulky files (hotové záznamy), s fulltextovým filtrem.
+        q = (self.ops_filter.text() or "").strip() if hasattr(self, "ops_filter") else ""
         with self.sf() as session:
-            jobs = session.execute(
-                select(ImportJob)
-                .order_by(ImportJob.created_at.desc())
-                .limit(500)
-            ).scalars().all()
+            stmt = select(DocumentFile).where(DocumentFile.status.notin_(("NEW", "QUEUED", "RUNNING")))
+            if q:
+                like = f"%{q}%"
+                stmt = stmt.where(
+                    (DocumentFile.original_name.like(like))
+                    | (DocumentFile.current_path.like(like))
+                    | (DocumentFile.last_error.like(like))
+                )
+            stmt = stmt.order_by(DocumentFile.processed_at.desc().nullslast(), DocumentFile.created_at.desc()).limit(500)
+            files = list(session.execute(stmt).scalars().all())
 
         rows = []
-        for j in jobs:
-            status = str(j.status or "").upper()
+        paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
+        out_base = Path(paths_cfg.get("output_dir", "") or "")
+        qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
+        ddir = out_base / paths_cfg.get("duplicate_dir_name", "DUPLICITY")
+
+        for f in files:
+            status = (f.status or "").upper()
             if status == "PROCESSED":
-                light = "green"
-                result = "Kompletně vytěženo"
-            elif status in ("NEW", "QUEUED", "RUNNING"):
-                light = "orange"
-                result = "Čeká / zpracovává se"
+                light = "green"; result = "Kompletně vytěženo"
+            elif status == "DUPLICATE":
+                light = "red"; result = "Duplicita"
+            elif status == "QUARANTINE":
+                light = "red"; result = "Karanténa (nekompletní)"
+            elif status == "ERROR":
+                light = "red"; result = "Chyba"
             else:
-                light = "red"
-                if status == "DUPLICATE":
-                    result = "Duplicita (odloženo)"
-                elif status == "QUARANTINE":
-                    result = "Nekompletní – karanténa"
-                else:
-                    result = "Chyba"
+                light = "orange"; result = status or "-"
 
             size = ""
             mtime = ""
-            doc_path = Path(str(j.path or ""))
+            doc_path = Path(str(f.current_path or f.original_name or ""))
             try:
-                if doc_path.exists():
-                    st = doc_path.stat()
-                    size = (
-                        f"{st.st_size/1024.0:.0f} KB"
-                        if st.st_size < 1024 * 1024
-                        else f"{st.st_size/1024/1024:.2f} MB"
-                    )
-                    mtime = dt.datetime.fromtimestamp(st.st_mtime).isoformat(sep=" ", timespec="seconds")
-                else:
-                    out_base = Path(self.cfg.get("paths", {}).get("output_dir", "") or "")
-                    qdir = out_base / self.cfg.get("paths", {}).get("quarantine_dir_name", "KARANTENA")
-                    ddir = out_base / self.cfg.get("paths", {}).get("duplicate_dir_name", "DUPLICITY")
-                    for cand in (out_base / doc_path.name, qdir / doc_path.name, ddir / doc_path.name):
-                        if cand.exists():
-                            st = cand.stat()
-                            size = (
-                                f"{st.st_size/1024.0:.0f} KB"
-                                if st.st_size < 1024 * 1024
-                                else f"{st.st_size/1024/1024:.2f} MB"
-                            )
-                            mtime = dt.datetime.fromtimestamp(st.st_mtime).isoformat(sep=" ", timespec="seconds")
-                            break
+                cand_paths = [doc_path, out_base / doc_path.name, qdir / doc_path.name, ddir / doc_path.name]
+                for cand in cand_paths:
+                    if cand.exists():
+                        st = cand.stat()
+                        size = (
+                            f"{st.st_size/1024.0:.0f} KB"
+                            if st.st_size < 1024 * 1024
+                            else f"{st.st_size/1024/1024:.2f} MB"
+                        )
+                        mtime = dt.datetime.fromtimestamp(st.st_mtime).isoformat(sep=" ", timespec="seconds")
+                        break
             except Exception:
                 pass
-
-            started = j.started_at.isoformat(sep=" ", timespec="seconds") if j.started_at else ""
-            finished = j.finished_at.isoformat(sep=" ", timespec="seconds") if j.finished_at else ""
-            err = (j.error or "").strip()
 
             rows.append(
                 [
                     light,
-                    doc_path.name,
+                    f.processed_at.isoformat(sep=" ", timespec="seconds") if getattr(f, "processed_at", None) else "",
+                    f.original_name or "",
+                    f.current_path or "",
                     size,
-                    mtime,
-                    started,
-                    finished,
                     status,
-                    result,
-                    err,
+                    result if not f.last_error else f.last_error,
                 ]
             )
 
-        headers = [
-            "",
-            "Soubor",
-            "Velikost",
-            "Posl. úprava",
-            "Start",
-            "Konec",
-            "Status",
-            "Výsledek",
-            "Důvod",
-        ]
+        headers = ["", "Zpracováno", "Soubor", "Cesta", "Velikost", "Status", "Výsledek / chyba"]
         snapshot: Tuple[Tuple[str, ...], ...] = tuple(tuple(str(x) for x in r) for r in rows)
-        if snapshot == self._ops_last_snapshot:
+        if snapshot == getattr(self, "_ops_last_snapshot", None):
             return
         self._ops_last_snapshot = snapshot
 
@@ -3527,89 +3665,177 @@ class MainWindow(QMainWindow):
 
 
 
-    def on_unproc_openai(self):
-        ids = self._unproc_selected_ids()
-        if not ids:
-            QMessageBox.information(self, "OpenAI", "Vyber řádky v tabulce.")
-            return
-        api_key = self.ed_api_key.text().strip()
-        model = self.ed_fallback_model.text().strip() or self.ed_primary_model.text().strip() or "auto"
-        if not api_key:
-            QMessageBox.warning(self, "OpenAI", "Není vyplněn API key (Nastavení).")
-            return
-        success_ids: list[int] = []
-        errors: list[str] = []
-        with self.sf() as session:
-            for doc_id in ids:
-                d = session.get(Document, doc_id)
-                if not d:
-                    continue
-                f = session.get(DocumentFile, d.file_id)
-                if not f or not Path(f.current_path).exists():
-                    errors.append(f"ID {doc_id}: soubor nenalezen")
-                    continue
-                try:
-                    ok, raw_resp, used_model = self._call_openai_responses(api_key, model, Path(f.current_path))
-                    if ok:
-                        f.status = "PROCESSED"
-                        f.processed_at = dt.datetime.utcnow()
-                        d.requires_review = False
-                        d.review_reasons = None
-                        d.extraction_method = "openai"
-                        d.extraction_confidence = max(0.7, float(d.extraction_confidence or 0.0))
-                        d.openai_model = used_model or model
-                        d.openai_raw_response = raw_resp
-                        session.add(f)
-                        session.add(d)
-                        success_ids.append(doc_id)
-                    else:
-                        errors.append(f"ID {doc_id}: OpenAI odpověď není úspěšná")
-                except Exception as e:
-                    errors.append(f"ID {doc_id}: {e}")
-            session.commit()
-        self.refresh_unprocessed()
-        if success_ids:
-            QMessageBox.information(self, "OpenAI", f"Odesláno a zpracováno: {len(success_ids)} dokladů.")
-        if errors:
-            QMessageBox.warning(self, "OpenAI", "\n".join(errors))
+    def on_unproc_selected(self, index: QModelIndex):
+        try:
+            model = self.unproc_table.model()
+            if not model or not index.isValid():
+                return
+            row = int(index.row())
+            meta = {
+                "file_id": model.rows[row][5] if hasattr(model, "rows") else None,
+                "path": model.rows[row][6] if hasattr(model, "rows") else None,
+            }
+            self._current_unproc = meta
+        except Exception:
+            self._current_unproc = None
+        # reset form
+        self._reset_unproc_form()
+        path = None
+        try:
+            path = self._current_unproc.get("path")
+        except Exception:
+            path = None
+        if path:
+            QTimer.singleShot(0, lambda: self._load_preview(self.unproc_preview, path))
 
-    def on_unproc_manual(self):
-        ids = self._unproc_selected_ids()
-        if not ids:
-            QMessageBox.information(self, "Ruční vytěžení", "Vyber řádky v tabulce.")
-            return
-        with self.sf() as session:
-            for doc_id in ids:
-                d = session.get(Document, doc_id)
-                if not d:
-                    continue
-                f = session.get(DocumentFile, d.file_id)
-                if f:
-                    f.status = "PROCESSED"
-                    f.processed_at = dt.datetime.utcnow()
-                    session.add(f)
-                d.requires_review = False
-                d.review_reasons = None
-                d.extraction_method = "manual"
-                d.extraction_confidence = 1.0
-                session.add(d)
-            session.commit()
-        self.refresh_unprocessed()
-        QMessageBox.information(self, "Ruční vytěžení", "Označeno jako ručně zpracované.")
+    def _reset_unproc_form(self):
+        self.unproc_supplier_name.setText("")
+        self.unproc_ico.setText("")
+        self.unproc_doc_number.setText("")
+        self.unproc_issue_date.setDate(dt.date.today())
+        self.unproc_total.setValue(0.0)
+        self.unproc_currency.setText("CZK")
+        self._current_unproc_items_model = EditableItemsModel([])
+        self.unproc_items_table.setModel(self._current_unproc_items_model)
+        self._update_unproc_total_hint()
 
-    def _unproc_selected_ids(self) -> list[int]:
-        model = self.unproc_table.model()
-        sm = self.unproc_table.selectionModel()
-        if not model or not sm:
-            return []
-        ids = []
-        for idx in sm.selectedRows():
+    def _unproc_item_add(self):
+        if not hasattr(self, "_current_unproc_items_model") or self._current_unproc_items_model is None:
+            self._current_unproc_items_model = EditableItemsModel([])
+            self.unproc_items_table.setModel(self._current_unproc_items_model)
+        self._current_unproc_items_model.insertRows(self._current_unproc_items_model.rowCount(), 1)
+        self._update_unproc_total_hint()
+
+    def _unproc_item_del(self):
+        model = getattr(self, "_current_unproc_items_model", None)
+        if not model:
+            return
+        sel = self.unproc_items_table.selectionModel()
+        if not sel or not sel.hasSelection():
+            return
+        row = int(sel.selectedRows()[0].row())
+        model.removeRows(row, 1)
+        self._update_unproc_total_hint()
+
+    def _update_unproc_total_hint(self):
+        """Vizuální kontrola: součet položek vs. zadaný total."""
+        try:
+            model = getattr(self, "_current_unproc_items_model", None)
+            rows = model.rows() if model else []
+            sum_lines = 0.0
+            for r in rows:
+                sum_lines += float(r.get("line_total") or 0.0)
+            current_total = float(self.unproc_total.value())
+            delta = abs(sum_lines - current_total)
+            self.unproc_total.setStyleSheet("")
+            if delta > 0.01:
+                # žluté pozadí + tooltip
+                self.unproc_total.setStyleSheet("background-color: #FFF7D6;")
+                self.unproc_total.setToolTip(f"Součet položek: {sum_lines:.2f} (odchylka {delta:.2f})")
+            else:
+                self.unproc_total.setToolTip("")
+        except Exception:
+            pass
+
+    def on_unproc_save_manual(self):
+        meta = getattr(self, "_current_unproc", None) or {}
+        path = Path(str(meta.get("path") or ""))
+        if not path.exists():
+            QMessageBox.warning(self, "Ruční uložení", "Soubor neexistuje (možná byl přesunut).")
+            return
+
+        ico = self.unproc_ico.text().strip()
+        doc_no = self.unproc_doc_number.text().strip()
+        supplier_name = self.unproc_supplier_name.text().strip() or None
+        issue_dt = self.unproc_issue_date.date().toPython()
+        total = float(self.unproc_total.value())
+        currency = (self.unproc_currency.text() or "CZK").strip() or "CZK"
+        items_model = getattr(self, "_current_unproc_items_model", None)
+        items_rows = items_model.rows() if items_model else []
+        if not items_rows:
+            QMessageBox.warning(self, "Ruční uložení", "Přidejte alespoň jednu položku.")
+            return
+        if not ico or not doc_no or not issue_dt or total == 0.0:
+            QMessageBox.warning(self, "Ruční uložení", "IČO, číslo dokladu, datum a celková částka jsou povinné.")
+            return
+
+        # vizuální kontrola součtu položek vs total s možností potvrdit
+        sum_lines = 0.0
+        for r in items_rows:
             try:
-                doc_id = int(model.rows[idx.row()][10])
-                ids.append(doc_id)
+                sum_lines += float(r.get("line_total") or 0.0)
             except Exception:
-                continue
-        return ids
+                pass
+        delta = abs(sum_lines - total)
+        if delta > 0.05:
+            resp = QMessageBox.question(
+                self,
+                "Odchylka součtu položek",
+                f"Součet položek {sum_lines:.2f} se liší od celkové částky {total:.2f} o {delta:.2f}.\nChcete i tak uložit?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if resp != QMessageBox.Yes:
+                return
+
+        # persist
+        paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
+        out_base = Path(paths_cfg.get("output_dir", "") or "")
+        qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
+
+        with self.sf() as session:
+            sha = sha256_file(path)
+            file_rec = None
+            file_id = meta.get("file_id")
+            if file_id:
+                file_rec = session.get(DocumentFile, int(file_id))
+            if not file_rec:
+                file_rec = session.execute(select(DocumentFile).where(DocumentFile.sha256 == sha)).scalar_one_or_none()
+            if not file_rec:
+                file_rec = create_file_record(
+                    session,
+                    sha256=sha,
+                    original_name=path.name,
+                    path=str(path),
+                    pages=1,
+                    status="QUARANTINE",
+                    mime_type="application/pdf" if path.suffix.lower() == ".pdf" else "image",
+                )
+            supplier = upsert_supplier(session, ico, name=supplier_name)
+            doc = add_document(
+                session,
+                file_id=int(file_rec.id),
+                supplier_id=int(supplier.id) if supplier else None,
+                supplier_ico=ico,
+                doc_number=doc_no,
+                bank_account=None,
+                issue_date=issue_dt,
+                total_with_vat=total,
+                currency=currency,
+                confidence=1.0,
+                method="manual",
+                requires_review=False,
+                review_reasons=None,
+                items=items_rows,
+                page_from=1,
+                page_to=1,
+            )
+            # move file from karanténa -> OUT root
+            moved = safe_move(path, out_base, path.name)
+            file_rec.current_path = str(moved)
+            file_rec.status = "PROCESSED"
+            file_rec.processed_at = dt.datetime.utcnow()
+            session.add(file_rec)
+            session.add(doc)
+            rebuild_fts_for_document(session, doc.id, full_text="\n".join([r.get("name","") for r in items_rows]))
+            session.commit()
+
+        QMessageBox.information(self, "Ruční uložení", "Doklad byl uložen a přesunut do OUT.")
+        self.refresh_unprocessed()
+        try:
+            self._docs_new_search_v2()
+        except Exception:
+            pass
 
     def _enhance_for_openai(self, image: Image.Image) -> Image.Image:
         img = image.convert("RGB")
@@ -3814,7 +4040,7 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.information(self, "Export", f"Uloženo: {path}")
 
-    def _apply_dashboard(self, c: Dict[str, Any] | None, rs: Dict[str, Any] | None) -> None:
+    def _apply_dashboard(self, c: Dict[str, Any] | None, rs: Dict[str, Any] | None, st: Dict[str, Any] | None = None) -> None:
         # RUN dashboard values (DB + filesystem + status)
         try:
             # keep original import status string if used elsewhere
@@ -3824,17 +4050,15 @@ class MainWindow(QMainWindow):
 
         if c:
             try:
-                q = int(c.get("quarantine", 0) or 0)
-                d = int(c.get("duplicates", 0) or 0)
-                total = q + d
+                q_fs = int(c.get("quarantine_fs", c.get("quarantine", 0)) or 0)
+                d_fs = int(c.get("duplicates_fs", c.get("duplicates", 0)) or 0)
                 try:
-                    self._dash_tiles["quarantine_total"].set_value(str(total))
-                    self._dash_tiles["quarantine_dup"].set_value(str(d))
-                    self._dash_tiles["quarantine_fail"].set_value(str(q))
+                    self._dash_tiles["quarantine_total"].set_value(str(q_fs))
+                    self._dash_tiles["quarantine_dup"].set_value(str(d_fs))
                 except Exception:
                     pass
 
-                in_wait = int(getattr(self, "_dash_in_waiting", 0) or 0)
+                in_wait = int(getattr(self, "_dash_in_waiting", 0) or c.get("in_waiting", 0) or 0)
                 try:
                     self._dash_tiles["in_waiting"].set_value(str(in_wait))
                 except Exception:
@@ -3863,6 +4087,18 @@ class MainWindow(QMainWindow):
                 self._stat_labels["sum_items_wo_vat"].setText(fmt_money(rs.get("sum_items_wo_vat", 0.0) or 0.0))
             if "sum_items_w_vat" in self._stat_labels:
                 self._stat_labels["sum_items_w_vat"].setText(fmt_money(rs.get("sum_items_w_vat", 0.0) or 0.0))
+            if st and isinstance(st, dict):
+                power_txt = "Zapnuto" if st.get("running") else "Vypnuto"
+                activity = st.get("current_phase") or ""
+                cur = st.get("current_path") or ""
+                if cur:
+                    activity = f"{activity} • {Path(cur).name}"
+                if "import_power" in self._stat_labels:
+                    self._stat_labels["import_power"].setText(power_txt)
+                if "import_activity" in self._stat_labels:
+                    self._stat_labels["import_activity"].setText(activity or "-")
+                if "import_eta" in self._stat_labels and st.get("eta_txt"):
+                    self._stat_labels["import_eta"].setText(st.get("eta_txt"))
         except Exception:
             pass
 
@@ -3878,19 +4114,50 @@ class MainWindow(QMainWindow):
             rs = None
             in_waiting = 0
             avg_job_seconds = 0.0
+            quarantine_fs = 0
+            duplicates_fs = 0
+            st_dict: Dict[str, Any] | None = None
             try:
-                # filesystem: INPUT waiting
+                exts = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+                paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
+                input_dir = Path(paths_cfg.get("input_dir", "") or "")
+                out_base = Path(paths_cfg.get("output_dir", "") or "")
+                qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
+                ddir = out_base / paths_cfg.get("duplicate_dir_name", "DUPLICITY")
+
                 try:
-                    input_dir = Path(self.cfg.get("paths", {}).get("input_dir", "") or "")
                     if input_dir.exists():
-                        exts = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
                         in_waiting = len([p for p in input_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
                 except Exception:
                     in_waiting = 0
+                try:
+                    if qdir.exists():
+                        quarantine_fs = len([p for p in qdir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
+                    if ddir.exists():
+                        duplicates_fs = len([p for p in ddir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
+                except Exception:
+                    quarantine_fs = quarantine_fs or 0
+                    duplicates_fs = duplicates_fs or 0
 
                 with self.sf() as session:
                     c = db_api.counts(session)
+                    # doplň FS počty pro dashboard
+                    if isinstance(c, dict):
+                        c["in_waiting"] = in_waiting
+                        c["quarantine_fs"] = quarantine_fs
+                        c["duplicates_fs"] = duplicates_fs
                     rs = db_api.run_stats(session)
+                    st = db_api.service_state(session)
+                    if st:
+                        st_dict = {
+                            "running": bool(st.running),
+                            "current_phase": st.current_phase,
+                            "current_path": st.current_path,
+                            "queue_size": int(st.queue_size or 0),
+                            "inflight": int(st.inflight or 0),
+                            "last_error": st.last_error,
+                            "last_success": st.last_success,
+                        }
 
                     # recent average processing time (PROCESSED only; best-effort)
                     try:
@@ -3921,15 +4188,52 @@ class MainWindow(QMainWindow):
                     self.log.debug("run tab stats failed: %s", e)
                 except Exception:
                     pass
-            return (c, rs, in_waiting, avg_job_seconds)
+            return (c, rs, in_waiting, avg_job_seconds, quarantine_fs, duplicates_fs, st_dict)
 
         def done(res):
             try:
-                c, rs, in_waiting, avg_job_seconds = res
+                c, rs, in_waiting, avg_job_seconds, q_fs, d_fs, st_dict = res
                 self._dash_last_counts = c
                 self._dash_in_waiting = int(in_waiting or 0)
                 self._avg_job_seconds = float(avg_job_seconds or 0.0)
-                self._apply_dashboard(c, rs)
+                if isinstance(c, dict):
+                    c.setdefault("quarantine_fs", q_fs)
+                    c.setdefault("duplicates_fs", d_fs)
+                # ETA text
+                eta_txt = None
+                try:
+                    remaining = int(self._dash_in_waiting or 0)
+                    if st_dict and isinstance(st_dict, dict):
+                        remaining += int(st_dict.get("queue_size") or 0)
+                    if remaining > 0 and self._avg_job_seconds > 1.0:
+                        eta_sec = int(remaining * self._avg_job_seconds)
+                        mm, ss = divmod(eta_sec, 60)
+                        hh, mm = divmod(mm, 60)
+                        if hh:
+                            eta_txt = f"{hh} h {mm} min"
+                        elif mm:
+                            eta_txt = f"{mm} min"
+                        else:
+                            eta_txt = f"{ss} s"
+                except Exception:
+                    eta_txt = None
+                if st_dict is not None and eta_txt:
+                    st_dict["eta_txt"] = eta_txt
+                self._apply_dashboard(c, rs, st_dict)
+                try:
+                    paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
+                    ocr_cfg = self.cfg.get("ocr", {}) if isinstance(self.cfg, dict) else {}
+                    openai_cfg = self.cfg.get("openai", {}) if isinstance(self.cfg, dict) else {}
+                    txt = []
+                    txt.append(f"IN: {paths_cfg.get('input_dir','')}")
+                    txt.append(f"OUT: {paths_cfg.get('output_dir','')}")
+                    txt.append(f"KARANTENA: {paths_cfg.get('quarantine_dir_name','KARANTENA')}")
+                    txt.append(f"DUPLICITY: {paths_cfg.get('duplicate_dir_name','DUPLICITY')}")
+                    txt.append(f"OCR min_conf: {ocr_cfg.get('min_confidence', '')}")
+                    txt.append(f"OpenAI: {'ON' if openai_cfg.get('enabled') else 'OFF'}")
+                    self.lbl_cfg_summary.setPlainText("\n".join(txt))
+                except Exception:
+                    pass
             finally:
                 self._dash_refresh_inflight = False
 
