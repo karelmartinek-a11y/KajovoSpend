@@ -103,13 +103,13 @@ class TrafficLightDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option, index):
         v = index.data(Qt.DisplayRole)
         # default color
-        col = QColor("#64748B")  # slate
+        col = QColor("#6B7280")  # slate
         if isinstance(v, str):
             vv = v.lower()
             if vv == "green":
-                col = QColor("#22C55E")
+                col = QColor("#7FB51F")
             elif vv in ("orange", "amber", "yellow"):
-                col = QColor("#F59E0B")
+                col = QColor("#F5B800")
             elif vv == "red":
                 col = QColor("#EF4444")
 
@@ -122,7 +122,7 @@ class TrafficLightDelegate(QStyledItemDelegate):
         cy = r.y() + r.height() // 2
         circle = QRectF(cx - d / 2, cy - d / 2, d, d)
 
-        painter.setPen(QPen(QColor("#0B1220"), 1))
+        painter.setPen(QPen(QColor("#FFFFFF"), 1))
         painter.setBrush(col)
         painter.drawEllipse(circle)
         painter.restore()
@@ -138,9 +138,9 @@ def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
 
     p = QPainter(img)
     p.setRenderHint(QPainter.Antialiasing, True)
-    stroke = QColor("#93C5FD")
-    fill = QColor("#1F2937")
-    accent = QColor("#2563EB")
+    stroke = QColor("#2F8FE5")
+    fill = QColor("#F3F4F6")
+    accent = QColor("#2F8FE5")
 
     def pen(w: int = 2, c: QColor | None = None) -> QPen:
         q = QPen(c or stroke)
@@ -164,7 +164,7 @@ def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
         p.setPen(pen(2))
         p.setBrush(fill)
         p.drawRoundedRect(8, 10, s - 16, s - 16, 8, 8)
-        p.setPen(pen(3, QColor("#F59E0B")))
+        p.setPen(pen(3, QColor("#F5B800")))
         p.drawLine(s // 2, 16, s // 2, s - 16)
         p.drawPoint(s // 2, s - 12)
     elif name == "duplicate":
@@ -176,7 +176,7 @@ def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
         p.setPen(pen(2))
         p.setBrush(fill)
         p.drawRoundedRect(8, 8, s - 16, s - 16, 10, 10)
-        p.setPen(pen(3, QColor("#22C55E")))
+        p.setPen(pen(3, QColor("#7FB51F")))
         p.drawLine(14, s // 2, s - 14, s // 2)
     elif name == "clock":
         p.setPen(pen(2))
@@ -194,7 +194,7 @@ def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
         p.drawLine(14, 26, s - 14, 26)
         p.drawLine(14, 34, s - 14, 34)
     elif name == "check":
-        p.setPen(pen(3, QColor("#22C55E")))
+        p.setPen(pen(3, QColor("#7FB51F")))
         p.setBrush(Qt.NoBrush)
         p.drawEllipse(8, 8, s - 16, s - 16)
         p.drawLine(int(s * 0.28), int(s * 0.55), int(s * 0.45), int(s * 0.7))
@@ -1581,8 +1581,8 @@ class MainWindow(QMainWindow):
             "Vyžaduje heslo a potvrzení; akce je nevratná."
         )
         self.btn_reset_program.setStyleSheet(
-            "QPushButton {background-color:#b91c1c; color:white; font-weight:bold;} "
-            "QPushButton:hover {background-color:#dc2626;}"
+            "QPushButton {background-color:#DC2626; color:white; font-weight:bold;} "
+            "QPushButton:hover {background-color:#DC2626;}"
         )
 
         self.cb_allow_synth.setToolTip(
@@ -3730,7 +3730,7 @@ class MainWindow(QMainWindow):
             self.unproc_total.setStyleSheet("")
             if delta > 0.01:
                 # žluté pozadí + tooltip
-                self.unproc_total.setStyleSheet("background-color: #FFF7D6;")
+                self.unproc_total.setStyleSheet("background-color: #FFF4CC;")
                 self.unproc_total.setToolTip(f"Součet položek: {sum_lines:.2f} (odchylka {delta:.2f})")
             else:
                 self.unproc_total.setToolTip("")

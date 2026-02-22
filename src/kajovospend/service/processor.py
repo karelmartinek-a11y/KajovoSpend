@@ -1549,6 +1549,59 @@ class Processor:
             # de-dup důvodů, stabilní pořadí
             extracted.review_reasons = list(dict.fromkeys(reasons))
 
+            # Pouze plně kompletní doklady smí vstoupit do DB (dodavatelé/doklady/položky).
+            is_complete = bool(not requires_review)
+            if not is_complete:
+                any_requires_review = True
+                try:
+                    file_record.last_error = "; ".join(dict.fromkeys(reasons)) if reasons else "nekompletní vytěžení"
+                    session.add(file_record)
+                except Exception:
+                    pass
+                continue
+
+            # Business duplicita per-doc
+            if extracted.supplier_ico and extracted.doc_number and extracted.issue_date:
+                try:
+                    dup = session.execute(
+                        text(
+                            "SELECT id FROM documents "
+                            "WHERE supplier_ico = :ico AND doc_number = :dn AND issue_date = :d "
+                            "LIMIT 1"
+                        ),
+                        {"ico": extracted.supplier_ico, "dn": extracted.doc_number, "d": extracted.issue_date},
+                    ).fetchone()
+                    if dup:
+                        dup_dir = out_base / self.cfg["paths"].get("duplicate_dir_name", "DUPLICITY")
+                        moved = safe_move(path, dup_dir, path.name)
+                        file_record.current_path = str(moved)
+                        file_record.status = "DUPLICATE"
+                        file_record.processed_at = dt.datetime.utcnow()
+                        session.add(file_record)
+                        session.flush()
+                        return {
+                            "status": "DUPLICATE",
+                            "sha256": sha,
+                            "file_id": file_record.id,
+                            "moved_to": str(moved),
+                            "duplicate_of_document_id": int(dup[0]),
+                            "text_method": text_method,
+                            "text_debug": text_debug,
+                        }
+                except Exception as e:
+                    reasons.append(f"dup-check selhal: {e}")
+                    requires_review = True
+
+            last_error_msg = "; ".join(dict.fromkeys(reasons)) if reasons else "nekompletní vytěžení"
+            if requires_review:
+                any_requires_review = True
+                try:
+                    file_record.last_error = last_error_msg
+                    session.add(file_record)
+                except Exception:
+                    pass
+                continue
+
             supplier_id = None
             supplier_name_guess: str | None = None
             if extracted.supplier_ico:
@@ -1594,38 +1647,15 @@ class Processor:
                     )
                     supplier_id = s.id
 
-
-            # Business duplicita per-doc
-            if extracted.supplier_ico and extracted.doc_number and extracted.issue_date:
+            last_error_msg = "; ".join(dict.fromkeys(reasons)) if reasons else "nekompletní vytěžení"
+            if requires_review:
+                any_requires_review = True
                 try:
-                    dup = session.execute(
-                        text(
-                            "SELECT id FROM documents "
-                            "WHERE supplier_ico = :ico AND doc_number = :dn AND issue_date = :d "
-                            "LIMIT 1"
-                        ),
-                        {"ico": extracted.supplier_ico, "dn": extracted.doc_number, "d": extracted.issue_date},
-                    ).fetchone()
-                    if dup:
-                        dup_dir = out_base / self.cfg["paths"].get("duplicate_dir_name", "DUPLICITY")
-                        moved = safe_move(path, dup_dir, path.name)
-                        file_record.current_path = str(moved)
-                        file_record.status = "DUPLICATE"
-                        file_record.processed_at = dt.datetime.utcnow()
-                        session.add(file_record)
-                        session.flush()
-                        return {
-                            "status": "DUPLICATE",
-                            "sha256": sha,
-                            "file_id": file_record.id,
-                            "moved_to": str(moved),
-                            "duplicate_of_document_id": int(dup[0]),
-                            "text_method": text_method,
-                            "text_debug": text_debug,
-                        }
-                except Exception as e:
-                    reasons.append(f"dup-check selhal: {e}")
-                    requires_review = True
+                    file_record.last_error = last_error_msg
+                    session.add(file_record)
+                except Exception:
+                    pass
+                continue
 
             doc = add_document(
                 session,

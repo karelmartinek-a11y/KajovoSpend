@@ -28,15 +28,15 @@ openai:
   auto_enable: true
   primary_enabled: true
   fallback_enabled: true
-  fallback_model: ''
+  fallback_model: gpt-5
   use_json_schema: true
   temperature: 0.0
   max_output_tokens: 2000
   timeout_sec: 60
-  image_dpi: 300
+  image_dpi: 150
   image_max_pages: 3
-  image_enhance: true
-  image_variants: 2
+  image_enhance: false
+  image_variants: 1
   allow_synthetic_items: false
 performance:
   image_max_px: 3000

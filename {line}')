@@ -1,0 +1,1 @@
+for idx,line in enumerate(lines[start:end],start): print(f'{idx}: 
