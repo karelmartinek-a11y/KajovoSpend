@@ -15,3 +15,8 @@ modules:
     status: DONE
     pr: pending-local
     note: opraven pád CI `pytest: command not found` přidáním explicitního pip install pytest
+
+  tests/integration:
+    status: DONE
+    pr: pending-local
+    note: test extraction fixtures je stabilizovaný mockem ARES + processor neblokuje uložení při výpadku ARES

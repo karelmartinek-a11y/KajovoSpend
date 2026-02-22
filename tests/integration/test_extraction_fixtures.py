@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -110,23 +111,27 @@ class TestExtractionFixturesHarness(unittest.TestCase):
             pdf_path.write_bytes(_make_minimal_pdf_with_text(txt))
 
             proc = Processor(cfg, paths, log)
-            with sf() as session:
-                res = proc.process_path(session, pdf_path)
-                session.commit()
+            with patch("kajovospend.service.processor.fetch_by_ico") as fetch_ares:
+                from kajovospend.integrations.ares import AresRecord
 
-                self.assertIn(res.get("status"), {"PROCESSED", "QUARANTINE"})
-                self.assertEqual(res.get("text_method"), "embedded")
+                fetch_ares.return_value = AresRecord(ico="12345678", name="ACME")
+                with sf() as session:
+                    res = proc.process_path(session, pdf_path)
+                    session.commit()
 
-                doc_ids = list(res.get("document_ids") or [])
-                self.assertTrue(doc_ids, "expected at least 1 extracted document")
+                    self.assertIn(res.get("status"), {"PROCESSED", "QUARANTINE"})
+                    self.assertEqual(res.get("text_method"), "embedded")
 
-                doc = session.execute(select(Document).where(Document.id == int(doc_ids[0]))).scalar_one()
-                items = session.execute(select(LineItem).where(LineItem.document_id == doc.id)).scalars().all()
-                self.assertTrue(doc.supplier_ico)
-                self.assertTrue(doc.doc_number)
-                self.assertIsNotNone(doc.issue_date)
-                self.assertIsNotNone(doc.total_with_vat)
-                self.assertGreaterEqual(len(items), 1)
+                    doc_ids = list(res.get("document_ids") or [])
+                    self.assertTrue(doc_ids, "expected at least 1 extracted document")
+
+                    doc = session.execute(select(Document).where(Document.id == int(doc_ids[0]))).scalar_one()
+                    items = session.execute(select(LineItem).where(LineItem.document_id == doc.id)).scalars().all()
+                    self.assertTrue(doc.supplier_ico)
+                    self.assertTrue(doc.doc_number)
+                    self.assertIsNotNone(doc.issue_date)
+                    self.assertIsNotNone(doc.total_with_vat)
+                    self.assertGreaterEqual(len(items), 1)
 
             engine.dispose()
 
