@@ -14,4 +14,4 @@ modules:
   ci:
     status: DONE
     pr: pending-local
-    note: přidán základní GitHub Actions workflow a pre-commit hooks
+    note: opraven pád CI `pytest: command not found` přidáním explicitního pip install pytest
