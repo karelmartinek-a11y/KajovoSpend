@@ -1,0 +1,9 @@
+flowchart LR
+    A[Detekce souboru] --> B{Podporovaný typ?}
+    B -- Ne --> Z[Konec]
+    B -- Ano --> C[Hash + deduplikace]
+    C --> D[Extrakce textu PDF/OCR]
+    D --> E[Parser polí]
+    E --> F{Validace OK?}
+    F -- Ano --> G[Uložení do DB + OUTPUT]
+    F -- Ne --> H[KARANTENA]

@@ -1,0 +1,9 @@
+flowchart TD
+    User[Uživatel] --> GUI[KájovoSpend GUI]
+    User --> Input[INPUT složka]
+    Input --> Service[Import service]
+    Service --> ARES[ARES API]
+    Service --> OpenAI[OpenAI fallback volitelně]
+    Service --> DB[(SQLite)]
+    GUI --> DB
+    Service --> Output[OUTPUT/KARANTENA/DUPLICITY]

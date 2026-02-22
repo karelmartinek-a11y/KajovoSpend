@@ -1,0 +1,17 @@
+modules:
+  integrations/ares:
+    status: DONE
+    pr: pending-local
+    note: odstraněn globální socket timeout side-effect
+  tests/unit:
+    status: IN_PROGRESS
+    pr: pending-local
+    note: přidán regresní test pro ares timeout izolaci
+  docs:
+    status: DONE
+    pr: pending-local
+    note: doplněna architektura, security, contributing a diagramy
+  ci:
+    status: DONE
+    pr: pending-local
+    note: přidán základní GitHub Actions workflow a pre-commit hooks

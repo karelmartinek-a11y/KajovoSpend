@@ -1,0 +1,24 @@
+flowchart TB
+    subgraph UI
+      MW[main_window.py]
+      DBAPI[ui/db_api.py]
+    end
+    subgraph Service
+      APP[service/app.py]
+      WATCH[service/watcher.py]
+      PROC[service/processor.py]
+    end
+    subgraph Core
+      EXT[extract/*]
+      OCR[ocr/*]
+      DB[db/*]
+      INT[integrations/*]
+      UTL[utils/*]
+    end
+    MW --> DBAPI --> DB
+    WATCH --> APP --> PROC
+    PROC --> EXT
+    PROC --> OCR
+    PROC --> INT
+    PROC --> DB
+    PROC --> UTL

@@ -1,0 +1,10 @@
+sequenceDiagram
+    participant W as Watcher
+    participant P as Processor
+    participant X as Extractor
+    participant D as DB
+    W->>P: nový PDF soubor
+    P->>X: extract_text()
+    X-->>P: text + confidence
+    P->>D: insert document + items
+    P-->>W: status PROCESSED/KARANTENA

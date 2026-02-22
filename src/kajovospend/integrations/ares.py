@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import socket
 from dataclasses import dataclass, field
 import re
 from typing import Optional
@@ -110,10 +109,8 @@ def fetch_by_ico(
             return rec
 
     url = f"{_ARES_BASE_URL}/ekonomicke-subjekty/{ico_norm}"
+    start = dt.datetime.utcnow()
     try:
-        start = dt.datetime.utcnow()
-        prev_timeout = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(timeout)
         resp = requests.get(
             url,
             timeout=(min(timeout, 5), timeout),
@@ -127,10 +124,6 @@ def fetch_by_ico(
     except Exception as e:
         raise AresError(f"Nepodařilo se načíst ARES pro IČO {ico_norm}: {e}") from e
     finally:
-        try:
-            socket.setdefaulttimeout(prev_timeout)
-        except Exception:
-            pass
         try:
             elapsed = (dt.datetime.utcnow() - start).total_seconds()
             log.debug("ares-fetch", extra={"ico": ico_norm, "seconds": elapsed})
