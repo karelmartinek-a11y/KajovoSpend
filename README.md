@@ -74,3 +74,17 @@ Doporučené:
 Alternativně lze spustit přímo skript:
 
 - `py run_gui.py`
+
+
+## Testování
+
+```powershell
+PYTHONPATH=src pytest tests
+```
+
+## Dokumentace
+
+- Architektura: `docs/ARCHITECTURE.md`
+- Bezpečnost: `docs/SECURITY.md`
+- Přispívání: `docs/CONTRIBUTING.md`
+- Diagramy: `docs/diagrams/`

@@ -1635,7 +1635,18 @@ class Processor:
                         extracted.supplier_ico = ares.ico
                     except Exception as e:
                         reasons.append(f"ARES selhal: {e}")
-                        requires_review = True
+                        # ARES je pouze enrich krok; při výpadku sítě neblokujeme uložení dokladu.
+                        # Zachováme IČO z extrakce a vytvoříme/aktualizujeme lokálního dodavatele best-effort.
+                        try:
+                            s = upsert_supplier(
+                                session,
+                                str(extracted.supplier_ico),
+                                name=self._extract_supplier_name_guess(ocr_text),
+                                overwrite=False,
+                            )
+                            supplier_id = s.id
+                        except Exception:
+                            pass
                 else:
                     # Pseudo-IČO: uložíme dodavatele lokálně jen se jménem (pokud ho umíme odhadnout).
                     supplier_name_guess = self._extract_supplier_name_guess(ocr_text)
