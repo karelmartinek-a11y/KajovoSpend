@@ -41,6 +41,7 @@ def upsert_supplier(
     address: str | None = None,
     is_vat_payer: bool | None = None,
     ares_last_sync: dt.datetime | None = None,
+    pending_ares: bool | None = None,
     *,
     legal_form: str | None = None,
     street: str | None = None,
@@ -87,6 +88,8 @@ def upsert_supplier(
     _set("is_vat_payer", is_vat_payer)
     if ares_last_sync is not None:
         s.ares_last_sync = ares_last_sync
+    if pending_ares is not None:
+        s.pending_ares = bool(pending_ares)
 
     session.flush()
     return s
@@ -104,6 +107,11 @@ def _to_float(v, default: float = 0.0) -> float:
         return float(s)
     except Exception:
         return float(default)
+
+
+def _infer_doc_type(doc_number: str | None) -> str:
+    s = str(doc_number or "").strip()
+    return "invoice" if s else "receipt"
 
 
 def _to_str(v, max_len: int) -> str | None:
@@ -136,7 +144,13 @@ def add_document(session: Session, file_id: int, supplier_id: int | None, suppli
                  items: Iterable[dict],
                  *,
                  page_from: int = 1,
-                 page_to: int | None = None) -> Document:
+                 page_to: int | None = None,
+                 total_without_vat: float | None = None,
+                 total_vat_amount: float | None = None,
+                 vat_breakdown_json: str | None = None,
+                 processing_profile: str | None = None) -> Document:
+    doc_type = _infer_doc_type(doc_number)
+
     d = Document(
         file_id=file_id,
         supplier_id=supplier_id,
@@ -145,6 +159,9 @@ def add_document(session: Session, file_id: int, supplier_id: int | None, suppli
         bank_account=bank_account,
         issue_date=issue_date,
         total_with_vat=total_with_vat,
+        total_without_vat=total_without_vat,
+        total_vat_amount=total_vat_amount,
+        vat_breakdown_json=vat_breakdown_json,
         currency=currency,
         extraction_confidence=confidence,
         extraction_method=method,
@@ -152,31 +169,98 @@ def add_document(session: Session, file_id: int, supplier_id: int | None, suppli
         review_reasons=review_reasons,
         page_from=int(page_from or 1),
         page_to=(int(page_to) if page_to is not None else None),
+        doc_type=doc_type,
+        processing_profile=processing_profile,
     )
     session.add(d)
     session.flush()
     line_no = 1
+    sum_net = 0.0
+    sum_gross = 0.0
+    has_any_net = False
+    has_any_gross = False
+
     for it in items:
         qty = _to_float(it.get("quantity"), 1.0)
-        unit_price = it.get("unit_price")
-        unit_price_f = None if unit_price is None else _to_float(unit_price, 0.0)
-        line_total = _to_float(it.get("line_total"), 0.0)
-        # If line_total is missing/zero but unit_price exists, deterministically compute.
-        if (line_total == 0.0) and (unit_price_f is not None) and (qty != 0.0):
-            line_total = round(qty * unit_price_f, 2)
+        if qty == 0.0:
+            qty = 1.0
+
+        vat_rate = _to_float(it.get("vat_rate"), 0.0)
+
+        unit_price_legacy = it.get("unit_price")
+        unit_price_legacy_f = None if unit_price_legacy is None else _to_float(unit_price_legacy, 0.0)
+        line_total_legacy = _to_float(it.get("line_total"), 0.0)
+
+        unit_price_net = it.get("unit_price_net")
+        unit_price_net_f = None if unit_price_net is None else _to_float(unit_price_net, 0.0)
+        unit_price_gross = it.get("unit_price_gross")
+        unit_price_gross_f = None if unit_price_gross is None else _to_float(unit_price_gross, 0.0)
+        line_total_net = it.get("line_total_net")
+        line_total_net_f = None if line_total_net is None else _to_float(line_total_net, 0.0)
+        line_total_gross = it.get("line_total_gross")
+        line_total_gross_f = None if line_total_gross is None else _to_float(line_total_gross, 0.0)
+
+        # Kompatibilita: legacy mapování dle zadání.
+        if unit_price_net_f is None and unit_price_legacy_f is not None:
+            unit_price_net_f = unit_price_legacy_f
+        if line_total_gross_f is None and line_total_legacy != 0.0:
+            line_total_gross_f = line_total_legacy
+
+        # Deterministické dopočty z dostupných dat.
+        if line_total_net_f is None and unit_price_net_f is not None:
+            line_total_net_f = round(unit_price_net_f * qty, 2)
+        if line_total_gross_f is None and unit_price_gross_f is not None:
+            line_total_gross_f = round(unit_price_gross_f * qty, 2)
+        if line_total_gross_f is None and line_total_net_f is not None:
+            line_total_gross_f = round(line_total_net_f * (1.0 + vat_rate / 100.0), 2) if vat_rate > 0 else round(line_total_net_f, 2)
+        if line_total_net_f is None and line_total_gross_f is not None:
+            line_total_net_f = round(line_total_gross_f / (1.0 + vat_rate / 100.0), 2) if vat_rate > 0 else round(line_total_gross_f, 2)
+
+        if unit_price_gross_f is None and line_total_gross_f is not None and qty != 0.0:
+            unit_price_gross_f = round(line_total_gross_f / qty, 4)
+        if unit_price_net_f is None and line_total_net_f is not None and qty != 0.0:
+            unit_price_net_f = round(line_total_net_f / qty, 4)
+
+        vat_amount = it.get("vat_amount")
+        vat_amount_f = None if vat_amount is None else _to_float(vat_amount, 0.0)
+        if vat_amount_f is None and (line_total_gross_f is not None and line_total_net_f is not None):
+            vat_amount_f = round(line_total_gross_f - line_total_net_f, 2)
+
         li = LineItem(
             document_id=d.id,
             line_no=line_no,
             name=str(it.get("name") or "").strip()[:512] or f"Položka {line_no}",
             quantity=qty,
-            unit_price=unit_price_f,
-            vat_rate=_to_float(it.get("vat_rate"), 0.0),
-            line_total=line_total,
+            unit_price=unit_price_net_f,
+            vat_rate=vat_rate,
+            line_total=round(line_total_gross_f, 2) if line_total_gross_f is not None else 0.0,
             ean=_to_str(it.get("ean"), 64),
             item_code=_to_str(it.get("item_code"), 64),
+            unit_price_net=unit_price_net_f,
+            unit_price_gross=unit_price_gross_f,
+            line_total_net=line_total_net_f,
+            line_total_gross=line_total_gross_f,
+            vat_amount=vat_amount_f,
+            vat_code=_to_str(it.get("vat_code"), 32),
         )
         session.add(li)
         line_no += 1
+
+        if line_total_net_f is not None:
+            sum_net += float(line_total_net_f)
+            has_any_net = True
+        if line_total_gross_f is not None:
+            sum_gross += float(line_total_gross_f)
+            has_any_gross = True
+
+    # Dokumentové agregáty (deterministické, kompatibilní se stávajícím total_with_vat).
+    if d.total_without_vat is None:
+        d.total_without_vat = round(sum_net, 2) if has_any_net else None
+    if d.total_with_vat is None and has_any_gross:
+        d.total_with_vat = round(sum_gross, 2)
+    if d.total_vat_amount is None and d.total_with_vat is not None and d.total_without_vat is not None:
+        d.total_vat_amount = round(float(d.total_with_vat) - float(d.total_without_vat), 2)
+
     session.flush()
     return d
 

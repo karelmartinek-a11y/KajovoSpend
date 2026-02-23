@@ -22,6 +22,14 @@ ocr:
     enabled: true
     enable_pdf_attachments: true
   force_ocr_on_parse_failure: true
+  handwriting:
+    enabled: true
+    backend: tesseract
+    lang: ces
+    psm: 6
+    oem: 1
+    trigger_min_ocr_conf: 0.45
+    trigger_min_text_quality: 0.25
   ensemble:
     enabled: true
     dpis:
@@ -36,6 +44,12 @@ ocr:
     - 270
     include_reconstructed: true
     max_candidates: 8
+    run_only_on_failure: true
+    trigger:
+      min_ocr_conf: 0.65
+      min_text_quality: 0.35
+      min_items: 1
+      require_sum_ok: true
 openai:
   enabled: false
   auto_enable: true
@@ -52,6 +66,9 @@ openai:
   image_enhance: true
   image_variants: 2
   allow_synthetic_items: false
+ares:
+  ttl_hours: 24
+
 performance:
   docs_page_size: 500
   supplier_debounce_ms: 250

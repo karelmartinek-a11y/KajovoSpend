@@ -76,6 +76,8 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
                 con.execute(text(f"ALTER TABLE suppliers ADD COLUMN {name} {coltype}"))
         if "ico_norm" not in col_names:
             con.execute(text("ALTER TABLE suppliers ADD COLUMN ico_norm TEXT"))
+        if "pending_ares" not in col_names:
+            con.execute(text("ALTER TABLE suppliers ADD COLUMN pending_ares INTEGER DEFAULT 0"))
 
         # Backfill ico_norm in Python (SQLite has no built-in regex replace)
         rows = con.execute(text("SELECT id, ico, ico_norm FROM suppliers")).fetchall()
@@ -104,6 +106,18 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         if "openai_raw_response" not in doc_col_names:
             con.execute(text("ALTER TABLE documents ADD COLUMN openai_raw_response TEXT"))
 
+        # documents: VAT/net-gross fields (PULS-001)
+        if "total_without_vat" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN total_without_vat REAL"))
+        if "total_vat_amount" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN total_vat_amount REAL"))
+        if "vat_breakdown_json" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN vat_breakdown_json TEXT"))
+        if "doc_type" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN doc_type TEXT"))
+        if "processing_profile" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN processing_profile TEXT"))
+
         # items: UI expects unit_price/ean/item_code
         cols_items = con.execute(text("PRAGMA table_info('items')")).fetchall()
         item_col_names = {row[1] for row in cols_items}
@@ -113,6 +127,91 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
             con.execute(text("ALTER TABLE items ADD COLUMN ean TEXT"))
         if "item_code" not in item_col_names:
             con.execute(text("ALTER TABLE items ADD COLUMN item_code TEXT"))
+
+        # items: VAT/net-gross fields (PULS-001)
+        if "unit_price_net" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN unit_price_net REAL"))
+        if "unit_price_gross" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN unit_price_gross REAL"))
+        if "line_total_net" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN line_total_net REAL"))
+        if "line_total_gross" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN line_total_gross REAL"))
+        if "vat_amount" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN vat_amount REAL"))
+        if "vat_code" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN vat_code TEXT"))
+
+        # Deterministický backfill kompatibility:
+        # - unit_price -> unit_price_net
+        # - line_total -> line_total_gross
+        con.execute(text("UPDATE items SET unit_price_net = unit_price WHERE unit_price_net IS NULL AND unit_price IS NOT NULL"))
+        con.execute(text("UPDATE items SET line_total_gross = line_total WHERE line_total_gross IS NULL AND line_total IS NOT NULL"))
+
+        # Backfill odvozených hodnot z dostupných dat (deterministicky).
+        con.execute(text("""
+            UPDATE items
+            SET
+              line_total_net = CASE
+                WHEN line_total_net IS NOT NULL THEN line_total_net
+                WHEN line_total_gross IS NULL THEN NULL
+                WHEN vat_rate IS NULL OR vat_rate = 0 THEN line_total_gross
+                ELSE ROUND(line_total_gross / (1.0 + (vat_rate / 100.0)), 2)
+              END,
+              vat_amount = CASE
+                WHEN vat_amount IS NOT NULL THEN vat_amount
+                WHEN line_total_gross IS NULL THEN NULL
+                WHEN vat_rate IS NULL OR vat_rate = 0 THEN 0.0
+                ELSE ROUND(line_total_gross - (line_total_gross / (1.0 + (vat_rate / 100.0))), 2)
+              END,
+              unit_price_gross = CASE
+                WHEN unit_price_gross IS NOT NULL THEN unit_price_gross
+                WHEN quantity IS NULL OR quantity = 0 THEN NULL
+                WHEN line_total_gross IS NULL THEN NULL
+                ELSE ROUND(line_total_gross / quantity, 4)
+              END
+        """))
+        con.execute(text("""
+            UPDATE items
+            SET unit_price_net = CASE
+              WHEN unit_price_net IS NOT NULL THEN unit_price_net
+              WHEN quantity IS NULL OR quantity = 0 THEN NULL
+              WHEN line_total_net IS NULL THEN NULL
+              ELSE ROUND(line_total_net / quantity, 4)
+            END
+        """))
+
+        # Documents backfill z položek: total_without_vat + total_vat_amount.
+        con.execute(text("""
+            UPDATE documents
+            SET
+              total_without_vat = COALESCE(total_without_vat, (
+                SELECT ROUND(SUM(COALESCE(i.line_total_net,
+                    CASE
+                      WHEN i.line_total_gross IS NULL THEN NULL
+                      WHEN i.vat_rate IS NULL OR i.vat_rate = 0 THEN i.line_total_gross
+                      ELSE i.line_total_gross / (1.0 + (i.vat_rate / 100.0))
+                    END
+                )), 2)
+                FROM items i WHERE i.document_id = documents.id
+              )),
+              total_vat_amount = COALESCE(total_vat_amount, (
+                CASE
+                  WHEN total_with_vat IS NULL THEN NULL
+                  ELSE ROUND(total_with_vat - COALESCE((
+                    SELECT SUM(COALESCE(i.line_total_net,
+                      CASE
+                        WHEN i.line_total_gross IS NULL THEN NULL
+                        WHEN i.vat_rate IS NULL OR i.vat_rate = 0 THEN i.line_total_gross
+                        ELSE i.line_total_gross / (1.0 + (i.vat_rate / 100.0))
+                      END
+                    ))
+                    FROM items i WHERE i.document_id = documents.id
+                  ), 0.0), 2)
+                END
+              )),
+              doc_type = COALESCE(doc_type, CASE WHEN doc_number IS NULL OR TRIM(doc_number) = '' THEN 'receipt' ELSE 'invoice' END)
+        """))
 
         # service_state: observability columns (idempotent)
         cols_ss = con.execute(text("PRAGMA table_info('service_state')")).fetchall()

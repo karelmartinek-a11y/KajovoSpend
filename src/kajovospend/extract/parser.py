@@ -7,6 +7,14 @@ from typing import List, Optional, Tuple, Dict, Iterable, Sequence
 
 from dateutil import parser as dtparser
 
+from kajovospend.extract.vat_math import compute_document_totals, compute_item_derivations
+from kajovospend.utils.amount_correction import (
+    parse_amount_candidates,
+    validate_candidates_against_invariant,
+    choose_best_candidate,
+    normalize_ocr_amount_token,
+)
+
 
 @dataclass
 class Extracted:
@@ -15,6 +23,9 @@ class Extracted:
     bank_account: Optional[str]
     issue_date: Optional[dt.date]
     total_with_vat: Optional[float]
+    total_without_vat: Optional[float]
+    total_vat_amount: Optional[float]
+    vat_breakdown_json: Optional[str]
     currency: str
     items: List[dict]
     confidence: float
@@ -240,7 +251,7 @@ def _canonicalize_items_to_unit_net_and_line_gross(
         return False
 
     # nejdřív doplň chybějící line_total tam, kde to jde
-    _normalize_items(items, reasons)
+    _normalize_items(items, reasons, total_with_vat=total_with_vat)
 
     # u mnoha dokladů jsou částky v položkách net (bez DPH), ale total je gross
     # => vyzkoušíme 2 režimy a vybereme ten s menší odchylkou.
@@ -352,17 +363,54 @@ def _f(v, default: float = 0.0) -> float:
     except Exception:
         return float(default)
 
-def _normalize_items(items: List[dict], reasons: List[str]) -> None:
+def _normalize_items(items: List[dict], reasons: List[str], *, total_with_vat: Optional[float] = None) -> None:
     """
     Sjednotí položky do deterministické podoby pro výpočty:
     - když chybí line_total a máme qty+unit_price -> dopočítá
     - když line_total zjevně obsahuje jednotkovou cenu (qty>1 a line_total≈unit_price) -> opraví na qty*unit_price
     """
-    for it in items:
+    for idx, it in enumerate(items):
         q = _f(it.get("quantity"), 1.0)
         up = it.get("unit_price")
         upf = None if up is None else _f(up, 0.0)
-        lt = _f(it.get("line_total"), 0.0)
+        lt_raw = it.get("line_total")
+        lt = _f(lt_raw, 0.0)
+
+        # OCR post-korekce tokenů částek (PULS-006)
+        if isinstance(up, str) and up.strip() and upf == 0.0:
+            up_cands = parse_amount_candidates(up)
+            if up_cands:
+                best_up = choose_best_candidate(up_cands, original_guess=upf)
+                if best_up is not None:
+                    it["unit_price"] = round(float(best_up), 4)
+                    upf = float(best_up)
+                    fixed, _changed = normalize_ocr_amount_token(up)
+                    reasons.append(f"oprava částky položky unit_price: '{up}' -> '{fixed}'")
+
+        if isinstance(lt_raw, str) and lt_raw.strip() and lt == 0.0:
+            lt_cands = parse_amount_candidates(lt_raw)
+            if lt_cands:
+                # invariant: kandidát by měl zlepšit shodu na total_with_vat (pokud total známe)
+                if total_with_vat is not None and float(total_with_vat or 0.0) > 0.0:
+                    others = 0.0
+                    for j, other in enumerate(items):
+                        if j == idx:
+                            continue
+                        others += _f(other.get("line_total"), 0.0)
+                    current_diff = abs((others + lt) - float(total_with_vat))
+                    valid = validate_candidates_against_invariant(
+                        lt_cands,
+                        validator=lambda c: abs((others + float(c)) - float(total_with_vat)) <= current_diff + 1e-9,
+                    )
+                    if valid:
+                        lt_cands = valid
+                best_lt = choose_best_candidate(lt_cands, original_guess=lt)
+                if best_lt is not None:
+                    it["line_total"] = round(float(best_lt), 2)
+                    lt = float(best_lt)
+                    fixed, _changed = normalize_ocr_amount_token(lt_raw)
+                    reasons.append(f"oprava částky položky line_total: '{lt_raw}' -> '{fixed}'")
+
         # dopočet, když line_total chybí
         if (lt <= 0.0) and (upf is not None) and (q > 0):
             it["line_total"] = round(q * upf, 2)
@@ -1360,12 +1408,23 @@ def extract_from_text(text: str) -> Extracted:
         re.compile(r"\bCelkem\s+k\s+uhradě\b[^\d\-]{0,40}([0-9][0-9\s]*[.,][0-9]{2})\b", re.IGNORECASE),
     ], t)
 
+    pre_reasons: List[str] = []
     total = None
     if total_s:
         try:
             total = _norm_amount(total_s)
         except Exception:
             total = None
+            cands = parse_amount_candidates(total_s)
+            if cands:
+                best = choose_best_candidate(cands)
+                if best is not None:
+                    total = float(best)
+                    fixed, changed = normalize_ocr_amount_token(total_s)
+                    if changed:
+                        pre_reasons.append(f"oprava částky total: '{total_s}' -> '{fixed}'")
+                    else:
+                        pre_reasons.append(f"oprava částky total: '{total_s}' -> '{best:.2f}'")
 
     items: List[dict] = []
     # 1) Special-case: vertical table extraction (pypdf) for Rohlik / Money S3
@@ -1501,12 +1560,36 @@ def extract_from_text(text: str) -> Extracted:
 
     # --- kontrola součtu položek vs. celkem ---
     # Cíl: co nejvíc dokladů vyřešit offline, a na OpenAI posílat jen minimum.
-    reasons: List[str] = []
+    reasons: List[str] = list(pre_reasons)
     sum_ok = False
+    total_without_vat: Optional[float] = None
+    total_vat_amount: Optional[float] = None
+    vat_breakdown_json: Optional[str] = None
     try:
         sum_ok = _canonicalize_items_to_unit_net_and_line_gross(items, total, reasons)
         if items and (total is not None) and not sum_ok:
             reasons.append("nesedí součet položek vs. celkem")
+
+        # PULS-002: deterministické dopočty net/gross/vat + VAT breakdown.
+        derived_items: List[dict] = []
+        for it in items:
+            d = compute_item_derivations(it)
+            derived_items.append(d)
+        items = derived_items
+
+        net, vat, gross, breakdown, flags = compute_document_totals(items, total_with_vat=total)
+        total_without_vat = net
+        total_vat_amount = vat
+        try:
+            import json
+            vat_breakdown_json = json.dumps(breakdown, ensure_ascii=False)
+        except Exception:
+            vat_breakdown_json = None
+
+        if not bool(flags.get("sum_ok_gross", True)):
+            reasons.append("gross nesedí na total_with_vat")
+        if not bool(flags.get("sum_ok_net", True)):
+            reasons.append("net nesedí na dopočtený základ")
     except Exception:
         if items and total is not None:
             reasons.append("nelze ověřit součet položek")
@@ -1549,6 +1632,9 @@ def extract_from_text(text: str) -> Extracted:
         bank_account=bank_account,
         issue_date=issue_date,
         total_with_vat=total,
+        total_without_vat=total_without_vat,
+        total_vat_amount=total_vat_amount,
+        vat_breakdown_json=vat_breakdown_json,
         currency=currency,
         items=items,
         confidence=min(conf, 1.0),
@@ -1562,8 +1648,9 @@ def postprocess_items_for_db(
     *,
     items: List[dict],
     total_with_vat: Optional[float],
+    total_without_vat_hint: Optional[float] = None,
     reasons: Optional[List[str]] = None,
-) -> Tuple[bool, List[str]]:
+) -> Tuple[bool, List[str], Optional[float], Optional[float], Optional[str]]:
     """
     Normalizuje položky do kanonického formátu používaného v DB a provede kontrolu součtu.
 
@@ -1571,17 +1658,44 @@ def postprocess_items_for_db(
       - po offline extrakci je voláno implicitně v extract_from_text()
       - po OpenAI fallbacku je potřeba volat znovu, protože OpenAI vrací položky v různém základu
 
-    Vrací (sum_ok, reasons).
+    Vrací (sum_ok, reasons, total_without_vat, total_vat_amount, vat_breakdown_json).
     """
     rr: List[str] = list(reasons or [])
     ok = False
+    total_without_vat: Optional[float] = None
+    total_vat_amount: Optional[float] = None
+    vat_breakdown_json: Optional[str] = None
     try:
         ok = _canonicalize_items_to_unit_net_and_line_gross(items, total_with_vat, rr)
         if items and (total_with_vat is not None) and not ok:
             rr.append("nesedí součet položek vs. celkem")
+
+        derived_items: List[dict] = []
+        for it in items:
+            derived_items.append(compute_item_derivations(it))
+        items[:] = derived_items
+
+        net, vat, _gross, breakdown, flags = compute_document_totals(
+            items,
+            total_with_vat=total_with_vat,
+            total_without_vat_hint=total_without_vat_hint,
+        )
+        total_without_vat = net
+        total_vat_amount = vat
+        try:
+            import json
+            vat_breakdown_json = json.dumps(breakdown, ensure_ascii=False)
+        except Exception:
+            vat_breakdown_json = None
+
+        if not bool(flags.get("sum_ok_gross", True)):
+            rr.append("gross nesedí na total_with_vat")
+        if not bool(flags.get("sum_ok_net", True)):
+            rr.append("net nesedí na total_without_vat")
+        ok = bool(flags.get("sum_ok", ok))
     except Exception:
         if items and (total_with_vat is not None):
             rr.append("nelze ověřit součet položek")
     # de-dup reasons (stabilní pořadí)
     rr = list(dict.fromkeys(rr))
-    return ok, rr
+    return ok, rr, total_without_vat, total_vat_amount, vat_breakdown_json
