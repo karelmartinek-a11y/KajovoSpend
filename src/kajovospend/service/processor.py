@@ -13,9 +13,9 @@ from typing import Any, Dict, Optional, Tuple, List
 
 from PIL import Image, ImageFilter, ImageOps
 from pypdf import PdfReader
-from sqlalchemy import text
+from sqlalchemy import text, select
 
-from kajovospend.db.models import ImportJob
+from kajovospend.db.models import ImportJob, Supplier
 from kajovospend.db.queries import (
     add_document,
     create_file_record,
@@ -23,6 +23,8 @@ from kajovospend.db.queries import (
     upsert_supplier,
 )
 from kajovospend.extract.parser import extract_from_text, postprocess_items_for_db
+from kajovospend.extract.vat_math import compute_document_totals
+from kajovospend.extract.layout_items import extract_items_from_ocr_layout
 from kajovospend.extract.structured_pdf import extract_structured_from_pdf
 from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
 try:
@@ -39,6 +41,7 @@ except Exception:  # pragma: no cover
 
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 from kajovospend.ocr.rapidocr_engine import RapidOcrEngine
+from kajovospend.ocr.handwriting_tesseract import TesseractHandwritingEngine
 from kajovospend.utils.hashing import sha256_file
 from kajovospend.utils.text_quality import compute_text_quality, summarize_text_quality, text_quality_score
 from kajovospend.utils.qr_spayd import decode_qr_from_pil, parse_spayd
@@ -92,6 +95,22 @@ class Processor:
         except Exception as e:
             self.log.warning(f"OCR init failed; will quarantine documents. Error: {e}")
             self.ocr_engine = None
+
+        # Handwriting OCR backend (MVP): detailní fallback při slabém RapidOCR výstupu.
+        self.hw_ocr_engine = None
+        try:
+            hw_cfg = ((self.cfg or {}).get("ocr") or {}).get("handwriting") or {}
+            if bool(hw_cfg.get("enabled", True)):
+                backend = str(hw_cfg.get("backend", "tesseract") or "tesseract").strip().lower()
+                if backend == "tesseract":
+                    self.hw_ocr_engine = TesseractHandwritingEngine(
+                        lang=str(hw_cfg.get("lang", "ces") or "ces"),
+                        psm=int(hw_cfg.get("psm", 6) or 6),
+                        oem=int(hw_cfg.get("oem", 1) or 1),
+                    )
+        except Exception as e:
+            self.log.warning(f"Handwriting OCR init failed: {e}")
+            self.hw_ocr_engine = None
 
 
     def _try_qr_spayd_from_image(self, img: Image.Image) -> dict[str, Any]:
@@ -160,6 +179,43 @@ class Processor:
             except Exception:
                 pass
     
+    def _should_try_handwriting(self, *, ocr_conf: float, text: str) -> bool:
+        ocr_cfg = (self.cfg.get("ocr") or {}) if isinstance(self.cfg, dict) else {}
+        hw_cfg = (ocr_cfg.get("handwriting") or {}) if isinstance(ocr_cfg, dict) else {}
+        if not bool(hw_cfg.get("enabled", True)):
+            return False
+        if self.hw_ocr_engine is None or (not getattr(self.hw_ocr_engine, "is_available", lambda: False)()):
+            return False
+        min_ocr_conf = float(hw_cfg.get("trigger_min_ocr_conf", 0.45) or 0.45)
+        min_text_quality = float(hw_cfg.get("trigger_min_text_quality", 0.25) or 0.25)
+        tq, _ = text_quality_score(text or "")
+        return (float(ocr_conf or 0.0) < min_ocr_conf) and (float(tq) < min_text_quality)
+
+    def _run_handwriting_fallback(self, *, image: Image.Image, base_text: str, base_conf: float) -> Tuple[str, float, Dict[str, Any]]:
+        debug: Dict[str, Any] = {"used": False}
+        if not self._should_try_handwriting(ocr_conf=float(base_conf or 0.0), text=base_text or ""):
+            debug["reason"] = "trigger_not_met"
+            return base_text, float(base_conf or 0.0), debug
+        try:
+            htxt, hconf = self.hw_ocr_engine.image_to_text(image)
+        except Exception as e:
+            debug["reason"] = f"backend_error:{e}"
+            return base_text, float(base_conf or 0.0), debug
+
+        base_score, _ = text_quality_score(base_text or "")
+        hw_score, _ = text_quality_score(htxt or "")
+        use_hw = (float(hw_score) > float(base_score) + 0.02) or (len((htxt or "").strip()) > len((base_text or "").strip()) + 10)
+        debug.update({
+            "used": bool(use_hw),
+            "base_conf": float(base_conf or 0.0),
+            "hw_conf": float(hconf or 0.0),
+            "base_score": float(base_score),
+            "hw_score": float(hw_score),
+        })
+        if use_hw:
+            return htxt or "", float(hconf or 0.0), debug
+        return base_text, float(base_conf or 0.0), debug
+
     def _ocr_pdf_pages(self, pdf_path: Path, status_cb=None) -> Tuple[List[str], List[float], int, str, Dict[str, Any]]:
         """
         Hybrid per-page OCR:
@@ -306,6 +362,9 @@ class Processor:
                 if status_cb:
                     status_cb(f"OCR: strana {idx_page}/{len(images)}…")
                 t, c = self.ocr_engine.image_to_text(img)
+                t, c, hw_debug = self._run_handwriting_fallback(image=img, base_text=t or "", base_conf=float(c or 0.0))
+                if hw_debug.get("used"):
+                    text_debug.setdefault("handwriting", []).append({"page_no": idx_page, **hw_debug})
                 texts2.append(t or "")
                 confs2.append(float(c or 0.0))
                 s, met = text_quality_score(t or "")
@@ -391,6 +450,13 @@ class Processor:
                 if status_cb:
                     status_cb(f"OCR: strana {page_idx+1}/{n_pages}…")
                 ocr_text, ocr_conf = self.ocr_engine.image_to_text(img)
+                ocr_text, ocr_conf, hw_debug = self._run_handwriting_fallback(
+                    image=img,
+                    base_text=ocr_text or "",
+                    base_conf=float(ocr_conf or 0.0),
+                )
+                if hw_debug.get("used"):
+                    text_debug.setdefault("handwriting", []).append({"page_no": page_idx + 1, **hw_debug})
                 ocr_text = ocr_text or ""
                 ocr_conf_f = float(ocr_conf or 0.0)
 
@@ -674,6 +740,74 @@ class Processor:
 
     
 
+
+    def _collect_layout_ocr_items_for_range(
+        self,
+        *,
+        path: Path,
+        page_from: int,
+        page_to: int,
+    ) -> List[Any]:
+        """Posbírá OCR bbox tokeny pro layout-aware parser (jen při failure fallbacku)."""
+        if self.ocr_engine is None or (not getattr(self.ocr_engine, "is_available", lambda: False)()):
+            return []
+        try:
+            if path.suffix.lower() == ".pdf":
+                ocr_cfg = (self.cfg.get("ocr") or {}) if isinstance(self.cfg, dict) else {}
+                dpi = int(ocr_cfg.get("pdf_dpi", 200) or 200)
+                max_pages = max(1, int(page_to - page_from + 1))
+                imgs = render_pdf_to_images(path, dpi=dpi, max_pages=max_pages, start_page=max(0, int(page_from) - 1))
+            else:
+                imgs = [Image.open(path).convert("RGB")]
+        except Exception:
+            return []
+
+        out: List[Any] = []
+        y_offset = 0.0
+        for im in imgs:
+            try:
+                items = self.ocr_engine.image_to_items(im)
+            except Exception:
+                items = []
+            if y_offset != 0.0:
+                for it in items:
+                    try:
+                        it.box = [[float(p[0]), float(p[1]) + y_offset] for p in (it.box or [])]
+                    except Exception:
+                        continue
+            out.extend(items)
+            try:
+                y_offset += float(im.height) + 100.0
+            except Exception:
+                y_offset += 1000.0
+        return out
+
+
+    def _ares_ttl_hours(self) -> float:
+        cfg = self.cfg.get("ares") if isinstance(self.cfg, dict) else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        return float(cfg.get("ttl_hours", 24.0) or 24.0)
+
+    def _find_supplier_for_ico(self, session, ico: str) -> Supplier | None:
+        try:
+            norm = normalize_ico(str(ico))
+        except Exception:
+            norm = str(ico)
+        return session.execute(
+            select(Supplier).where((Supplier.ico_norm == norm) | (Supplier.ico == norm))
+        ).scalar_one_or_none()
+
+    def _is_ares_ttl_fresh(self, supplier: Supplier | None) -> bool:
+        if not supplier or not getattr(supplier, "ares_last_sync", None):
+            return False
+        ttl_h = self._ares_ttl_hours()
+        try:
+            age_h = (dt.datetime.utcnow() - supplier.ares_last_sync).total_seconds() / 3600.0
+            return age_h <= ttl_h
+        except Exception:
+            return False
+
     def _score_extracted_candidate(self, ex) -> Tuple[int, int, int, int, int]:
         """Skóre pro výběr nejlepšího offline výstupu. Vyšší je lepší (lexikograficky)."""
         try:
@@ -696,6 +830,82 @@ class Processor:
         no_review = 1 if (not bool(getattr(ex, "requires_review", False))) else 0
         conf = int(round(1000.0 * float(getattr(ex, "confidence", 0.0) or 0.0)))
         return (items_n, core, sum_ok, no_review, conf)
+
+
+    def _should_run_offline_ensemble(
+        self,
+        *,
+        extracted,
+        ocr_conf: float,
+        text_debug: Dict[str, Any],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Gate pro drahý offline ensemble: běží jen při slabé baseline extrakci."""
+        ocr_cfg = (self.cfg.get("ocr") or {}) if isinstance(self.cfg, dict) else {}
+        ens_cfg = (ocr_cfg.get("ensemble") or {}) if isinstance(ocr_cfg, dict) else {}
+        run_only_on_failure = bool(ens_cfg.get("run_only_on_failure", True))
+        trigger = ens_cfg.get("trigger") or {}
+        if not isinstance(trigger, dict):
+            trigger = {}
+
+        min_ocr_conf = float(trigger.get("min_ocr_conf", 0.65) or 0.65)
+        min_text_quality = float(trigger.get("min_text_quality", 0.35) or 0.35)
+        min_items = int(trigger.get("min_items", 1) or 1)
+        require_sum_ok = bool(trigger.get("require_sum_ok", True))
+
+        items_n = len(list(getattr(extracted, "items", None) or []))
+        core_missing = [
+            ("supplier_ico", not bool(getattr(extracted, "supplier_ico", None))),
+            ("doc_number", not bool(getattr(extracted, "doc_number", None))),
+            ("issue_date", getattr(extracted, "issue_date", None) is None),
+            ("total_with_vat", getattr(extracted, "total_with_vat", None) is None),
+        ]
+        missing_core_fields = [k for k, bad in core_missing if bad]
+
+        baseline_sum_ok = True
+        try:
+            tmp_items = [dict(x) for x in (getattr(extracted, "items", None) or [])]
+            sum_ok, _reasons, _net, _vat, _br = postprocess_items_for_db(
+                items=tmp_items,
+                total_with_vat=getattr(extracted, "total_with_vat", None),
+                total_without_vat_hint=getattr(extracted, "total_without_vat", None),
+                reasons=list(getattr(extracted, "review_reasons", None) or []),
+            )
+            baseline_sum_ok = bool(sum_ok)
+        except Exception:
+            baseline_sum_ok = False
+
+        text_quality = float(text_debug.get("document_text_quality") or 0.0)
+
+        flags = {
+            "missing_core": len(missing_core_fields) > 0,
+            "no_items": items_n < min_items,
+            "sum_not_ok": (not baseline_sum_ok) if require_sum_ok else False,
+            "low_text_quality": text_quality < min_text_quality,
+            "low_ocr_conf": float(ocr_conf or 0.0) < min_ocr_conf,
+        }
+        should_run = True
+        if run_only_on_failure:
+            should_run = any(flags.values())
+
+        audit = {
+            "run_only_on_failure": run_only_on_failure,
+            "trigger": {
+                "min_ocr_conf": min_ocr_conf,
+                "min_text_quality": min_text_quality,
+                "min_items": min_items,
+                "require_sum_ok": require_sum_ok,
+            },
+            "baseline": {
+                "ocr_conf": float(ocr_conf or 0.0),
+                "text_quality": text_quality,
+                "items": items_n,
+                "sum_ok": baseline_sum_ok,
+                "missing_core_fields": missing_core_fields,
+            },
+            "flags": flags,
+            "should_run": should_run,
+        }
+        return should_run, audit
 
     def _ocr_pdf_range_candidates(
         self,
@@ -804,7 +1014,7 @@ class Processor:
         best_text = baseline_text
         best_ex = baseline_extracted
         best_score = self._score_extracted_candidate(best_ex)
-        debug: Dict[str, Any] = {"baseline_score": list(best_score)}
+        debug: Dict[str, Any] = {"baseline_score": list(best_score), "selected": "baseline"}
 
         candidates: List[Tuple[str, float, Dict[str, Any]]] = []
         if path.suffix.lower() == ".pdf":
@@ -834,8 +1044,11 @@ class Processor:
             except Exception:
                 candidates = []
 
+        debug["candidate_count"] = int(len(candidates))
         debug["candidates"] = []
-        for cand_text, cand_conf, meta in candidates:
+        best_meta: Dict[str, Any] | None = None
+        best_idx: int | None = None
+        for idx, (cand_text, cand_conf, meta) in enumerate(candidates):
             try:
                 ex2 = extract_from_text(cand_text)
             except Exception:
@@ -846,9 +1059,17 @@ class Processor:
                 best_score = sc
                 best_text = cand_text
                 best_ex = ex2
+                best_meta = dict(meta or {})
+                best_idx = int(idx)
 
         if best_ex is not baseline_extracted:
+            debug["selected"] = "candidate"
             debug["selected_score"] = list(best_score)
+            debug["winner_index"] = best_idx
+            debug["winner_meta"] = best_meta
+            debug["winner_reason"] = "vyšší lexikografické skóre kandidáta"
+        else:
+            debug["winner_reason"] = "baseline zůstala nejlepší"
         return best_text, best_ex, debug
 
     def _enhance_for_openai(self, image: Image.Image) -> Image.Image:
@@ -960,6 +1181,9 @@ class Processor:
             status_cb("OCR: zpracovávám obrázek…")
         with Image.open(path) as img:
             t, c = self.ocr_engine.image_to_text(img)
+            t, c, hw_debug = self._run_handwriting_fallback(image=img, base_text=t or "", base_conf=float(c or 0.0))
+            if hw_debug.get("used"):
+                self.log.info("Handwriting fallback used for image path=%s debug=%s", path, hw_debug)
         try:
             q = summarize_text_quality([compute_text_quality(t or "")])
             self.log.info("Image text source: ocr conf=%.3f quality=%s", float(c or 0.0), q)
@@ -1282,31 +1506,41 @@ class Processor:
                 except Exception:
                     pass
 
-            # Offline ensemble: zkus více OCR metod (různá DPI, rotace, rekonstrukce řádků) a vyber nejlepší výsledek.
-            # Záměrně běží před heuristikami (pseudo-IČO, syntetické číslo), aby se vybíral "skutečně nejlepší" text.
+            # Offline ensemble: drahý krok, spouštíme jen při slabé baseline extrakci.
             try:
-                best_text, best_ex, ens_debug = self._offline_ensemble_best(
-                    path=path,
-                    page_from=page_from,
-                    page_to=page_to,
-                    baseline_text=ocr_text,
-                    baseline_extracted=extracted,
-                    status_cb=status_cb,
+                should_run_ens, gate_audit = self._should_run_offline_ensemble(
+                    extracted=extracted,
+                    ocr_conf=ocr_conf,
+                    text_debug=text_debug,
                 )
-                if best_ex is not None and best_text:
-                    extracted = best_ex
-                    ocr_text = best_text
-                    # ensemble text se typicky opírá o OCR, takže konfidence jen orientačně
-                    extracted.full_text = ocr_text
-                    doc_type = self._classify_doc_type(ocr_text)
-                    reasons = list(extracted.review_reasons or [])
-                    reasons.append("offline ensemble: vybrán lepší OCR kandidát")
+                text_debug.setdefault("ensemble", {})
+                text_debug["ensemble"]["gate"] = gate_audit
+                if should_run_ens:
+                    best_text, best_ex, ens_debug = self._offline_ensemble_best(
+                        path=path,
+                        page_from=page_from,
+                        page_to=page_to,
+                        baseline_text=ocr_text,
+                        baseline_extracted=extracted,
+                        status_cb=status_cb,
+                    )
                     if isinstance(ens_debug, dict):
-                        text_debug.setdefault("ensemble", ens_debug)
-                    method = "offline_ensemble"
-                    method_global = "offline_ensemble"
-            except Exception:
-                pass
+                        text_debug["ensemble"].update(ens_debug)
+                    if best_ex is not None and best_text:
+                        extracted = best_ex
+                        ocr_text = best_text
+                        # ensemble text se typicky opírá o OCR, takže konfidence jen orientačně
+                        extracted.full_text = ocr_text
+                        doc_type = self._classify_doc_type(ocr_text)
+                        reasons = list(extracted.review_reasons or [])
+                        reasons.append("offline ensemble: vybrán lepší OCR kandidát")
+                        method = "offline_ensemble"
+                        method_global = "offline_ensemble"
+                else:
+                    text_debug["ensemble"]["skipped_reason"] = "baseline neaktivovala trigger"
+            except Exception as e:
+                text_debug.setdefault("ensemble", {})
+                text_debug["ensemble"]["gate_error"] = str(e)
 
             # OpenAI primary: pokud je API klic a povoleni, zkus online extrakci
             
@@ -1424,13 +1658,53 @@ class Processor:
 
             # Po offline i OpenAI: kanonizace položek (unit_price bez DPH, line_total s DPH) + kontrola součtu.
             items_ref = list(extracted.items or [])
-            sum_ok, reasons = postprocess_items_for_db(
+            sum_ok, reasons, total_without_vat, total_vat_amount, vat_breakdown_json = postprocess_items_for_db(
                 items=items_ref,
                 total_with_vat=extracted.total_with_vat,
+                total_without_vat_hint=getattr(extracted, "total_without_vat", None),
                 reasons=reasons,
             )
             extracted.items = items_ref
+            extracted.total_without_vat = total_without_vat
+            extracted.total_vat_amount = total_vat_amount
+            extracted.vat_breakdown_json = vat_breakdown_json
             extracted.review_reasons = reasons
+
+            # Layout-aware fallback z OCR bboxů: když parser vrátí 0 položek nebo neprojde součet.
+            try:
+                need_layout = (len(list(extracted.items or [])) == 0) or (not bool(sum_ok))
+                layout_debug: Dict[str, Any] = {"trigger": {"no_items": len(list(extracted.items or [])) == 0, "sum_not_ok": not bool(sum_ok)}}
+                if need_layout:
+                    ocr_bbox_items = self._collect_layout_ocr_items_for_range(
+                        path=path,
+                        page_from=page_from,
+                        page_to=page_to,
+                    )
+                    layout_debug["ocr_bbox_items"] = int(len(ocr_bbox_items))
+                    cand_items = extract_items_from_ocr_layout(ocr_bbox_items, document_text=ocr_text)
+                    layout_debug["layout_items"] = int(len(cand_items))
+
+                    if cand_items:
+                        cand_sum_ok, cand_reasons, cand_net, cand_vat, cand_breakdown = postprocess_items_for_db(
+                            items=cand_items,
+                            total_with_vat=extracted.total_with_vat,
+                            total_without_vat_hint=getattr(extracted, "total_without_vat", None),
+                            reasons=list(reasons),
+                        )
+                        layout_debug["candidate_sum_ok"] = bool(cand_sum_ok)
+                        better = (len(cand_items) > len(list(extracted.items or []))) or (bool(cand_sum_ok) and (not bool(sum_ok)))
+                        layout_debug["selected"] = bool(better)
+                        if better:
+                            extracted.items = cand_items
+                            extracted.total_without_vat = cand_net
+                            extracted.total_vat_amount = cand_vat
+                            extracted.vat_breakdown_json = cand_breakdown
+                            sum_ok = bool(cand_sum_ok)
+                            reasons = list(dict.fromkeys(cand_reasons + ["layout parser: použita bbox extrakce položek"]))
+                            extracted.review_reasons = reasons
+                text_debug["layout_items"] = layout_debug
+            except Exception as e:
+                text_debug["layout_items"] = {"error": str(e)}
 
             # OpenAI fallback: pokud stale chybi klicova data, zkus druhe kolo s prisnejsim promptem
             need_openai = False
@@ -1485,12 +1759,16 @@ class Processor:
 
                 # Po OpenAI znovu normalizace polozek a kontrola souctu
                 items_ref = list(extracted.items or [])
-                sum_ok, reasons = postprocess_items_for_db(
+                sum_ok, reasons, total_without_vat, total_vat_amount, vat_breakdown_json = postprocess_items_for_db(
                     items=items_ref,
                     total_with_vat=extracted.total_with_vat,
+                    total_without_vat_hint=getattr(extracted, "total_without_vat", None),
                     reasons=reasons,
                 )
                 extracted.items = items_ref
+                extracted.total_without_vat = total_without_vat
+                extracted.total_vat_amount = total_vat_amount
+                extracted.vat_breakdown_json = vat_breakdown_json
                 extracted.review_reasons = reasons
 
 # Pro účtenky: pokud nemáme položky, vytvoř syntetickou z total.
@@ -1507,7 +1785,19 @@ class Processor:
                             "line_total": total_f,
                         }
                     ]
-                    sum_ok = True
+                    net, vat, _gross, breakdown, flags = compute_document_totals(
+                        extracted.items,
+                        total_with_vat=extracted.total_with_vat,
+                        total_without_vat_hint=getattr(extracted, "total_without_vat", None),
+                    )
+                    extracted.total_without_vat = net
+                    extracted.total_vat_amount = vat
+                    try:
+                        import json
+                        extracted.vat_breakdown_json = json.dumps(breakdown, ensure_ascii=False)
+                    except Exception:
+                        extracted.vat_breakdown_json = None
+                    sum_ok = bool(flags.get("sum_ok", True))
                     reasons.append("chybi polozky -> vytvorena synteticka polozka z total")
                 except Exception:
                     pass
@@ -1611,42 +1901,50 @@ class Processor:
                         extracted.supplier_ico = normalize_ico(extracted.supplier_ico)
                     except Exception:
                         pass
-                    try:
-                        if status_cb:
-                            status_cb("ARES: doplňuji dodavatele…")
-                        ares = fetch_by_ico(extracted.supplier_ico)
-                        s = upsert_supplier(
-                            session,
-                            ares.ico,
-                            name=ares.name,
-                            dic=ares.dic,
-                            address=ares.address,
-                            is_vat_payer=ares.is_vat_payer,
-                            ares_last_sync=ares.fetched_at,
-                            legal_form=ares.legal_form,
-                            street=ares.street,
-                            street_number=ares.street_number,
-                            orientation_number=ares.orientation_number,
-                            city=ares.city,
-                            zip_code=ares.zip_code,
-                            overwrite=True,
-                        )
-                        supplier_id = s.id
-                        extracted.supplier_ico = ares.ico
-                    except Exception as e:
-                        reasons.append(f"ARES selhal: {e}")
-                        # ARES je pouze enrich krok; při výpadku sítě neblokujeme uložení dokladu.
-                        # Zachováme IČO z extrakce a vytvoříme/aktualizujeme lokálního dodavatele best-effort.
+
+                    supplier_cached = self._find_supplier_for_ico(session, str(extracted.supplier_ico))
+                    if self._is_ares_ttl_fresh(supplier_cached):
+                        supplier_id = int(supplier_cached.id)
+                        reasons.append("ARES TTL: použit čerstvý záznam z DB")
+                    else:
                         try:
+                            if status_cb:
+                                status_cb("ARES: doplňuji dodavatele…")
+                            ares = fetch_by_ico(extracted.supplier_ico)
                             s = upsert_supplier(
                                 session,
-                                str(extracted.supplier_ico),
-                                name=self._extract_supplier_name_guess(ocr_text),
-                                overwrite=False,
+                                ares.ico,
+                                name=ares.name,
+                                dic=ares.dic,
+                                address=ares.address,
+                                is_vat_payer=ares.is_vat_payer,
+                                ares_last_sync=ares.fetched_at,
+                                pending_ares=False,
+                                legal_form=ares.legal_form,
+                                street=ares.street,
+                                street_number=ares.street_number,
+                                orientation_number=ares.orientation_number,
+                                city=ares.city,
+                                zip_code=ares.zip_code,
+                                overwrite=True,
                             )
                             supplier_id = s.id
-                        except Exception:
-                            pass
+                            extracted.supplier_ico = ares.ico
+                        except Exception as e:
+                            reasons.append(f"ARES selhal: {e}")
+                            # ARES je pouze enrich krok; při výpadku sítě neblokujeme uložení dokladu.
+                            # Zachováme IČO z extrakce a vytvoříme/aktualizujeme lokálního dodavatele best-effort.
+                            try:
+                                s = upsert_supplier(
+                                    session,
+                                    str(extracted.supplier_ico),
+                                    name=self._extract_supplier_name_guess(ocr_text),
+                                    overwrite=False,
+                                    pending_ares=True,
+                                )
+                                supplier_id = s.id
+                            except Exception:
+                                pass
                 else:
                     # Pseudo-IČO: uložíme dodavatele lokálně jen se jménem (pokud ho umíme odhadnout).
                     supplier_name_guess = self._extract_supplier_name_guess(ocr_text)
@@ -1668,6 +1966,27 @@ class Processor:
                     pass
                 continue
 
+            # PULS-002: před persistencí ještě jednou deterministicky přepočítat dokumentové totals.
+            try:
+                net, vat, _gross, breakdown, flags = compute_document_totals(
+                    list(extracted.items or []),
+                    total_with_vat=extracted.total_with_vat,
+                    total_without_vat_hint=getattr(extracted, "total_without_vat", None),
+                )
+                extracted.total_without_vat = net
+                extracted.total_vat_amount = vat
+                try:
+                    import json
+                    extracted.vat_breakdown_json = json.dumps(breakdown, ensure_ascii=False)
+                except Exception:
+                    extracted.vat_breakdown_json = None
+                if not bool(flags.get("sum_ok_gross", True)):
+                    reasons.append("gross check fail před uložením")
+                if not bool(flags.get("sum_ok_net", True)):
+                    reasons.append("net check fail před uložením")
+            except Exception:
+                reasons.append("nelze dopočítat VAT breakdown před uložením")
+
             doc = add_document(
                 session,
                 file_id=file_record.id,
@@ -1677,6 +1996,9 @@ class Processor:
                 bank_account=extracted.bank_account,
                 issue_date=extracted.issue_date,
                 total_with_vat=extracted.total_with_vat,
+                total_without_vat=getattr(extracted, "total_without_vat", None),
+                total_vat_amount=getattr(extracted, "total_vat_amount", None),
+                vat_breakdown_json=getattr(extracted, "vat_breakdown_json", None),
                 currency=extracted.currency,
                 confidence=float(extracted.confidence),
                 method=method,

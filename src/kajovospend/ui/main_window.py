@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import threading
 from io import BytesIO
@@ -43,6 +44,7 @@ from kajovospend.integrations.openai_fallback import (
 from kajovospend.service.processor import Processor, safe_move
 from kajovospend.utils.hashing import sha256_file
 from kajovospend.ocr.pdf_render import render_pdf_to_images
+from kajovospend.extract.vat_math import compute_document_totals, compute_item_derivations
 
 from .styles import QSS
 from . import db_api
@@ -1792,6 +1794,9 @@ class MainWindow(QMainWindow):
         sr.addWidget(self.btn_zoom_in); sr.addWidget(self.btn_zoom_out); sr.addWidget(self.btn_zoom_reset)
         rl.addWidget(srcrow)
 
+        self.lbl_doc_totals = QLabel("Celky: netto - | DPH - | brutto -")
+        rl.addWidget(self.lbl_doc_totals)
+
         self.preview_view = PdfPreviewView()
         rl.addWidget(self.preview_view, 3)
 
@@ -2240,6 +2245,12 @@ class MainWindow(QMainWindow):
         self._current_doc_file_id = int(f.id) if f else None
         self._current_doc_path = f.current_path if f else None
         self.doc_src_line.setText(self._current_doc_path or "")
+        net_v = getattr(doc, "total_without_vat", None)
+        vat_v = getattr(doc, "total_vat_amount", None)
+        gross_v = getattr(doc, "total_with_vat", None)
+        self.lbl_doc_totals.setText(
+            f"Celky: netto {float(net_v or 0.0):,.2f} | DPH {float(vat_v or 0.0):,.2f} | brutto {float(gross_v or 0.0):,.2f}".replace(",", " ")
+        )
 
         rows = []
         for it in items:
@@ -2255,8 +2266,13 @@ class MainWindow(QMainWindow):
                     "name": it.name or "",
                     "quantity": float(it.quantity or 0.0),
                     "unit_price": unit_price_val,
-                    "line_total": float(it.line_total or 0.0),
+                    "line_total": float(getattr(it, "line_total_gross", None) or it.line_total or 0.0),
+                    "line_total_net": float(getattr(it, "line_total_net", 0.0) or 0.0),
+                    "unit_price_net": float(getattr(it, "unit_price_net", 0.0) or unit_price_val or 0.0),
+                    "unit_price_gross": float(getattr(it, "unit_price_gross", 0.0) or 0.0),
+                    "vat_amount": float(getattr(it, "vat_amount", 0.0) or 0.0),
                     "vat_rate": float(it.vat_rate or 0.0),
+                    "vat_code": getattr(it, "vat_code", "") or "",
                     "ean": getattr(it, "ean", "") or "",
                     "item_code": getattr(it, "item_code", "") or "",
                 }
@@ -2318,15 +2334,47 @@ class MainWindow(QMainWindow):
                 vr = float(r.get("vat_rate") or 0.0)
                 ean = (r.get("ean") or "").strip() or None
                 code = (r.get("item_code") or "").strip() or None
-                total_sum += float(lt or 0.0)
+
+                derived = compute_item_derivations(
+                    {
+                        "name": name,
+                        "quantity": qty,
+                        "unit_price": up,
+                        "line_total": lt,
+                        "vat_rate": vr,
+                        "vat_code": r.get("vat_code"),
+                        "ean": ean,
+                        "item_code": code,
+                    }
+                )
+                up_net = float(derived.get("unit_price_net") or 0.0)
+                up_gross = float(derived.get("unit_price_gross") or 0.0)
+                lt_net = float(derived.get("line_total_net") or 0.0)
+                lt_gross = float(derived.get("line_total_gross") or 0.0)
+                vat_amount = float(derived.get("vat_amount") or 0.0)
+                vat_code = (derived.get("vat_code") or "").strip() or None
+                total_sum += float(lt_gross or 0.0)
 
                 if rid and int(rid) in existing:
                     it = existing[int(rid)]
                     it.line_no = line_no
                     it.name = name[:512]
                     it.quantity = qty
-                    it.line_total = lt
+                    it.unit_price = up_net
+                    it.line_total = lt_gross
                     it.vat_rate = vr
+                    if hasattr(it, "unit_price_net"):
+                        it.unit_price_net = up_net
+                    if hasattr(it, "unit_price_gross"):
+                        it.unit_price_gross = up_gross
+                    if hasattr(it, "line_total_net"):
+                        it.line_total_net = lt_net
+                    if hasattr(it, "line_total_gross"):
+                        it.line_total_gross = lt_gross
+                    if hasattr(it, "vat_amount"):
+                        it.vat_amount = vat_amount
+                    if hasattr(it, "vat_code"):
+                        it.vat_code = vat_code
                     if hasattr(it, "ean"):
                         it.ean = ean
                     if hasattr(it, "item_code"):
@@ -2339,9 +2387,22 @@ class MainWindow(QMainWindow):
                         line_no=line_no,
                         name=name[:512],
                         quantity=qty,
-                        line_total=lt,
+                        unit_price=up_net,
+                        line_total=lt_gross,
                         vat_rate=vr,
                     )
+                    if hasattr(it, "unit_price_net"):
+                        it.unit_price_net = up_net
+                    if hasattr(it, "unit_price_gross"):
+                        it.unit_price_gross = up_gross
+                    if hasattr(it, "line_total_net"):
+                        it.line_total_net = lt_net
+                    if hasattr(it, "line_total_gross"):
+                        it.line_total_gross = lt_gross
+                    if hasattr(it, "vat_amount"):
+                        it.vat_amount = vat_amount
+                    if hasattr(it, "vat_code"):
+                        it.vat_code = vat_code
                     if hasattr(it, "ean"):
                         it.ean = ean
                     if hasattr(it, "item_code"):
@@ -2355,10 +2416,22 @@ class MainWindow(QMainWindow):
                 if it_id not in keep_ids:
                     session.delete(it)
 
-            # update total (volitelně)
-            if total_sum and (doc.total_with_vat is None or abs(float(doc.total_with_vat or 0.0) - total_sum) > 0.01):
-                doc.total_with_vat = float(total_sum)
-                session.add(doc)
+            # update document net/vat/gross totals deterministicky z položek
+            doc_items_rows = []
+            for r in rows:
+                name = (r.get("name") or "").strip() or "Položka"
+                qty = float(r.get("quantity") or 0.0)
+                up = float(r.get("unit_price") or 0.0)
+                lt = float(r.get("line_total") or 0.0)
+                vr = float(r.get("vat_rate") or 0.0)
+                doc_items_rows.append({"name": name, "quantity": qty, "unit_price": up, "line_total": lt, "vat_rate": vr})
+            net, vat, gross, breakdown, _flags = compute_document_totals(doc_items_rows, total_with_vat=(float(doc.total_with_vat) if doc.total_with_vat is not None else total_sum))
+            doc.total_without_vat = net
+            doc.total_vat_amount = vat
+            if gross is not None:
+                doc.total_with_vat = gross
+            doc.vat_breakdown_json = json.dumps(breakdown, ensure_ascii=False)
+            session.add(doc)
 
             session.flush()
             # rebuild FTS (text = položky)
@@ -3391,10 +3464,28 @@ class MainWindow(QMainWindow):
         src = f.current_path if f else ""
         self.doc_src_line.setText(src or "")
 
-        item_headers = ["#", "Název", "Množství", "DPH", "Cena"]
+        net_v = getattr(d, "total_without_vat", None)
+        vat_v = getattr(d, "total_vat_amount", None)
+        gross_v = getattr(d, "total_with_vat", None)
+        self.lbl_doc_totals.setText(
+            f"Celky: netto {float(net_v or 0.0):,.2f} | DPH {float(vat_v or 0.0):,.2f} | brutto {float(gross_v or 0.0):,.2f}".replace(",", " ")
+        )
+
+        item_headers = ["#", "Název", "Množství", "DPH %", "Jedn. netto", "Jedn. brutto", "Řádek netto", "Řádek brutto", "DPH částka", "VAT kód"]
         item_rows: List[List[Any]] = []
         for it in items:
-            item_rows.append([it.line_no, it.name, it.quantity, it.vat_rate, it.line_total])
+            item_rows.append([
+                it.line_no,
+                it.name,
+                it.quantity,
+                it.vat_rate,
+                getattr(it, "unit_price_net", None) if getattr(it, "unit_price_net", None) is not None else it.unit_price,
+                getattr(it, "unit_price_gross", None),
+                getattr(it, "line_total_net", None),
+                getattr(it, "line_total_gross", None) if getattr(it, "line_total_gross", None) is not None else it.line_total,
+                getattr(it, "vat_amount", None),
+                getattr(it, "vat_code", None),
+            ])
         self.doc_items_table.setModel(TableModel(item_headers, item_rows))
         self.doc_items_table.resizeColumnsToContents()
 
@@ -3991,6 +4082,9 @@ class MainWindow(QMainWindow):
                         "doc_number": d.doc_number,
                         "bank_account": d.bank_account,
                         "total_with_vat": d.total_with_vat,
+                        "total_without_vat": getattr(d, "total_without_vat", None),
+                        "total_vat_amount": getattr(d, "total_vat_amount", None),
+                        "vat_breakdown_json": getattr(d, "vat_breakdown_json", None),
                         "currency": d.currency,
                         "requires_review": bool(d.requires_review),
                         "review_reasons": d.review_reasons,
@@ -3999,6 +4093,12 @@ class MainWindow(QMainWindow):
                         "item_name": None,
                         "item_quantity": None,
                         "item_vat_rate": None,
+                        "item_vat_code": None,
+                        "item_unit_price_net": None,
+                        "item_unit_price_gross": None,
+                        "item_line_total_net": None,
+                        "item_line_total_gross": None,
+                        "item_vat_amount": None,
                         "item_line_total": None,
                     })
                 else:
@@ -4010,6 +4110,9 @@ class MainWindow(QMainWindow):
                             "doc_number": d.doc_number,
                             "bank_account": d.bank_account,
                             "total_with_vat": d.total_with_vat,
+                            "total_without_vat": getattr(d, "total_without_vat", None),
+                            "total_vat_amount": getattr(d, "total_vat_amount", None),
+                            "vat_breakdown_json": getattr(d, "vat_breakdown_json", None),
                             "currency": d.currency,
                             "requires_review": bool(d.requires_review),
                             "review_reasons": d.review_reasons,
@@ -4018,6 +4121,12 @@ class MainWindow(QMainWindow):
                             "item_name": it.name,
                             "item_quantity": it.quantity,
                             "item_vat_rate": it.vat_rate,
+                            "item_vat_code": getattr(it, "vat_code", None),
+                            "item_unit_price_net": getattr(it, "unit_price_net", None) if getattr(it, "unit_price_net", None) is not None else it.unit_price,
+                            "item_unit_price_gross": getattr(it, "unit_price_gross", None),
+                            "item_line_total_net": getattr(it, "line_total_net", None),
+                            "item_line_total_gross": getattr(it, "line_total_gross", None) if getattr(it, "line_total_gross", None) is not None else it.line_total,
+                            "item_vat_amount": getattr(it, "vat_amount", None),
                             "item_line_total": it.line_total,
                         })
 
@@ -4029,6 +4138,42 @@ class MainWindow(QMainWindow):
                     w.writeheader()
                     for r in rows:
                         w.writerow(r)
+            elif kind == "jsonl":
+                grouped: Dict[int, Dict[str, Any]] = {}
+                for r in rows:
+                    did = int(r.get("document_id") or 0)
+                    g = grouped.setdefault(did, {
+                        "document_id": did,
+                        "issue_date": r.get("issue_date"),
+                        "supplier_ico": r.get("supplier_ico"),
+                        "doc_number": r.get("doc_number"),
+                        "bank_account": r.get("bank_account"),
+                        "currency": r.get("currency"),
+                        "total_with_vat": r.get("total_with_vat"),
+                        "total_without_vat": r.get("total_without_vat"),
+                        "total_vat_amount": r.get("total_vat_amount"),
+                        "vat_breakdown_json": r.get("vat_breakdown_json"),
+                        "requires_review": r.get("requires_review"),
+                        "review_reasons": r.get("review_reasons"),
+                        "file_path": r.get("file_path"),
+                        "items": [],
+                    })
+                    if r.get("item_line_no") is not None:
+                        g["items"].append({
+                            "line_no": r.get("item_line_no"),
+                            "name": r.get("item_name"),
+                            "quantity": r.get("item_quantity"),
+                            "vat_rate": r.get("item_vat_rate"),
+                            "vat_code": r.get("item_vat_code"),
+                            "unit_price_net": r.get("item_unit_price_net"),
+                            "unit_price_gross": r.get("item_unit_price_gross"),
+                            "line_total_net": r.get("item_line_total_net"),
+                            "line_total_gross": r.get("item_line_total_gross"),
+                            "vat_amount": r.get("item_vat_amount"),
+                        })
+                with open(path, "w", encoding="utf-8") as fp:
+                    for did in sorted(grouped.keys()):
+                        fp.write(json.dumps(grouped[did], ensure_ascii=False) + "\n")
             elif kind == "xlsx":
                 import pandas as pd
                 df = pd.DataFrame(rows)

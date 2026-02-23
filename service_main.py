@@ -18,12 +18,22 @@ from kajovospend.db.session import make_engine, make_session_factory
 from kajovospend.db.migrate import init_db
 from kajovospend.service.app import ServiceApp
 from kajovospend.service.control import ControlContext, ControlServer
+from kajovospend.service.sync_ares import sync_pending_suppliers
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
+    sub = ap.add_subparsers(dest="command")
+
+    ap_run = sub.add_parser("run")
+
+    ap_sync = sub.add_parser("sync-ares")
+    ap_sync.add_argument("--limit", type=int, default=500)
+
     args = ap.parse_args()
+    if not getattr(args, "command", None):
+        args.command = "run"
 
     cfg = load_yaml(Path(args.config))
     # Merge missing sections with defaults
@@ -33,6 +43,7 @@ def main() -> int:
     cfg.setdefault("ocr", {})
     cfg.setdefault("openai", {})
     cfg.setdefault("performance", {})
+    cfg.setdefault("ares", {})
 
     paths = resolve_app_paths(
         cfg["app"].get("data_dir"),
@@ -45,6 +56,13 @@ def main() -> int:
     engine = make_engine(str(paths.db_path))
     init_db(engine)
     sf = make_session_factory(engine)
+
+    if args.command == "sync-ares":
+        ttl_hours = float(cfg.get("ares", {}).get("ttl_hours", 24.0) or 24.0)
+        limit = int(getattr(args, "limit", 500) or 500)
+        stats = sync_pending_suppliers(sf, log, ttl_hours=ttl_hours, limit=limit)
+        log.info("sync-ares done: %s", stats)
+        return 0
 
     # store pid
     pid_path = paths.data_dir / "service.pid"
