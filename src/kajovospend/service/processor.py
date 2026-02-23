@@ -1429,7 +1429,7 @@ class Processor:
             ex = extract_from_text(ocr_text or "")
             per_doc_chunks = [{
                 "page_from": 1,
-                "page_to": int(pages_count),
+                "page_to": int(pages),
                 "extracted": ex,
                 "full_text": ocr_text or "",
                 "ocr_conf": float(ocr_conf or 0.0),
@@ -1575,7 +1575,7 @@ class Processor:
             openai_feature_enabled = bool((features.get("openai_fallback", {}) or {}).get("enabled", False))
             openai_enabled = bool(openai_feature_enabled and (OpenAIConfig is not None) and api_key and (openai_cfg.get("enabled") or auto_enable))
             primary_enabled = bool(openai_cfg.get("primary_enabled", True))
-            openai_model = str(openai_cfg.get("model") or "auto").strip() or "auto"
+            openai_model = str(openai_cfg.get("model") or "gpt-4.1").strip() or "gpt-4.1"
             fallback_model = str(openai_cfg.get("fallback_model") or "").strip() or None
             use_json_schema = bool(openai_cfg.get("use_json_schema", True))
             temperature = float(openai_cfg.get("temperature", 0.0) or 0.0)
