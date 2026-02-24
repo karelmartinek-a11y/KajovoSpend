@@ -22,7 +22,7 @@ flowchart LR
 ## Bezpečnostní rozhodnutí
 - Síťové timeouty jsou explicitní pro HTTP volání (`requests`).
 - YAML konfigurace používá `yaml.safe_load`.
-- Přesuny souborů používají bezpečný fallback `copy2 + unlink` při locku.
+- Přesuny souborů používají bezpečný fallback `copy2 + unlink` při locku a sanitizaci názvu cílového souboru (bez path traversal).
 
 ## Diagramy
 - [System context](diagrams/system-context.mmd)
