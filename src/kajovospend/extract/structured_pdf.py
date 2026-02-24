@@ -4,6 +4,7 @@ import datetime as dt
 import re
 from dataclasses import asdict
 from pathlib import Path
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 from pypdf import PdfReader
@@ -92,7 +93,7 @@ def _iter(node: ET.Element, path: str) -> List[ET.Element]:
         return []
 
 def extract_pdf_attachments(pdf_path: Path) -> Dict[str, bytes]:
-    reader = PdfReader(str(pdf_path))
+    reader = PdfReader(BytesIO(pdf_path.read_bytes()))
     out: Dict[str, bytes] = {}
 
     # Newer pypdf exposes reader.attachments

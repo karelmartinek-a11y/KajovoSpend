@@ -58,6 +58,7 @@ openai:
   fallback_model: ''
   primary_enabled: true
   use_json_schema: true
+  only_openai: false
   temperature: 0.0
   max_output_tokens: 2000
   timeout_sec: 60

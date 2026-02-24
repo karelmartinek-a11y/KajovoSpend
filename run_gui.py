@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QIcon
+
+from kajovospend.utils.env import load_user_env_var, sanitize_openai_api_key
+
+ROOT_DIR = Path(__file__).resolve().parent
+SRC_DIR = ROOT_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    # Prefer lokální zdrojáky před případnou instalací balíčku jinde v systému.
+    sys.path.insert(0, str(SRC_DIR))
 
 from kajovospend.ui.main_window import MainWindow
 
@@ -33,9 +42,15 @@ def _install_excepthook() -> None:
 
 
 def main() -> int:
+    root = ROOT_DIR
+    # načti klíč přímo z registru (uživatelské proměnné). Procesy spuštěné ze stejného PowerShellu
+    # nemusí mít aktualizované prostředí, proto nečteme jen os.getenv.
+    val = sanitize_openai_api_key(load_user_env_var("KAJOVOSPEND_OPENAI_API_KEY"))
+    if val:
+        os.environ["KAJOVOSPEND_OPENAI_API_KEY"] = val
+
     app = QApplication(sys.argv)
     _install_excepthook()
-    root = Path(__file__).parent
     icon_path = root / "assets" / "app.ico"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))

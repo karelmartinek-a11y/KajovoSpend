@@ -16,20 +16,32 @@ def render_pdf_to_images(
     start_page: int = 0,
 ) -> List[Image.Image]:
     pdf = pdfium.PdfDocument(str(pdf_path))
-    n = len(pdf)
-    start = max(0, int(start_page or 0))
-    if start >= n:
-        return []
-    if max_pages is not None:
-        n = min(n, start + int(max_pages))
-    scale = dpi / 72.0
-    images: List[Image.Image] = []
-    for i in range(start, n):
-        page = pdf[i]
-        bitmap = page.render(scale=scale)
-        arr = bitmap.to_numpy()  # BGRA
-        if arr.shape[2] == 4:
-            arr = arr[:, :, :3]
-        img = Image.fromarray(arr.astype(np.uint8), mode="RGB")
-        images.append(img)
-    return images
+    try:
+        n = len(pdf)
+        start = max(0, int(start_page or 0))
+        if start >= n:
+            return []
+        if max_pages is not None:
+            n = min(n, start + int(max_pages))
+        scale = dpi / 72.0
+        images: List[Image.Image] = []
+        for i in range(start, n):
+            page = pdf[i]
+            try:
+                bitmap = page.render(scale=scale)
+                try:
+                    arr = bitmap.to_numpy()  # BGRA
+                    if arr.shape[2] == 4:
+                        arr = arr[:, :, :3]
+                    img = Image.fromarray(arr.astype(np.uint8), mode="RGB")
+                    images.append(img)
+                finally:
+                    if hasattr(bitmap, "close"):
+                        bitmap.close()
+            finally:
+                if hasattr(page, "close"):
+                    page.close()
+        return images
+    finally:
+        if hasattr(pdf, "close"):
+            pdf.close()

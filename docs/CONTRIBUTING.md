@@ -6,7 +6,6 @@
 3. Instalace: `pip install -r requirements.txt`
 
 ## Běh aplikace
-- Služba: `python service_main.py --config config.yaml`
 - GUI: `python -m app_gui`
 
 ## Testování

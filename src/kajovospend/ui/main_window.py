@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import copy
+import copy
 import datetime as dt
-import json
 import os
 import threading
 from io import BytesIO
@@ -13,17 +14,19 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageFilter, ImageOps
 
-from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl, QPointF, QRectF
+from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl, QPointF, QRectF, QSize
 from PySide6.QtGui import QIcon, QPixmap, QImage, QDesktopServices, QPainter, QPen, QColor, QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QTabWidget, QTableView,
     QLineEdit, QFormLayout, QSplitter, QTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QFileDialog,
     QMessageBox, QDateEdit, QDialog, QDialogButtonBox, QHeaderView, QAbstractItemView,
-    QCheckBox, QProgressDialog, QApplication, QInputDialog, QScrollArea, QStyledItemDelegate,
+    QCheckBox, QProgressDialog, QApplication, QInputDialog, QScrollArea, QStyledItemDelegate, QSizePolicy,
+    QProgressBar,
 )
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
 from sqlalchemy import select, text
+from sqlalchemy.orm import selectinload
 
 from shiboken6 import Shiboken
 from kajovospend.utils.config import load_yaml, save_yaml, deep_set
@@ -44,7 +47,7 @@ from kajovospend.integrations.openai_fallback import (
 from kajovospend.service.processor import Processor, safe_move
 from kajovospend.utils.hashing import sha256_file
 from kajovospend.ocr.pdf_render import render_pdf_to_images
-from kajovospend.extract.vat_math import compute_document_totals, compute_item_derivations
+from kajovospend.utils.env import load_user_env_var, set_user_env_var, sanitize_openai_api_key
 
 from .styles import QSS
 from . import db_api
@@ -57,6 +60,7 @@ class PdfPreviewView(QGraphicsView):
         self.setScene(self._scene)
         self._pix_item = QGraphicsPixmapItem()
         self._scene.addItem(self._pix_item)
+        self._user_zoomed = False
 
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
@@ -72,15 +76,19 @@ class PdfPreviewView(QGraphicsView):
         self._pix_item.setPixmap(px)
         if not px.isNull():
             self._scene.setSceneRect(px.rect())
-            self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+            if not self._user_zoomed:
+                self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
 
     def zoom_in(self):
+        self._user_zoomed = True
         self.scale(1.25, 1.25)
 
     def zoom_out(self):
+        self._user_zoomed = True
         self.scale(0.8, 0.8)
 
     def reset_zoom(self):
+        self._user_zoomed = False
         self.resetTransform()
         if not self._scene.sceneRect().isEmpty():
             self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
@@ -131,6 +139,14 @@ class TrafficLightDelegate(QStyledItemDelegate):
 
     def displayText(self, value, locale):
         return ""
+
+
+OPS_STAGE_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("offline", "Offline"),
+    ("openai_primary", "OpenAI prim."),
+    ("openai_fallback", "OpenAI fallback"),
+    ("synthetic", "Syntet."),
+)
 
 
 def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
@@ -229,17 +245,21 @@ class DashboardTile(QWidget):
         super().__init__(parent)
         self.setObjectName("DashTile")
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(8)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.setMinimumHeight(150)
 
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        tile_px = 96
         self.icon = QLabel()
-        # 3? p?vodn? velikosti (cca 46 px) ? 150 px
-        self.icon.setFixedSize(150, 150)
+        # menší velikost dlaždic pro nižší minimální výšku okna
+        self.icon.setFixedSize(tile_px, tile_px)
         if pixmap is None:
-            pixmap = _make_icon_pixmap(icon, 150)
+            pixmap = _make_icon_pixmap(icon, tile_px)
         if not pixmap.isNull():
-            pixmap = pixmap.scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pixmap = pixmap.scaled(tile_px, tile_px, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.icon.setPixmap(pixmap)
         self.icon.setAlignment(Qt.AlignCenter)
         self.icon.setObjectName("DashIcon")
@@ -247,12 +267,13 @@ class DashboardTile(QWidget):
 
         self.lbl_value = QLabel("-")
         f: QFont = self.lbl_value.font()
-        f.setPointSize(72)
+        f.setPointSize(36)
         f.setBold(True)
         self.lbl_value.setFont(f)
         self.lbl_value.setAlignment(Qt.AlignCenter)
         self.lbl_value.setObjectName("DashValue")
         self.lbl_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_value.setSizePolicy(self.lbl_value.sizePolicy().horizontalPolicy(), QSizePolicy.Fixed)
         lay.addWidget(self.lbl_value)
 
     def set_value(self, text: str) -> None:
@@ -482,6 +503,9 @@ class _ImportWorker(QObject):
     @Slot()
     def run(self):
         try:
+            reg_api = sanitize_openai_api_key(load_user_env_var("KAJOVOSPEND_OPENAI_API_KEY"))
+            if reg_api:
+                os.environ["KAJOVOSPEND_OPENAI_API_KEY"] = reg_api
             input_dir = Path(self.cfg["paths"]["input_dir"])
             if not input_dir.exists():
                 self.done.emit({"imported": 0, "message": "Adresář INPUT neexistuje."})
@@ -736,6 +760,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config_path = config_path
         self.assets_dir = assets_dir
+        # načti klíč z registru (uživatelské proměnné) i z  kvůli zpětné kompatibilitě
+        val = sanitize_openai_api_key(load_user_env_var("KAJOVOSPEND_OPENAI_API_KEY"))
+        if val:
+            os.environ["KAJOVOSPEND_OPENAI_API_KEY"] = val
         self._icon_cache: Dict[str, QPixmap] = {}
         self.cfg = self._load_or_create_config()
         # keep threads/workers alive
@@ -805,6 +833,9 @@ class MainWindow(QMainWindow):
         if ico.exists():
             self.setWindowIcon(QIcon(str(ico)))
 
+        # Omez minimální velikost okna, aby se vešlo i na menší displeje a netlačilo geometry warnings.
+        self.setMinimumSize(QSize(720, 540))
+
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(QSS)
@@ -862,6 +893,7 @@ class MainWindow(QMainWindow):
             openai_cfg.setdefault("auto_enable", True)
             openai_cfg.setdefault("primary_enabled", True)
             openai_cfg.setdefault("fallback_enabled", True)
+            openai_cfg.setdefault("only_openai", False)
             openai_cfg.setdefault("model", "auto")
             openai_cfg.setdefault("fallback_model", "")
             openai_cfg.setdefault("use_json_schema", True)
@@ -1009,6 +1041,82 @@ class MainWindow(QMainWindow):
                 return px
         return None
 
+    def _set_combo_value(self, combo: QComboBox, value: str) -> None:
+        """Bezpecne nastavi hodnotu do editovatelneho comboboxu."""
+        val = value or ""
+        found = any(combo.itemText(i) == val for i in range(combo.count()))
+        if not found:
+            combo.addItem(val)
+        combo.setCurrentText(val)
+
+    def _normalize_openai_settings(self) -> List[str]:
+        """Upraví kolidující nastavení OpenAI a vrátí poznámky k zobrazení uživateli."""
+        notes: List[str] = []
+        # dovolena je vždy jen jedna volba z triady; zadna = OpenAI vypnuto
+        if self.cb_openai_only.isChecked():
+            if self.cb_openai_primary.isChecked():
+                self.cb_openai_primary.setChecked(False)
+            if self.cb_openai_fallback.isChecked():
+                self.cb_openai_fallback.setChecked(False)
+            notes.append("Zvolen režim jen OpenAI – ostatní volby vypnuty.")
+        elif self.cb_openai_primary.isChecked():
+            if self.cb_openai_fallback.isChecked():
+                self.cb_openai_fallback.setChecked(False)
+            if self.cb_openai_only.isChecked():
+                self.cb_openai_only.setChecked(False)
+            notes.append("Zvolena primární online extrakce – ostatní volby vypnuty.")
+        elif self.cb_openai_fallback.isChecked():
+            if self.cb_openai_primary.isChecked():
+                self.cb_openai_primary.setChecked(False)
+            if self.cb_openai_only.isChecked():
+                self.cb_openai_only.setChecked(False)
+            notes.append("Zvolen OpenAI fallback – ostatní volby vypnuty.")
+        return notes
+
+    def _recommend_model(self, models: List[str], *, fallback: bool = False) -> str:
+        prefer_primary = [
+            "gpt-4.1-mini",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4.1-nano",
+        ]
+        prefer_fallback = [
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4.1-mini",
+            "gpt-4o-mini",
+        ]
+        prefs = prefer_fallback if fallback else prefer_primary
+        for cand in prefs:
+            if cand in models:
+                return cand
+        return models[0] if models else "auto"
+
+    def _populate_model_combos(self, models: List[str], *, auto_fill: bool = True) -> tuple[str, str]:
+        """Naplní dropdowny dostupnými modely a vrátí doporučení (primary, fallback)."""
+        clean = [m for m in models if isinstance(m, str)]
+        # lepší UX: gpt* nahoru, ostatní poté
+        gpts = sorted([m for m in clean if m.startswith("gpt")])
+        others = sorted([m for m in clean if not m.startswith("gpt")])
+        ordered = gpts + others if gpts else others
+        recommended_primary = self._recommend_model(ordered, fallback=False)
+        recommended_fallback = self._recommend_model(ordered, fallback=True)
+
+        def _fill(combo: QComboBox, current: str):
+            combo.blockSignals(True)
+            combo.clear()
+            for m in ordered:
+                combo.addItem(m)
+            self._set_combo_value(combo, current)
+            combo.blockSignals(False)
+
+        cur_primary = recommended_primary if auto_fill else (self.cmb_primary_model.currentText() or recommended_primary)
+        cur_fallback = recommended_fallback if auto_fill else (self.cmb_fallback_model.currentText() or recommended_fallback)
+        _fill(self.cmb_primary_model, cur_primary)
+        _fill(self.cmb_fallback_model, cur_fallback)
+        return recommended_primary, recommended_fallback
+
     def _stat_number_font(self, size: int, *, bold: bool = False) -> QFont:
         f = QFont()
         f.setPointSize(int(size))
@@ -1140,8 +1248,17 @@ class MainWindow(QMainWindow):
         p.end()
         return px
 
+    def minimumSizeHint(self) -> QSize:
+        # Drž malé minimum, aby okno šlo otevřít i na menších displejích.
+        return QSize(640, 520)
+
+    def sizeHint(self) -> QSize:
+        return QSize(1280, 900)
+
     def _build_ui(self):
         root = QWidget()
+        root.setMinimumSize(QSize(640, 480))
+        root.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         v = QVBoxLayout(root)
 
         # Header
@@ -1179,6 +1296,8 @@ class MainWindow(QMainWindow):
         v.addWidget(header)
 
         self.tabs = QTabWidget()
+        self.tabs.setMinimumSize(QSize(640, 480))
+        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         v.addWidget(self.tabs, 1)
 
                 
@@ -1215,7 +1334,7 @@ class MainWindow(QMainWindow):
         dash_grid = QGridLayout(dash_wrap)
         dash_grid.setContentsMargins(0, 0, 0, 0)
         dash_grid.setHorizontalSpacing(12)
-        dash_grid.setVerticalSpacing(12)
+        dash_grid.setVerticalSpacing(8)
 
         self._dash_tiles: dict[str, DashboardTile] = {}
         self._stat_labels = {}  # reused by _apply_dashboard (DB stats)
@@ -1398,31 +1517,56 @@ class MainWindow(QMainWindow):
         openai_cfg = self.cfg.get("openai", {}) if isinstance(self.cfg, dict) else {}
         if not isinstance(openai_cfg, dict):
             openai_cfg = {}
+        # odebrané přepínače, ale necháme je jako skryté dummy kvůli stávajícímu kódu
+        self.cb_openai_enabled = QCheckBox("Zapnout OpenAI")
+        self.cb_openai_enabled.setChecked(True)
+        self.cb_openai_enabled.hide()
+        self.cb_openai_auto = QCheckBox("Auto-zapnout pri vyplnenem API key")
+        self.cb_openai_auto.setChecked(False)
+        self.cb_openai_auto.hide()
         self.ed_api_key = QLineEdit(openai_cfg.get("api_key", ""))
         self.ed_api_key.setEchoMode(QLineEdit.Password)
         self.btn_api_show = QPushButton("Zobrazit")
         self.btn_api_clear = QPushButton("Smazat")
+        self.btn_api_save = QPushButton("Uložit")
+        self.btn_api_load = QPushButton("Načíst z prostředí")
+        self.btn_api_test = QPushButton("Otestovat API key")
         self.btn_api_models = QPushButton("Načíst modely")
         api_row = QWidget(); ar = QHBoxLayout(api_row); ar.setContentsMargins(0,0,0,0)
-        ar.addWidget(self.ed_api_key, 1); ar.addWidget(self.btn_api_show); ar.addWidget(self.btn_api_clear); ar.addWidget(self.btn_api_models)
+        ar.addWidget(self.ed_api_key, 1)
+        ar.addWidget(self.btn_api_show)
+        ar.addWidget(self.btn_api_clear)
+        ar.addWidget(self.btn_api_save)
+        ar.addWidget(self.btn_api_load)
+        ar.addWidget(self.btn_api_test)
+        ar.addWidget(self.btn_api_models)
         form.addRow("OpenAI API key", api_row)
 
-        self.cb_openai_enabled = QCheckBox("Zapnout OpenAI")
-        self.cb_openai_enabled.setChecked(bool(openai_cfg.get("enabled", False)))
-        self.cb_openai_auto = QCheckBox("Auto-zapnout pri vyplnenem API key")
-        self.cb_openai_auto.setChecked(bool(openai_cfg.get("auto_enable", True)))
         self.cb_openai_primary = QCheckBox("Primarni online extrakce (OpenAI)")
         self.cb_openai_primary.setChecked(bool(openai_cfg.get("primary_enabled", True)))
-        self.cb_openai_fallback = QCheckBox("Povolit OpenAI fallback")
+        self.cb_openai_fallback = QCheckBox("Povolit OpenAI (fallback / online)")
         self.cb_openai_fallback.setChecked(bool(openai_cfg.get("fallback_enabled", True)))
+        self.cb_openai_only = QCheckBox("Používat jen OpenAI (bez offline)")
+        self.cb_openai_only.setChecked(bool(openai_cfg.get("only_openai", False)))
 
-        self.ed_primary_model = QLineEdit(openai_cfg.get("model", "auto"))
-        self.ed_primary_model.setPlaceholderText("auto")
-        self.ed_fallback_model = QLineEdit(openai_cfg.get("fallback_model", ""))
-        self.ed_fallback_model.setPlaceholderText("auto / prazdne = stejny model")
+        self.cmb_primary_model = QComboBox()
+        self.cmb_primary_model.setEditable(True)
+        self.cmb_primary_model.setInsertPolicy(QComboBox.NoInsert)
+        self.cmb_primary_model.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.cmb_primary_model.addItem(openai_cfg.get("model", "auto") or "auto")
+        self.cmb_primary_model.setCurrentText(openai_cfg.get("model", "auto") or "auto")
 
+        self.cmb_fallback_model = QComboBox()
+        self.cmb_fallback_model.setEditable(True)
+        self.cmb_fallback_model.setInsertPolicy(QComboBox.NoInsert)
+        self.cmb_fallback_model.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.cmb_fallback_model.addItem(openai_cfg.get("fallback_model", "") or "")
+        self.cmb_fallback_model.setCurrentText(openai_cfg.get("fallback_model", ""))
+
+        # JSON schema je povinné, ale necháme skrytý checkbox kvůli stávajícímu kódu (tooltips, save)
         self.cb_use_json_schema = QCheckBox("Vynutit JSON schema (strict)")
-        self.cb_use_json_schema.setChecked(bool(openai_cfg.get("use_json_schema", True)))
+        self.cb_use_json_schema.setChecked(True)
+        self.cb_use_json_schema.hide()
 
         self.sp_temperature = QDoubleSpinBox()
         self.sp_temperature.setDecimals(2)
@@ -1449,31 +1593,28 @@ class MainWindow(QMainWindow):
         self.sp_image_max_pages.setRange(1, 5)
         self.sp_image_max_pages.setValue(int(openai_cfg.get("image_max_pages", 3) or 3))
 
+        # skrytý dummy přepínač pro tooltips a save, ale hodnota je vždy True
         self.cb_image_enhance = QCheckBox("Zlepsit obraz pred odeslanim")
-        self.cb_image_enhance.setChecked(bool(openai_cfg.get("image_enhance", True)))
+        self.cb_image_enhance.setChecked(True)
+        self.cb_image_enhance.hide()
 
         self.sp_image_variants = QSpinBox()
         self.sp_image_variants.setRange(1, 3)
         self.sp_image_variants.setValue(int(openai_cfg.get("image_variants", 2) or 2))
 
-        self.cb_allow_synth = QCheckBox("Povolit synteticke polozky jako posledni zachrana")
-        self.cb_allow_synth.setChecked(bool(openai_cfg.get("allow_synthetic_items", False)))
 
-        form.addRow("Primarni model", self.ed_primary_model)
-        form.addRow("Fallback model", self.ed_fallback_model)
+        form.addRow("Primarni model", self.cmb_primary_model)
+        form.addRow("Fallback model", self.cmb_fallback_model)
         form.addRow("Teplota", self.sp_temperature)
         form.addRow("Max output tokens", self.sp_max_tokens)
         form.addRow("Timeout (s)", self.sp_timeout)
         form.addRow("Image DPI", self.sp_image_dpi)
         form.addRow("Max stranky", self.sp_image_max_pages)
         form.addRow("Varianta obrazu", self.sp_image_variants)
-        form.addRow(self.cb_use_json_schema)
-        form.addRow(self.cb_openai_enabled)
-        form.addRow(self.cb_openai_auto)
+        # JSON schema je nyní povinné, volba odebrána
         form.addRow(self.cb_openai_primary)
         form.addRow(self.cb_openai_fallback)
-        form.addRow(self.cb_image_enhance)
-        form.addRow(self.cb_allow_synth)
+        form.addRow(self.cb_openai_only)
 
         # Tooltips (obsahle napovedy pro nastaveni)
         self.ed_input_dir.setToolTip(
@@ -1500,29 +1641,30 @@ class MainWindow(QMainWindow):
         self.btn_api_clear.setToolTip(
             "Vymaze API key z pole (a po ulozeni i z configu)."
         )
+        self.btn_api_save.setToolTip(
+            "Ulozi API key do uzivatelskych promennych Windows (registr)."
+        )
+        self.btn_api_load.setToolTip(
+            "Nacte API key z Windows prostredi (KAJOVOSPEND_OPENAI_API_KEY) zpet do pole."
+        )
+        self.btn_api_test.setToolTip(
+            "Otestuje API key proti /v1/models a ověří, že je funkční."
+        )
         self.btn_api_models.setToolTip(
             "Nacte seznam modelu z /v1/models pres zadany API key.\n"
             "Vybrany model lze ulozit jako primarni nebo fallback."
         )
-        self.ed_primary_model.setToolTip(
+        self.cmb_primary_model.setToolTip(
             "Model pro primarni online extrakci.\n"
             "Hodnota 'auto' vybere nejvhodnejsi dostupny model.\n"
             "Muzes zadat i presny identifikator modelu."
         )
-        self.ed_fallback_model.setToolTip(
+        self.cmb_fallback_model.setToolTip(
             "Model pro fallback pri nekompletni extrakci.\n"
             "Prazdne = pouzije se primarni model.\n"
             "Vhodne je nastavit robustnejsi (ale drazsi) model."
         )
-        self.cb_openai_enabled.setToolTip(
-            "Manualni prepinac online extrakce.\n"
-            "Kdyz je zapnute auto-zapnuti, rozhoduje API key.\n"
-            "Kdyz auto vypnes, timto prepinacem OpenAI povolis/zakazes."
-        )
-        self.cb_openai_auto.setToolTip(
-            "Automaticky zapne OpenAI, pokud je vyplnen API key.\n"
-            "Vhodne pro bezobsluzny rezim bez rucniho prepinani."
-        )
+        # odebrané přepínače openai_enabled/auto_enable
         self.cb_openai_primary.setToolTip(
             "Primarni online extrakce pred heuristikami.\n"
             "Zvyssuje presnost u tezko citelnych skenu, ale prodluzuje cas."
@@ -1531,6 +1673,23 @@ class MainWindow(QMainWindow):
             "Druhe kolo OpenAI, kdyz data stale nejsou kompletni.\n"
             "Typicky kdyz chybi polozky nebo soucty."
         )
+        self.cb_openai_only.setToolTip(
+            "Preskoci vsechny offline metody (OCR/ensemble) a pouzije jen OpenAI Responses.\n"
+            "Vyuzij, pokud mas spolehlivy API key a chces striktne cloud vytahovani."
+        )
+        # vzajemne vylouceni voleb (primarni/fallback/only)
+        def _exclusive_toggle(changed: QCheckBox) -> None:
+            if not changed.isChecked():
+                return
+            for other in (self.cb_openai_primary, self.cb_openai_fallback, self.cb_openai_only):
+                if other is changed:
+                    continue
+                other.blockSignals(True)
+                other.setChecked(False)
+                other.blockSignals(False)
+        self.cb_openai_primary.toggled.connect(lambda _v: _exclusive_toggle(self.cb_openai_primary))
+        self.cb_openai_fallback.toggled.connect(lambda _v: _exclusive_toggle(self.cb_openai_fallback))
+        self.cb_openai_only.toggled.connect(lambda _v: _exclusive_toggle(self.cb_openai_only))
         self.cb_use_json_schema.setToolTip(
             "Vynuti striktni JSON schema pro vystup.\n"
             "Zlepsuje spolehlivost struktury, ale muze byt prisnejsi."
@@ -1587,10 +1746,6 @@ class MainWindow(QMainWindow):
             "QPushButton:hover {background-color:#DC2626;}"
         )
 
-        self.cb_allow_synth.setToolTip(
-            "Povoli vytvoreni synteticke polozky z totalu jako posledni zachranu.\n"
-            "Pouzivej jen pokud je to akceptovatelne z pohledu kvality."
-        )
         self.btn_save_settings.setToolTip(
             "Ulozi nastaveni do configu.\n"
             "Zmeny se projevi pro nove zpracovani."
@@ -1794,9 +1949,6 @@ class MainWindow(QMainWindow):
         sr.addWidget(self.btn_zoom_in); sr.addWidget(self.btn_zoom_out); sr.addWidget(self.btn_zoom_reset)
         rl.addWidget(srcrow)
 
-        self.lbl_doc_totals = QLabel("Celky: netto - | DPH - | brutto -")
-        rl.addWidget(self.lbl_doc_totals)
-
         self.preview_view = PdfPreviewView()
         rl.addWidget(self.preview_view, 3)
 
@@ -1841,6 +1993,9 @@ class MainWindow(QMainWindow):
         self.btn_reset_program.clicked.connect(self._on_reset_program)
         self.btn_api_show.clicked.connect(self._on_api_show_toggle)
         self.btn_api_clear.clicked.connect(self._on_api_clear)
+        self.btn_api_save.clicked.connect(self._on_api_save)
+        self.btn_api_load.clicked.connect(self._on_api_load)
+        self.btn_api_test.clicked.connect(self._on_api_test)
         self.btn_api_models.clicked.connect(self._on_api_models)
 
         self.btn_sup_refresh.clicked.connect(self.refresh_suppliers)
@@ -2245,12 +2400,6 @@ class MainWindow(QMainWindow):
         self._current_doc_file_id = int(f.id) if f else None
         self._current_doc_path = f.current_path if f else None
         self.doc_src_line.setText(self._current_doc_path or "")
-        net_v = getattr(doc, "total_without_vat", None)
-        vat_v = getattr(doc, "total_vat_amount", None)
-        gross_v = getattr(doc, "total_with_vat", None)
-        self.lbl_doc_totals.setText(
-            f"Celky: netto {float(net_v or 0.0):,.2f} | DPH {float(vat_v or 0.0):,.2f} | brutto {float(gross_v or 0.0):,.2f}".replace(",", " ")
-        )
 
         rows = []
         for it in items:
@@ -2266,13 +2415,8 @@ class MainWindow(QMainWindow):
                     "name": it.name or "",
                     "quantity": float(it.quantity or 0.0),
                     "unit_price": unit_price_val,
-                    "line_total": float(getattr(it, "line_total_gross", None) or it.line_total or 0.0),
-                    "line_total_net": float(getattr(it, "line_total_net", 0.0) or 0.0),
-                    "unit_price_net": float(getattr(it, "unit_price_net", 0.0) or unit_price_val or 0.0),
-                    "unit_price_gross": float(getattr(it, "unit_price_gross", 0.0) or 0.0),
-                    "vat_amount": float(getattr(it, "vat_amount", 0.0) or 0.0),
+                    "line_total": float(it.line_total or 0.0),
                     "vat_rate": float(it.vat_rate or 0.0),
-                    "vat_code": getattr(it, "vat_code", "") or "",
                     "ean": getattr(it, "ean", "") or "",
                     "item_code": getattr(it, "item_code", "") or "",
                 }
@@ -2334,47 +2478,15 @@ class MainWindow(QMainWindow):
                 vr = float(r.get("vat_rate") or 0.0)
                 ean = (r.get("ean") or "").strip() or None
                 code = (r.get("item_code") or "").strip() or None
-
-                derived = compute_item_derivations(
-                    {
-                        "name": name,
-                        "quantity": qty,
-                        "unit_price": up,
-                        "line_total": lt,
-                        "vat_rate": vr,
-                        "vat_code": r.get("vat_code"),
-                        "ean": ean,
-                        "item_code": code,
-                    }
-                )
-                up_net = float(derived.get("unit_price_net") or 0.0)
-                up_gross = float(derived.get("unit_price_gross") or 0.0)
-                lt_net = float(derived.get("line_total_net") or 0.0)
-                lt_gross = float(derived.get("line_total_gross") or 0.0)
-                vat_amount = float(derived.get("vat_amount") or 0.0)
-                vat_code = (derived.get("vat_code") or "").strip() or None
-                total_sum += float(lt_gross or 0.0)
+                total_sum += float(lt or 0.0)
 
                 if rid and int(rid) in existing:
                     it = existing[int(rid)]
                     it.line_no = line_no
                     it.name = name[:512]
                     it.quantity = qty
-                    it.unit_price = up_net
-                    it.line_total = lt_gross
+                    it.line_total = lt
                     it.vat_rate = vr
-                    if hasattr(it, "unit_price_net"):
-                        it.unit_price_net = up_net
-                    if hasattr(it, "unit_price_gross"):
-                        it.unit_price_gross = up_gross
-                    if hasattr(it, "line_total_net"):
-                        it.line_total_net = lt_net
-                    if hasattr(it, "line_total_gross"):
-                        it.line_total_gross = lt_gross
-                    if hasattr(it, "vat_amount"):
-                        it.vat_amount = vat_amount
-                    if hasattr(it, "vat_code"):
-                        it.vat_code = vat_code
                     if hasattr(it, "ean"):
                         it.ean = ean
                     if hasattr(it, "item_code"):
@@ -2387,22 +2499,9 @@ class MainWindow(QMainWindow):
                         line_no=line_no,
                         name=name[:512],
                         quantity=qty,
-                        unit_price=up_net,
-                        line_total=lt_gross,
+                        line_total=lt,
                         vat_rate=vr,
                     )
-                    if hasattr(it, "unit_price_net"):
-                        it.unit_price_net = up_net
-                    if hasattr(it, "unit_price_gross"):
-                        it.unit_price_gross = up_gross
-                    if hasattr(it, "line_total_net"):
-                        it.line_total_net = lt_net
-                    if hasattr(it, "line_total_gross"):
-                        it.line_total_gross = lt_gross
-                    if hasattr(it, "vat_amount"):
-                        it.vat_amount = vat_amount
-                    if hasattr(it, "vat_code"):
-                        it.vat_code = vat_code
                     if hasattr(it, "ean"):
                         it.ean = ean
                     if hasattr(it, "item_code"):
@@ -2416,22 +2515,10 @@ class MainWindow(QMainWindow):
                 if it_id not in keep_ids:
                     session.delete(it)
 
-            # update document net/vat/gross totals deterministicky z položek
-            doc_items_rows = []
-            for r in rows:
-                name = (r.get("name") or "").strip() or "Položka"
-                qty = float(r.get("quantity") or 0.0)
-                up = float(r.get("unit_price") or 0.0)
-                lt = float(r.get("line_total") or 0.0)
-                vr = float(r.get("vat_rate") or 0.0)
-                doc_items_rows.append({"name": name, "quantity": qty, "unit_price": up, "line_total": lt, "vat_rate": vr})
-            net, vat, gross, breakdown, _flags = compute_document_totals(doc_items_rows, total_with_vat=(float(doc.total_with_vat) if doc.total_with_vat is not None else total_sum))
-            doc.total_without_vat = net
-            doc.total_vat_amount = vat
-            if gross is not None:
-                doc.total_with_vat = gross
-            doc.vat_breakdown_json = json.dumps(breakdown, ensure_ascii=False)
-            session.add(doc)
+            # update total (volitelně)
+            if total_sum and (doc.total_with_vat is None or abs(float(doc.total_with_vat or 0.0) - total_sum) > 0.01):
+                doc.total_with_vat = float(total_sum)
+                session.add(doc)
 
             session.flush()
             # rebuild FTS (text = položky)
@@ -2494,26 +2581,42 @@ class MainWindow(QMainWindow):
                 pass
 
     def on_save_settings(self):
+        notes = self._normalize_openai_settings()
         deep_set(self.cfg, ["paths", "input_dir"], self.ed_input_dir.text().strip())
         deep_set(self.cfg, ["paths", "output_dir"], self.ed_output_dir.text().strip())
         deep_set(self.cfg, ["openai", "api_key"], "")  # API klíč se nikdy neukládá do YAML; použijte ENV KAJOVOSPEND_OPENAI_API_KEY
-        deep_set(self.cfg, ["openai", "enabled"], self.cb_openai_enabled.isChecked())
-        deep_set(self.cfg, ["openai", "auto_enable"], self.cb_openai_auto.isChecked())
+        deep_set(self.cfg, ["openai", "enabled"], True)
+        deep_set(self.cfg, ["openai", "auto_enable"], False)
         deep_set(self.cfg, ["openai", "primary_enabled"], self.cb_openai_primary.isChecked())
         deep_set(self.cfg, ["openai", "fallback_enabled"], self.cb_openai_fallback.isChecked())
-        deep_set(self.cfg, ["openai", "model"], self.ed_primary_model.text().strip())
-        deep_set(self.cfg, ["openai", "fallback_model"], self.ed_fallback_model.text().strip())
-        deep_set(self.cfg, ["openai", "use_json_schema"], self.cb_use_json_schema.isChecked())
+        # vzájemné vyloučení: only_openai = True -> fallback vypnuto
+        only = self.cb_openai_only.isChecked()
+        deep_set(self.cfg, ["openai", "only_openai"], only)
+        if only:
+            deep_set(self.cfg, ["openai", "fallback_enabled"], False)
+        deep_set(self.cfg, ["openai", "model"], self.cmb_primary_model.currentText().strip())
+        deep_set(self.cfg, ["openai", "fallback_model"], self.cmb_fallback_model.currentText().strip())
+        deep_set(self.cfg, ["openai", "use_json_schema"], True)
         deep_set(self.cfg, ["openai", "temperature"], float(self.sp_temperature.value()))
         deep_set(self.cfg, ["openai", "max_output_tokens"], int(self.sp_max_tokens.value()))
         deep_set(self.cfg, ["openai", "timeout_sec"], int(self.sp_timeout.value()))
         deep_set(self.cfg, ["openai", "image_dpi"], int(self.sp_image_dpi.value()))
         deep_set(self.cfg, ["openai", "image_max_pages"], int(self.sp_image_max_pages.value()))
-        deep_set(self.cfg, ["openai", "image_enhance"], self.cb_image_enhance.isChecked())
+        deep_set(self.cfg, ["openai", "image_enhance"], True)
         deep_set(self.cfg, ["openai", "image_variants"], int(self.sp_image_variants.value()))
-        deep_set(self.cfg, ["openai", "allow_synthetic_items"], self.cb_allow_synth.isChecked())
+        # synteticke polozky: zapnute vsude, ale ne v rezimu only_openai
+        deep_set(self.cfg, ["openai", "allow_synthetic_items"], (not only))
         save_yaml(self.config_path, self.cfg)
-        QMessageBox.information(self, "Nastavení", "Uloženo.")
+        # Upozorni, pokud je zapnut jen OpenAI, ale není klíč ani v poli ani v ENV.
+        if self.cb_openai_only.isChecked():
+            api_inline = self.ed_api_key.text().strip()
+            api_env = os.getenv("KAJOVOSPEND_OPENAI_API_KEY", "").strip()
+            if not api_inline and not api_env:
+                notes.append("Režim jen OpenAI je zapnut, ale API key není v poli ani v systémových proměnných – online extrakce se nespustí.")
+        msg = "Uloženo."
+        if notes:
+            msg += "\n\nÚpravy:\n- " + "\n- ".join(notes)
+        QMessageBox.information(self, "Nastavení", msg)
 
     # --- Backup / restore / reset ---
 
@@ -2693,22 +2796,35 @@ class MainWindow(QMainWindow):
         self.ed_input_dir.setText(str(paths_cfg.get("input_dir", "")))
         self.ed_output_dir.setText(str(paths_cfg.get("output_dir", "")))
 
+        # Prefer registry/env key, pak config pole
+        reg_api = sanitize_openai_api_key(load_user_env_var("KAJOVOSPEND_OPENAI_API_KEY") or "")
+        if reg_api:
+            os.environ["KAJOVOSPEND_OPENAI_API_KEY"] = reg_api
+            self.ed_api_key.setText(reg_api)
+        else:
+            env_api = sanitize_openai_api_key(os.getenv("KAJOVOSPEND_OPENAI_API_KEY", ""))
+            if env_api:
+                self.ed_api_key.setText(env_api)
+
         if isinstance(openai_cfg, dict):
-            self.cb_openai_enabled.setChecked(bool(openai_cfg.get("enabled", False)))
-            self.cb_openai_auto.setChecked(bool(openai_cfg.get("auto_enable", True)))
+            # povinně zapnuté; volby byly odstraněny z UI
+            self.cb_openai_enabled.setChecked(True)
+            self.cb_openai_auto.setChecked(False)
             self.cb_openai_primary.setChecked(bool(openai_cfg.get("primary_enabled", True)))
             self.cb_openai_fallback.setChecked(bool(openai_cfg.get("fallback_enabled", True)))
-            self.ed_primary_model.setText(openai_cfg.get("model", "auto"))
-            self.ed_fallback_model.setText(openai_cfg.get("fallback_model", ""))
-            self.cb_use_json_schema.setChecked(bool(openai_cfg.get("use_json_schema", True)))
+            self.cb_openai_only.setChecked(bool(openai_cfg.get("only_openai", False)))
+            self._set_combo_value(self.cmb_primary_model, openai_cfg.get("model", "auto") or "auto")
+            self._set_combo_value(self.cmb_fallback_model, openai_cfg.get("fallback_model", ""))
+            self.cb_use_json_schema.setChecked(True)
             self.sp_temperature.setValue(float(openai_cfg.get("temperature", 0.0) or 0.0))
             self.sp_max_tokens.setValue(int(openai_cfg.get("max_output_tokens", 2000) or 2000))
             self.sp_timeout.setValue(int(openai_cfg.get("timeout_sec", 60) or 60))
             self.sp_image_dpi.setValue(int(openai_cfg.get("image_dpi", 300) or 300))
             self.sp_image_max_pages.setValue(int(openai_cfg.get("image_max_pages", 3) or 3))
             self.sp_image_variants.setValue(int(openai_cfg.get("image_variants", 2) or 2))
-            self.cb_image_enhance.setChecked(bool(openai_cfg.get("image_enhance", True)))
-            self.cb_allow_synth.setChecked(bool(openai_cfg.get("allow_synthetic_items", False)))
+            self.cb_image_enhance.setChecked(True)
+        # vyrovnej kolize rovnou v UI
+        self._normalize_openai_settings()
     def _on_reset_program(self):
         if self._import_running:
             QMessageBox.warning(self, "RESET PROGRAMU", "Nejprve dokonči probíhající import.")
@@ -2864,8 +2980,96 @@ class MainWindow(QMainWindow):
     def _on_api_clear(self):
         self.ed_api_key.clear()
 
+    def _resolve_api_key(self, *, update_field: bool = True) -> str:
+        """
+        Vrati OpenAI API key z UI/registru a zajisti, ze je i v os.environ.
+
+        Dulezite: pokud se app spousti ze stejneho PowerShellu, proces nemusi mit
+        aktualizovane prostredi. Proto v prvnim kroku cteme z registru (HKCU\\Environment).
+        """
+        key = ""
+        try:
+            key = self.ed_api_key.text().strip()
+        except Exception:
+            key = ""
+        if not key:
+            key = sanitize_openai_api_key(load_user_env_var("KAJOVOSPEND_OPENAI_API_KEY"))
+        if not key:
+            key = sanitize_openai_api_key(os.getenv("KAJOVOSPEND_OPENAI_API_KEY", ""))
+        key = sanitize_openai_api_key(key)
+        if key:
+            os.environ["KAJOVOSPEND_OPENAI_API_KEY"] = key
+            if update_field:
+                try:
+                    if self.ed_api_key.text().strip() != key:
+                        self.ed_api_key.setText(key)
+                except Exception:
+                    pass
+        return key
+
+    def _on_api_save(self):
+        api_key = self._resolve_api_key(update_field=True)
+        if not api_key:
+            QMessageBox.warning(self, "OpenAI", "Nejdriv vypln API key.")
+            return
+        try:
+            os.environ["KAJOVOSPEND_OPENAI_API_KEY"] = api_key
+            ok = set_user_env_var("KAJOVOSPEND_OPENAI_API_KEY", api_key)
+            if ok:
+                QMessageBox.information(self, "OpenAI", "API key uložen do uživatelských proměnných systému (a načten do běžící aplikace).")
+            else:
+                QMessageBox.warning(self, "OpenAI", "API key se nepodařilo zapsat do systémových proměnných. Hodnota je dostupná jen pro aktuální spuštění.")
+        except Exception as e:
+            QMessageBox.critical(self, "OpenAI", f"Nelze uložit API key do systémových proměnných: {e}")
+
+    def _on_api_load(self):
+        env_api = sanitize_openai_api_key(load_user_env_var("KAJOVOSPEND_OPENAI_API_KEY"))
+        if not env_api:
+            QMessageBox.warning(self, "OpenAI", "V prostředí není nastaven KAJOVOSPEND_OPENAI_API_KEY.")
+            return
+        os.environ["KAJOVOSPEND_OPENAI_API_KEY"] = env_api
+        self.ed_api_key.setText(env_api)
+        QMessageBox.information(self, "OpenAI", "API key načten z prostředí.")
+
+    def _on_api_test(self):
+        api_key = self._resolve_api_key(update_field=True)
+        if not api_key:
+            raw = load_user_env_var("KAJOVOSPEND_OPENAI_API_KEY") or ""
+            if raw.strip() and not sanitize_openai_api_key(raw):
+                QMessageBox.warning(
+                    self,
+                    "OpenAI",
+                    "V systemu je ulozena hodnota KAJOVOSPEND_OPENAI_API_KEY, ale neni platny API key.\n"
+                    "Zadej API key znovu do pole a klikni na Ulozit (prepise se).",
+                )
+            else:
+                QMessageBox.warning(self, "OpenAI", "Nejdriv vypln API key.")
+            return
+        dlg = QProgressDialog("Overuji API key...", "", 0, 0, self)
+        dlg.setWindowTitle("OpenAI")
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.show()
+        QApplication.processEvents()
+        try:
+            ids = list_models(api_key)
+            ok = bool(ids)
+        except Exception as e:
+            dlg.close()
+            QMessageBox.critical(self, "OpenAI", f"API key neprosel: {e}")
+            return
+        dlg.close()
+        if not ok:
+            QMessageBox.warning(self, "OpenAI", "API key je platny, ale seznam modelu je prazdny.")
+            return
+        rec = self._recommend_model(ids)
+        self.cb_openai_enabled.setChecked(True)
+        QMessageBox.information(self, "OpenAI", f"API key OK.\nDoporuceny model: {rec}")
+        # neprepisuj uzivatelsky vyber, ale nabidni modely v dropdownu
+        self._populate_model_combos(ids, auto_fill=False)
     def _on_api_models(self):
-        api_key = self.ed_api_key.text().strip()
+        api_key = self._resolve_api_key(update_field=True)
         if not api_key:
             QMessageBox.warning(self, "Modely OpenAI", "Nejdriv vypln API key.")
             return
@@ -2886,35 +3090,15 @@ class MainWindow(QMainWindow):
         if not ids:
             QMessageBox.information(self, "Modely OpenAI", "Zadne modely nenalezeny.")
             return
-        items = [i for i in ids if i.startswith("gpt")]
-        if not items:
-            items = ids
-        choice, ok = QInputDialog.getItem(self, "Modely OpenAI", "Vyber model:", items, 0, False)
-        if not ok or not choice:
-            return
 
-        target = None
-        if self.ed_primary_model.hasFocus():
-            target = "primary"
-        elif self.ed_fallback_model.hasFocus():
-            target = "fallback"
-        if target is None:
-            tchoice, tok = QInputDialog.getItem(
-                self,
-                "Pouzit model",
-                "Kam model ulozit?",
-                ["Primarni model", "Fallback model"],
-                0,
-                False,
-            )
-            if not tok:
-                return
-            target = "primary" if "Primarni" in tchoice else "fallback"
-
-        if target == "fallback":
-            self.ed_fallback_model.setText(choice)
-        else:
-            self.ed_primary_model.setText(choice)
+        rec_primary, rec_fallback = self._populate_model_combos(ids, auto_fill=True)
+        self.cb_openai_enabled.setChecked(True)
+        msg = (
+            "Modely nacteny.\n"
+            f"Doporuceno: {rec_primary} (primarni), {rec_fallback} (fallback).\n"
+            "Vyber jiny model v dropdownu, pokud chces."
+        )
+        QMessageBox.information(self, "Modely OpenAI", msg)
 
     def _on_import_progress(self, msg: str) -> None:
         self._import_status = msg
@@ -2964,6 +3148,11 @@ class MainWindow(QMainWindow):
     def on_import_clicked(self) -> None:
         if self._import_running:
             return
+        # zajisti dostupnost API key pro import i bez otevreni karty Nastaveni
+        try:
+            self._resolve_api_key(update_field=False)
+        except Exception:
+            pass
         input_dir_val = self.ed_input_dir.text().strip() or str(self.cfg.get("paths", {}).get("input_dir") or "")
         if not input_dir_val:
             QMessageBox.warning(self, "IMPORTUJ", "Není nastaven INPUT adresář (Nastavení → Input adresář).")
@@ -3036,6 +3225,127 @@ class MainWindow(QMainWindow):
             self.lbl_run_status.setText(self._import_status)
         except Exception:
             pass
+        self.processor.log.info("Import stop requested by user.")
+
+    def _retry_extract(self, file_id: int, use_openai: bool) -> None:
+        """Opakované vytěžení konkrétního souboru (offline nebo OpenAI) s průběhem."""
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Opakovat vytěžení")
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setMinimumWidth(440)
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel("Připravuji opakování…")
+        bar = QProgressBar()
+        bar.setRange(0, 0)  # indeterminate teploměr
+        log_box = QTextEdit()
+        log_box.setReadOnly(True)
+        log_box.setMinimumHeight(160)
+        btn_close = QPushButton("Zavřít")
+        btn_close.setEnabled(False)
+        btn_close.clicked.connect(dlg.close)
+        lay.addWidget(lbl)
+        lay.addWidget(bar)
+        lay.addWidget(log_box)
+        lay.addWidget(btn_close, alignment=Qt.AlignRight)
+        dlg.show()
+
+        def status_cb(msg: str) -> None:
+            # voláno z worker vlákna -> přeposlat do UI
+            try:
+                txt = str(msg or "").strip()
+            except Exception:
+                txt = ""
+            def _upd():
+                if not Shiboken.isValid(dlg):
+                    return
+                lbl.setText(txt or "Pracuji…")
+                if txt:
+                    log_box.append(txt)
+            try:
+                QTimer.singleShot(0, self, _upd)
+            except Exception:
+                pass
+
+        def fn():
+            with self.sf() as session:
+                f = session.get(DocumentFile, int(file_id))
+                if not f:
+                    raise ValueError("Soubor nenalezen.")
+                p = Path(f.current_path or f.original_name or "")
+                if not p.exists():
+                    raise FileNotFoundError(f"Soubor {p} neexistuje (možná byl smazán nebo přejmenován).")
+
+                cfg = copy.deepcopy(self.cfg if isinstance(self.cfg, dict) else {})
+                if not isinstance(cfg, dict):
+                    cfg = {}
+                openai_cfg = cfg.get("openai", {})
+                if not isinstance(openai_cfg, dict):
+                    openai_cfg = {}
+
+                if use_openai:
+                    openai_cfg.update(
+                        {
+                            "enabled": True,
+                            "auto_enable": True,
+                            "primary_enabled": True,
+                            "fallback_enabled": True,
+                            "only_openai": True,
+                        }
+                    )
+                    key = self._resolve_api_key(update_field=False)
+                    if not key:
+                        raise ValueError("OpenAI API key není k dispozici.")
+                else:
+                    openai_cfg.update(
+                        {
+                            "enabled": False,
+                            "auto_enable": False,
+                            "primary_enabled": False,
+                            "fallback_enabled": False,
+                            "only_openai": False,
+                        }
+                    )
+                cfg["openai"] = openai_cfg
+
+                proc = Processor(cfg, self.paths, self.log)
+                res = proc.process_path(session, p, status_cb=status_cb, force=True)
+                session.commit()
+                return res
+
+        def ok(res):
+            try:
+                if Shiboken.isValid(dlg):
+                    lbl.setText("Hotovo.")
+                    bar.setRange(0, 1)
+                    bar.setValue(1)
+                    btn_close.setEnabled(True)
+                    QTimer.singleShot(500, dlg.close)
+            except Exception:
+                pass
+            try:
+                msg = res.get("message") or res.get("status") or "Hotovo."
+            except Exception:
+                msg = "Hotovo."
+            QMessageBox.information(self, "Opakovat vytěžení", msg)
+            try:
+                self.refresh_ops()
+            except Exception:
+                pass
+
+        def err(msg: str):
+            try:
+                if Shiboken.isValid(dlg):
+                    lbl.setText("Chyba")
+                    bar.setRange(0, 1)
+                    bar.setValue(0)
+                    log_box.append(str(msg))
+                    btn_close.setEnabled(True)
+            except Exception:
+                pass
+            QMessageBox.warning(self, "Opakovat vytěžení", str(msg))
+
+        _SilentRunner.run(self, fn, ok, err, timeout_ms=120_000)
 
     def refresh_suppliers(self):
         q = self.sup_filter.text()
@@ -3464,28 +3774,10 @@ class MainWindow(QMainWindow):
         src = f.current_path if f else ""
         self.doc_src_line.setText(src or "")
 
-        net_v = getattr(d, "total_without_vat", None)
-        vat_v = getattr(d, "total_vat_amount", None)
-        gross_v = getattr(d, "total_with_vat", None)
-        self.lbl_doc_totals.setText(
-            f"Celky: netto {float(net_v or 0.0):,.2f} | DPH {float(vat_v or 0.0):,.2f} | brutto {float(gross_v or 0.0):,.2f}".replace(",", " ")
-        )
-
-        item_headers = ["#", "Název", "Množství", "DPH %", "Jedn. netto", "Jedn. brutto", "Řádek netto", "Řádek brutto", "DPH částka", "VAT kód"]
+        item_headers = ["#", "Název", "Množství", "DPH", "Cena"]
         item_rows: List[List[Any]] = []
         for it in items:
-            item_rows.append([
-                it.line_no,
-                it.name,
-                it.quantity,
-                it.vat_rate,
-                getattr(it, "unit_price_net", None) if getattr(it, "unit_price_net", None) is not None else it.unit_price,
-                getattr(it, "unit_price_gross", None),
-                getattr(it, "line_total_net", None),
-                getattr(it, "line_total_gross", None) if getattr(it, "line_total_gross", None) is not None else it.line_total,
-                getattr(it, "vat_amount", None),
-                getattr(it, "vat_code", None),
-            ])
+            item_rows.append([it.line_no, it.name, it.quantity, it.vat_rate, it.line_total])
         self.doc_items_table.setModel(TableModel(item_headers, item_rows))
         self.doc_items_table.resizeColumnsToContents()
 
@@ -3682,7 +3974,11 @@ class MainWindow(QMainWindow):
         # Provozní panel: historie z tabulky files (hotové záznamy), s fulltextovým filtrem.
         q = (self.ops_filter.text() or "").strip() if hasattr(self, "ops_filter") else ""
         with self.sf() as session:
-            stmt = select(DocumentFile).where(DocumentFile.status.notin_(("NEW", "QUEUED", "RUNNING")))
+            stmt = (
+                select(DocumentFile)
+                .options(selectinload(DocumentFile.documents))
+                .where(DocumentFile.status.notin_(("NEW", "QUEUED", "RUNNING")))
+            )
             if q:
                 like = f"%{q}%"
                 stmt = stmt.where(
@@ -3693,7 +3989,8 @@ class MainWindow(QMainWindow):
             stmt = stmt.order_by(DocumentFile.processed_at.desc().nullslast(), DocumentFile.created_at.desc()).limit(500)
             files = list(session.execute(stmt).scalars().all())
 
-        rows = []
+        rows: List[List[Any]] = []
+        meta_ids: List[int] = []
         paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
         out_base = Path(paths_cfg.get("output_dir", "") or "")
         qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
@@ -3730,6 +4027,33 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+            # statusy per-stage
+            stage_colors: Dict[str, str] = {}
+            try:
+                docs = list(f.documents or [])
+            except Exception:
+                docs = []
+            stage_used: Dict[str, bool] = {code: False for code, _ in OPS_STAGE_COLUMNS}
+            synthetic_used = False
+            for d in docs:
+                method = str(getattr(d, "extraction_method", "") or "").lower()
+                rr = (getattr(d, "review_reasons", "") or "").lower()
+                if "syntet" in rr:
+                    synthetic_used = True
+                if method in ("offline", "pdf_hybrid", "image_ocr", "offline_ensemble", "structured_pdf_attachment"):
+                    stage_used["offline"] = True
+                if method in ("openai_primary", "openai_only"):
+                    stage_used["openai_primary"] = True
+                if method == "openai_fallback":
+                    stage_used["openai_fallback"] = True
+            stage_used["synthetic"] = synthetic_used
+
+            for code, _label in OPS_STAGE_COLUMNS:
+                if not stage_used.get(code):
+                    stage_colors[code] = ""
+                else:
+                    stage_colors[code] = "green" if status == "PROCESSED" else "red"
+
             rows.append(
                 [
                     light,
@@ -3739,16 +4063,53 @@ class MainWindow(QMainWindow):
                     size,
                     status,
                     result if not f.last_error else f.last_error,
+                    *[stage_colors.get(code, "") for code, _ in OPS_STAGE_COLUMNS],
+                    "offline_retry",
+                    "openai_retry",
                 ]
             )
+            meta_ids.append(int(getattr(f, "id", -1)))
 
-        headers = ["", "Zpracováno", "Soubor", "Cesta", "Velikost", "Status", "Výsledek / chyba"]
+        headers = ["", "Zpracováno", "Soubor", "Cesta", "Velikost", "Status", "Výsledek / chyba"] + [label for _c, label in OPS_STAGE_COLUMNS] + ["Zopakovat offline", "Zopakovat OpenAI"]
         snapshot: Tuple[Tuple[str, ...], ...] = tuple(tuple(str(x) for x in r) for r in rows)
         if snapshot == getattr(self, "_ops_last_snapshot", None):
             return
         self._ops_last_snapshot = snapshot
 
         self.ops_table.setModel(TableModel(headers, rows))
+        # traffic lights pro status a per-stage sloupce
+        self.ops_table.setItemDelegateForColumn(0, TrafficLightDelegate(self.ops_table))
+        base = 7
+        for i, _ in enumerate(OPS_STAGE_COLUMNS):
+            self.ops_table.setItemDelegateForColumn(base + i, TrafficLightDelegate(self.ops_table))
+            try:
+                self.ops_table.horizontalHeader().setSectionResizeMode(base + i, QHeaderView.ResizeToContents)
+            except Exception:
+                pass
+        try:
+            self.ops_table.horizontalHeader().setSectionResizeMode(len(headers) - 2, QHeaderView.ResizeToContents)
+            self.ops_table.horizontalHeader().setSectionResizeMode(len(headers) - 1, QHeaderView.ResizeToContents)
+        except Exception:
+            pass
+        # akční tlačítka
+        try:
+            model = self.ops_table.model()
+            if model:
+                off_col = len(headers) - 2
+                on_col = len(headers) - 1
+                for r_idx, file_id in enumerate(meta_ids):
+                    idx_off = model.index(r_idx, off_col)
+                    idx_on = model.index(r_idx, on_col)
+                    btn_off = QPushButton("Offline")
+                    btn_on = QPushButton("OpenAI")
+                    btn_off.setProperty("file_id", file_id)
+                    btn_on.setProperty("file_id", file_id)
+                    btn_off.clicked.connect(lambda _=None, fid=file_id: self._retry_extract(fid, use_openai=False))
+                    btn_on.clicked.connect(lambda _=None, fid=file_id: self._retry_extract(fid, use_openai=True))
+                    self.ops_table.setIndexWidget(idx_off, btn_off)
+                    self.ops_table.setIndexWidget(idx_on, btn_on)
+        except Exception:
+            pass
         try:
             self.ops_table.resizeColumnsToContents()
         except Exception:
@@ -3934,7 +4295,7 @@ class MainWindow(QMainWindow):
         img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
         return img
 
-    def _prepare_openai_images(self, file_path: Path) -> List[Tuple[str, bytes]]:
+    def _prepare_openai_images(self, file_path: Path) -> Tuple[List[Tuple[str, bytes]], Optional[Tuple[str, bytes]]]:
         cfg = self.cfg.get("openai") if isinstance(self.cfg, dict) else {}
         if not isinstance(cfg, dict):
             cfg = {}
@@ -3946,14 +4307,19 @@ class MainWindow(QMainWindow):
             variants = 1
 
         images_payload: List[Tuple[str, bytes]] = []
+        pdf_payload: Optional[Tuple[str, bytes]] = None
         try:
             if file_path.suffix.lower() == ".pdf":
+                try:
+                    pdf_payload = ("application/pdf", file_path.read_bytes())
+                except Exception:
+                    pdf_payload = None
                 imgs = render_pdf_to_images(file_path, dpi=dpi, max_pages=max_pages, start_page=0)
             else:
                 with Image.open(file_path) as im:
                     imgs = [im.convert("RGB")]
         except Exception:
-            return images_payload
+            return images_payload, pdf_payload
 
         for im in imgs[:max_pages]:
             try:
@@ -3967,7 +4333,7 @@ class MainWindow(QMainWindow):
                     images_payload.append(("image/png", bio2.getvalue()))
             except Exception:
                 continue
-        return images_payload
+        return images_payload, pdf_payload
 
     def _call_openai_responses(self, api_key: str, model: str, file_path: Path) -> tuple[bool, str, str]:
         """
@@ -3982,7 +4348,7 @@ class MainWindow(QMainWindow):
         max_output_tokens = int(cfg.get("max_output_tokens", 2000) or 2000)
         fallback_model = str(cfg.get("fallback_model") or "").strip() or None
 
-        images_payload = self._prepare_openai_images(file_path)
+        images_payload, pdf_payload = self._prepare_openai_images(file_path)
         oai_cfg = OpenAIConfig(
             api_key=api_key,
             model=model or "auto",
@@ -3996,6 +4362,7 @@ class MainWindow(QMainWindow):
                 oai_cfg,
                 ocr_text="",
                 images=images_payload,
+                pdf=pdf_payload,
                 timeout=timeout,
             )
             if isinstance(obj, dict):
@@ -4082,9 +4449,6 @@ class MainWindow(QMainWindow):
                         "doc_number": d.doc_number,
                         "bank_account": d.bank_account,
                         "total_with_vat": d.total_with_vat,
-                        "total_without_vat": getattr(d, "total_without_vat", None),
-                        "total_vat_amount": getattr(d, "total_vat_amount", None),
-                        "vat_breakdown_json": getattr(d, "vat_breakdown_json", None),
                         "currency": d.currency,
                         "requires_review": bool(d.requires_review),
                         "review_reasons": d.review_reasons,
@@ -4093,12 +4457,6 @@ class MainWindow(QMainWindow):
                         "item_name": None,
                         "item_quantity": None,
                         "item_vat_rate": None,
-                        "item_vat_code": None,
-                        "item_unit_price_net": None,
-                        "item_unit_price_gross": None,
-                        "item_line_total_net": None,
-                        "item_line_total_gross": None,
-                        "item_vat_amount": None,
                         "item_line_total": None,
                     })
                 else:
@@ -4110,9 +4468,6 @@ class MainWindow(QMainWindow):
                             "doc_number": d.doc_number,
                             "bank_account": d.bank_account,
                             "total_with_vat": d.total_with_vat,
-                            "total_without_vat": getattr(d, "total_without_vat", None),
-                            "total_vat_amount": getattr(d, "total_vat_amount", None),
-                            "vat_breakdown_json": getattr(d, "vat_breakdown_json", None),
                             "currency": d.currency,
                             "requires_review": bool(d.requires_review),
                             "review_reasons": d.review_reasons,
@@ -4121,12 +4476,6 @@ class MainWindow(QMainWindow):
                             "item_name": it.name,
                             "item_quantity": it.quantity,
                             "item_vat_rate": it.vat_rate,
-                            "item_vat_code": getattr(it, "vat_code", None),
-                            "item_unit_price_net": getattr(it, "unit_price_net", None) if getattr(it, "unit_price_net", None) is not None else it.unit_price,
-                            "item_unit_price_gross": getattr(it, "unit_price_gross", None),
-                            "item_line_total_net": getattr(it, "line_total_net", None),
-                            "item_line_total_gross": getattr(it, "line_total_gross", None) if getattr(it, "line_total_gross", None) is not None else it.line_total,
-                            "item_vat_amount": getattr(it, "vat_amount", None),
                             "item_line_total": it.line_total,
                         })
 
@@ -4138,42 +4487,6 @@ class MainWindow(QMainWindow):
                     w.writeheader()
                     for r in rows:
                         w.writerow(r)
-            elif kind == "jsonl":
-                grouped: Dict[int, Dict[str, Any]] = {}
-                for r in rows:
-                    did = int(r.get("document_id") or 0)
-                    g = grouped.setdefault(did, {
-                        "document_id": did,
-                        "issue_date": r.get("issue_date"),
-                        "supplier_ico": r.get("supplier_ico"),
-                        "doc_number": r.get("doc_number"),
-                        "bank_account": r.get("bank_account"),
-                        "currency": r.get("currency"),
-                        "total_with_vat": r.get("total_with_vat"),
-                        "total_without_vat": r.get("total_without_vat"),
-                        "total_vat_amount": r.get("total_vat_amount"),
-                        "vat_breakdown_json": r.get("vat_breakdown_json"),
-                        "requires_review": r.get("requires_review"),
-                        "review_reasons": r.get("review_reasons"),
-                        "file_path": r.get("file_path"),
-                        "items": [],
-                    })
-                    if r.get("item_line_no") is not None:
-                        g["items"].append({
-                            "line_no": r.get("item_line_no"),
-                            "name": r.get("item_name"),
-                            "quantity": r.get("item_quantity"),
-                            "vat_rate": r.get("item_vat_rate"),
-                            "vat_code": r.get("item_vat_code"),
-                            "unit_price_net": r.get("item_unit_price_net"),
-                            "unit_price_gross": r.get("item_unit_price_gross"),
-                            "line_total_net": r.get("item_line_total_net"),
-                            "line_total_gross": r.get("item_line_total_gross"),
-                            "vat_amount": r.get("item_vat_amount"),
-                        })
-                with open(path, "w", encoding="utf-8") as fp:
-                    for did in sorted(grouped.keys()):
-                        fp.write(json.dumps(grouped[did], ensure_ascii=False) + "\n")
             elif kind == "xlsx":
                 import pandas as pd
                 df = pd.DataFrame(rows)
@@ -4386,4 +4699,3 @@ class MainWindow(QMainWindow):
             self._dash_refresh_inflight = False
 
         _SilentRunner.run(self, work, done, err, timeout_ms=12000)
-

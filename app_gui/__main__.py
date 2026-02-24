@@ -1,3 +1,7 @@
-from .py import main
-if __name__ == '__main__':
-    main()
+"""Entrypoint pro `python -m app_gui`."""
+
+from run_gui import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -58,28 +58,70 @@ _JSON_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "supplier_ico": {"type": ["string", "null"]},
-        "doc_number": {"type": ["string", "null"]},
-        "bank_account": {"type": ["string", "null"]},
-        "issue_date": {"type": ["string", "null"]},
-        "total_with_vat": {"type": ["number", "null"]},
+        "document_type": {"type": ["string", "null"], "enum": ["invoice", "receipt", "credit_note", "other", None]},
+        "invoice_number": {"type": ["string", "null"]},
+        "issue_date": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+        "due_date": {"type": ["string", "null"]},
         "currency": {"type": ["string", "null"]},
-        "items": {
+        "supplier": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "name": {"type": ["string", "null"]},
+                "vat_id": {"type": ["string", "null"]},
+                "company_id": {"type": ["string", "null"]},
+                "address": {"type": ["string", "null"]},
+                "iban": {"type": ["string", "null"]},
+                "bic": {"type": ["string", "null"]},
+            },
+        },
+        "buyer": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "name": {"type": ["string", "null"]},
+                "vat_id": {"type": ["string", "null"]},
+                "company_id": {"type": ["string", "null"]},
+                "address": {"type": ["string", "null"]},
+            },
+        },
+        "line_items": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "name": {"type": ["string", "null"]},
+                    "description": {"type": ["string", "null"]},
                     "quantity": {"type": ["number", "null"]},
-                    "unit_price": {"type": ["number", "null"]},
+                    "unit": {"type": ["string", "null"]},
+                    "unit_price_net": {"type": ["number", "null"]},
                     "vat_rate": {"type": ["number", "null"]},
-                    "line_total": {"type": ["number", "null"]},
+                    "vat_amount": {"type": ["number", "null"]},
+                    "total_gross": {"type": ["number", "null"]},
                 },
             },
         },
+        "totals": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "subtotal_net": {"type": ["number", "null"]},
+                "vat_total": {"type": ["number", "null"]},
+                "total_gross": {"type": ["number", "null"]},
+            },
+        },
+        "payment": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "iban": {"type": ["string", "null"]},
+                "bic": {"type": ["string", "null"]},
+                "account": {"type": ["string", "null"]},
+                "vs": {"type": ["string", "null"]},
+            },
+        },
     },
-    "required": ["items"],
+    "required": ["line_items", "totals"],
 }
 
 
@@ -143,6 +185,7 @@ def extract_with_openai(
     cfg: OpenAIConfig,
     ocr_text: str,
     images: Optional[Sequence[Tuple[str, bytes]]] = None,
+    pdf: Optional[Tuple[str, bytes]] = None,
     timeout: int = 40,
 ) -> Tuple[Optional[Dict[str, Any]], str, str]:
     # Responses API supports multimodal input items (input_text + input_image).
@@ -212,11 +255,15 @@ def extract_with_openai_fallback(
     cfg: OpenAIConfig,
     ocr_text: str,
     images: Optional[Sequence[Tuple[str, bytes]]] = None,
+    pdf: Optional[Tuple[str, bytes]] = None,
     timeout: int = 40,
 ) -> Tuple[Optional[Dict[str, Any]], str, str]:
     model = _resolve_model(cfg.api_key, cfg.fallback_model or cfg.model, _MODEL_PREFER_FALLBACK)
     prompt = _build_prompt(ocr_text, mode="fallback")
     content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    if pdf and pdf[1]:
+        mime, data = pdf
+        content.insert(0, {"type": "input_file", "file_data": _b64_data_url(mime, data), "filename": "document.pdf"})
     if images:
         for mime, data in images:
             if not data:

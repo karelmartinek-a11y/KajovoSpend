@@ -3,8 +3,8 @@ app:
   db_path: ''
   log_dir: ''
 paths:
-  input_dir: C:/GitHub/KajovoSpend/IN
-  output_dir: C:/GitHub/KajovoSpend/OUT
+  input_dir: C:/KajovoSpend/INPUT
+  output_dir: C:/KajovoSpend/OUTPUT
   quarantine_dir_name: KARANTENA
   duplicate_dir_name: DUPLICITY
 service:
@@ -21,24 +21,43 @@ ocr:
   structured_first:
     enabled: true
     enable_pdf_attachments: true
+  force_ocr_on_parse_failure: true
+  ensemble:
+    enabled: true
+    dpis:
+    - 200
+    - 300
+    - 450
+    - 600
+    rotations:
+    - 0
+    - 90
+    - 180
+    - 270
+    include_reconstructed: true
+    max_candidates: 8
 openai:
-  enabled: false
-  api_key: ''
-  model: ''
+  enabled: true
   auto_enable: true
+  api_key: ''
+  model: auto
+  fallback_model: gpt-4.1
   primary_enabled: true
-  fallback_enabled: true
-  fallback_model: gpt-5
   use_json_schema: true
+  only_openai: true
   temperature: 0.0
   max_output_tokens: 2000
   timeout_sec: 60
-  image_dpi: 150
+  image_dpi: 300
   image_max_pages: 3
-  image_enhance: false
-  image_variants: 1
-  allow_synthetic_items: false
+  image_enhance: true
+  image_variants: 2
+  allow_synthetic_items: true
+  fallback_enabled: true
 performance:
+  docs_page_size: 500
+  supplier_debounce_ms: 250
+  preview_dpi: 120
   image_max_px: 3000
   parallel_pages: 2
 features:

@@ -1,7 +1,7 @@
 # Architektura KájovoSpend
 
 ## Přehled modulů
-- `service_main.py`: běh služby (watcher, fronta úloh, control endpoint).
+- GUI spouští zpracování přímo; samostatná služba (watcher/fronta) se již nepoužívá.
 - `run_gui.py` + `src/kajovospend/ui/`: desktop GUI (PySide6) pro import, kontrolu a reporting.
 - `src/kajovospend/service/`: orchestrace importu, zpracování OCR/PDF a přesunů souborů.
 - `src/kajovospend/extract/`: extrakce polí z OCR textu a strukturovaných PDF.
