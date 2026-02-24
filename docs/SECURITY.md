@@ -28,3 +28,16 @@
 ## Dependency policy
 - pinovat verze v `requirements.txt`
 - při update ověřit kompatibilitu s Python 3.11–3.13
+
+
+## Nově pokrytá rizika (audit 2026-02)
+- **Path traversal při přesunu souborů**: cílové jméno souboru se normalizuje na basename, takže vstupy typu `../../x` nebo `sub\x` nemohou opustit cílový adresář.
+- **Regresní testy**: přidané unit testy ověřují sanitizaci názvu i sjednocení Windows oddělovačů.
+
+```mermaid
+flowchart TD
+    A[Nevěrohodné jméno souboru] --> B[normalizace na basename]
+    B --> C{je uvnitř cílového adresáře?}
+    C -->|ano| D[přesun souboru]
+    C -->|ne| E[ValueError]
+```

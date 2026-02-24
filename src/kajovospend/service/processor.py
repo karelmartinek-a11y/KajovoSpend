@@ -3,10 +3,8 @@ from __future__ import annotations
 import datetime as dt
 import os
 from dateutil import parser as dtparser
-import shutil
 import re
 import hashlib
-import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
@@ -24,6 +22,7 @@ from kajovospend.db.queries import (
 )
 from kajovospend.extract.parser import extract_from_text, postprocess_items_for_db
 from kajovospend.extract.structured_pdf import extract_structured_from_pdf
+from kajovospend.service.file_ops import safe_move
 from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
 try:
     # Volitelný (placený) fallback – v našem nastavení typicky vypnutý.
@@ -46,40 +45,6 @@ from kajovospend.utils.qr_spayd import decode_qr_from_pil, parse_spayd
 from kajovospend.utils.iban import normalize_iban, is_valid_iban
 
 
-
-def safe_move(src: Path, dst_dir: Path, target_name: str) -> Path:
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = dst_dir / target_name
-    if dst.exists():
-        stem = dst.stem
-        suffix = dst.suffix
-        i = 1
-        while True:
-            cand = dst_dir / f"{stem}_{i}{suffix}"
-            if not cand.exists():
-                dst = cand
-                break
-            i += 1
-    for attempt in range(3):
-        try:
-            shutil.move(str(src), str(dst))
-            return dst
-        except PermissionError:
-            if attempt < 2:
-                time.sleep(0.05)
-                continue
-            # fallback: copy + best-effort delete
-            shutil.copy2(str(src), str(dst))
-            for _ in range(20):
-                try:
-                    Path(src).unlink()
-                    break
-                except PermissionError:
-                    time.sleep(0.1)
-                except Exception:
-                    break
-            return dst
-    return dst
 
 
 class Processor:
