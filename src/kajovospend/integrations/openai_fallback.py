@@ -181,6 +181,58 @@ def _build_prompt(ocr_text: str, *, mode: str) -> str:
     prompt = base + "\n\nOCR text dokladu:\n" + (ocr_text or "")
     return prompt
 
+
+def _normalize_extracted_payload(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """Prevede odpoved ze schema OpenAI na interni tvar, ktery ocekava processor."""
+    out = dict(obj)
+
+    if not out.get("doc_number") and out.get("invoice_number"):
+        out["doc_number"] = out.get("invoice_number")
+
+    supplier = out.get("supplier") if isinstance(out.get("supplier"), dict) else {}
+    if not out.get("supplier_ico"):
+        company_id = supplier.get("company_id")
+        if company_id:
+            out["supplier_ico"] = company_id
+
+    payment = out.get("payment") if isinstance(out.get("payment"), dict) else {}
+    if not out.get("bank_account"):
+        for key in ("iban", "account"):
+            val = payment.get(key) or supplier.get(key)
+            if val:
+                out["bank_account"] = val
+                break
+
+    totals = out.get("totals") if isinstance(out.get("totals"), dict) else {}
+    if out.get("total_with_vat") is None:
+        out["total_with_vat"] = totals.get("total_gross")
+    if out.get("total_without_vat") is None:
+        out["total_without_vat"] = totals.get("subtotal_net")
+    if out.get("total_vat_amount") is None:
+        out["total_vat_amount"] = totals.get("vat_total")
+
+    line_items = out.get("line_items")
+    if isinstance(line_items, list) and line_items and not out.get("items"):
+        normalized_items = []
+        for it in line_items:
+            if not isinstance(it, dict):
+                continue
+            normalized_items.append(
+                {
+                    "name": it.get("description"),
+                    "quantity": it.get("quantity"),
+                    "unit": it.get("unit"),
+                    "unit_price": it.get("unit_price_net"),
+                    "vat_rate": it.get("vat_rate"),
+                    "vat_amount": it.get("vat_amount"),
+                    "line_total": it.get("total_gross"),
+                }
+            )
+        if normalized_items:
+            out["items"] = normalized_items
+
+    return out
+
 def extract_with_openai(
     cfg: OpenAIConfig,
     ocr_text: str,
@@ -195,6 +247,9 @@ def extract_with_openai(
     prompt = _build_prompt(ocr_text, mode="primary")
 
     content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    if pdf and pdf[1]:
+        mime, data = pdf
+        content.insert(0, {"type": "input_file", "file_data": _b64_data_url(mime, data), "filename": "document.pdf"})
     if images:
         for mime, data in images:
             if not data:
@@ -245,7 +300,7 @@ def extract_with_openai(
         if start != -1 and end != -1 and end > start:
             obj = json.loads(text[start:end+1])
             if isinstance(obj, dict):
-                return obj, text, model
+                return _normalize_extracted_payload(obj), text, model
     except Exception:
         return None, text, model
     return None, text, model
@@ -312,7 +367,7 @@ def extract_with_openai_fallback(
         if start != -1 and end != -1 and end > start:
             obj = json.loads(text[start:end + 1])
             if isinstance(obj, dict):
-                return obj, text, model
+                return _normalize_extracted_payload(obj), text, model
     except Exception:
         return None, text, model
     return None, text, model
