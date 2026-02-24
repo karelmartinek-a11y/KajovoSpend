@@ -1476,13 +1476,19 @@ class Processor:
 
             # Po offline i OpenAI: kanonizace položek (unit_price bez DPH, line_total s DPH) + kontrola součtu.
             items_ref = list(extracted.items or [])
-            sum_ok, reasons = postprocess_items_for_db(
+            sum_ok, reasons, derived_total_wo_vat, derived_vat_amount, derived_vat_breakdown = postprocess_items_for_db(
                 items=items_ref,
                 total_with_vat=extracted.total_with_vat,
                 reasons=reasons,
             )
             extracted.items = items_ref
             extracted.review_reasons = reasons
+            if extracted.total_without_vat is None:
+                extracted.total_without_vat = derived_total_wo_vat
+            if extracted.total_vat_amount is None:
+                extracted.total_vat_amount = derived_vat_amount
+            if extracted.vat_breakdown_json is None:
+                extracted.vat_breakdown_json = derived_vat_breakdown
 
             # OpenAI fallback: pokud stale chybi klicova data, zkus druhe kolo s prisnejsim promptem
             need_openai = False
@@ -1550,13 +1556,19 @@ class Processor:
 
                 # Po OpenAI znovu normalizace polozek a kontrola souctu
                 items_ref = list(extracted.items or [])
-                sum_ok, reasons = postprocess_items_for_db(
+                sum_ok, reasons, derived_total_wo_vat, derived_vat_amount, derived_vat_breakdown = postprocess_items_for_db(
                     items=items_ref,
                     total_with_vat=extracted.total_with_vat,
                     reasons=reasons,
                 )
                 extracted.items = items_ref
                 extracted.review_reasons = reasons
+                if extracted.total_without_vat is None:
+                    extracted.total_without_vat = derived_total_wo_vat
+                if extracted.total_vat_amount is None:
+                    extracted.total_vat_amount = derived_vat_amount
+                if extracted.vat_breakdown_json is None:
+                    extracted.vat_breakdown_json = derived_vat_breakdown
 
 # Pro účtenky: pokud nemáme položky, vytvoř syntetickou z total.
             allow_synthetic = bool(openai_cfg.get("allow_synthetic_items", False))

@@ -56,7 +56,7 @@ class TestDbNetGrossMigration(unittest.TestCase):
             sf = make_session_factory(engine)
 
             with sf() as session:
-                session.execute(text("INSERT INTO files(id, sha256, original_name, pages, current_path, status) VALUES (1, 's', 'x.pdf', 1, '/tmp/x.pdf', 'PROCESSED')"))
+                session.execute(text("INSERT INTO files(id, sha256, original_name, pages, current_path, status, created_at) VALUES (1, 's', 'x.pdf', 1, '/tmp/x.pdf', 'PROCESSED', CURRENT_TIMESTAMP)"))
                 session.flush()
 
                 doc = add_document(
