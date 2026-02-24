@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10
 DEFAULT_CACHE_TTL_SECONDS = 7 * 24 * 3600
+MAX_CACHE_SIZE = 5_000
 
 _ARES_CACHE: dict[str, tuple[dt.datetime, "AresRecord"]] = {}
 
@@ -99,6 +100,11 @@ def fetch_by_ico(
     timeout: int = DEFAULT_TIMEOUT,
     cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
 ) -> AresRecord:
+    if timeout <= 0:
+        raise ValueError("timeout musi byt kladne cislo")
+    if cache_ttl_seconds < 0:
+        raise ValueError("cache_ttl_seconds nesmi byt zaporne")
+
     ico_norm = normalize_ico(ico)
 
     now = dt.datetime.utcnow()
@@ -201,4 +207,7 @@ def fetch_by_ico(
         fetched_at=now,
     )
     _ARES_CACHE[ico_norm] = (now, rec)
+    if len(_ARES_CACHE) > MAX_CACHE_SIZE:
+        oldest_key = min(_ARES_CACHE.items(), key=lambda item: item[1][0])[0]
+        _ARES_CACHE.pop(oldest_key, None)
     return rec

@@ -3,6 +3,8 @@ from __future__ import annotations
 import socket
 from unittest.mock import patch
 
+import pytest
+
 from kajovospend.integrations import ares
 
 
@@ -32,3 +34,13 @@ def test_fetch_by_ico_nemeni_globalni_socket_timeout() -> None:
         mocked_get.assert_called_once()
     finally:
         socket.setdefaulttimeout(puvodni_timeout)
+
+
+def test_fetch_by_ico_rejects_non_positive_timeout() -> None:
+    with pytest.raises(ValueError, match="timeout"):
+        ares.fetch_by_ico("12345678", timeout=0)
+
+
+def test_fetch_by_ico_rejects_negative_cache_ttl() -> None:
+    with pytest.raises(ValueError, match="cache_ttl_seconds"):
+        ares.fetch_by_ico("12345678", cache_ttl_seconds=-1)
