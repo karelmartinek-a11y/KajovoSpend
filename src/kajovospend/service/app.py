@@ -100,6 +100,14 @@ class ServiceApp:
             job = ImportJob(path=str(p), status="QUEUED")
             session.add(job)
             session.commit()
+            try:
+                from kajovospend.utils.logging_setup import log_event
+                from kajovospend.utils.forensic_context import forensic_scope, new_correlation_id
+
+                with forensic_scope(correlation_id=new_correlation_id(), job_id=int(job.id), phase="queued"):
+                    log_event(self.log, "job.start", "Job enqueued", path=str(p), job_id=int(job.id))
+            except Exception:
+                pass
 
     def _claim_next_job(self, session: Session) -> ImportJob | None:
         job = session.execute(
@@ -145,6 +153,13 @@ class ServiceApp:
             p = Path(job.path)
             try:
                 # best-effort "current job" observability
+                try:
+                    from kajovospend.utils.logging_setup import log_event
+                    from kajovospend.utils.forensic_context import forensic_scope
+                    with forensic_scope(correlation_id=str(job.id), job_id=int(job.id), phase="claim"):
+                        log_event(self.log, "job.claim", "Job claimed", job_id=int(job.id), path=str(p))
+                except Exception:
+                    pass
                 update_service_state(
                     session,
                     current_job_id=int(job.id),
@@ -160,12 +175,27 @@ class ServiceApp:
                     job.status = "ERROR"
                     job.error = "file_missing"
                 else:
-                    res = self._processor.process_path(session, p)
+                    res = self._processor.process_path(session, p, job_id=int(job.id))
                     job.sha256 = res.get("sha256")
                     job.status = res.get("status")
                     job.error = None
                 job.finished_at = dt.datetime.utcnow()
                 session.add(job)
+                try:
+                    from kajovospend.utils.logging_setup import log_event
+                    from kajovospend.utils.forensic_context import forensic_scope
+                    with forensic_scope(correlation_id=str(job.id), job_id=int(job.id), phase="finish"):
+                        log_event(
+                            self.log,
+                            "job.finish",
+                            "Job finish",
+                            status=job.status,
+                            job_id=int(job.id),
+                            path=str(p),
+                            sha256=job.sha256,
+                        )
+                except Exception:
+                    pass
 
                 # update service state
                 st = session.get(ServiceState, 1)
@@ -182,7 +212,7 @@ class ServiceApp:
                         st.last_success = dt.datetime.utcnow()
                     elif job.status in ("ERROR",):
                         st.last_error = job.error
-                        st.last_error_at = dt.datetime.utcnow()
+                    st.last_error_at = dt.datetime.utcnow()
                 session.commit()
             except Exception as e:
                 self.log.exception(f"Job failed: {e}")
@@ -191,6 +221,13 @@ class ServiceApp:
                     job.error = str(e)
                     job.finished_at = dt.datetime.utcnow()
                     session.add(job)
+                    try:
+                        from kajovospend.utils.logging_setup import log_event
+                        from kajovospend.utils.forensic_context import forensic_scope
+                        with forensic_scope(correlation_id=str(job.id), job_id=int(job.id), phase="error"):
+                            log_event(self.log, "job.finish", "Job finish (error)", status="ERROR", job_id=int(job.id), error=str(e))
+                    except Exception:
+                        pass
                     update_service_state(
                         session,
                         last_error=str(e),
@@ -254,6 +291,11 @@ class ServiceApp:
                 with self.sf() as session:
                     n_stuck = self._watchdog_mark_stuck(session, watchdog_sec)
                     if n_stuck:
+                        try:
+                            from kajovospend.utils.logging_setup import log_event
+                            log_event(self.log, "job.stuck.marked", "Marked stuck jobs", count=int(n_stuck))
+                        except Exception:
+                            pass
                         update_service_state(
                             session,
                             last_error=f"watchdog: {n_stuck} job(s) stuck_timeout",

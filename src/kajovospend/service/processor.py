@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import uuid
 from dateutil import parser as dtparser
 import re
 import hashlib
@@ -43,6 +44,8 @@ from kajovospend.utils.hashing import sha256_file
 from kajovospend.utils.text_quality import compute_text_quality, summarize_text_quality, text_quality_score
 from kajovospend.utils.qr_spayd import decode_qr_from_pil, parse_spayd
 from kajovospend.utils.iban import normalize_iban, is_valid_iban
+from kajovospend.utils.forensic_context import forensic_scope, new_correlation_id
+from kajovospend.utils.logging_setup import log_event
 
 
 
@@ -539,6 +542,7 @@ class Processor:
                 continue
 
             should_merge = False
+            score_val = None
 
             # case 1: exact complete key match
             if cur_key_ok and key_ok and cur_key == key:
@@ -546,6 +550,7 @@ class Processor:
             else:
                 # case 2: score-based merge
                 score = _merge_score(cur_ex, ex)
+                score_val = score
                 # allow merge if strong enough
                 if score >= 4:
                     should_merge = True
@@ -554,6 +559,18 @@ class Processor:
                     # don't merge if it looks like new document header
                     if not _looks_new_document(full_text or ""):
                         should_merge = True
+
+            log_event(
+                self.log,
+                "merge.decision",
+                "Merge decision",
+                page_left=int(cur["page_to"]),
+                page_right=page_no,
+                key_ok_left=bool(cur_key_ok),
+                key_ok_right=bool(key_ok),
+                score=score_val,
+                should_merge=bool(should_merge),
+            )
 
             if should_merge:
                 cur["page_to"] = page_no
@@ -1095,9 +1112,35 @@ class Processor:
             out.append(r)
         return out
 
-    def process_path(self, session, path: Path, status_cb=None, *, force: bool = False) -> Dict[str, Any]:
+    def process_path(self, session, path: Path, status_cb=None, *, force: bool = False, job_id: Optional[int] = None) -> Dict[str, Any]:
         # returns dict with outcome
+        correlation_id = new_correlation_id()
+        job_ref = job_id if job_id is not None else f"pseudo-{uuid.uuid4()}"
+        size = path.stat().st_size if path.exists() else 0
+        mtime = path.stat().st_mtime if path.exists() else None
         sha = sha256_file(path)
+
+        with forensic_scope(correlation_id=correlation_id, job_id=job_ref, file_sha256=sha, phase="ingest"):
+            log_event(
+                self.log,
+                "job.start",
+                "Job start",
+                path=str(path),
+                name=path.name,
+                size_bytes=size,
+                mtime=mtime,
+                job_id=job_ref,
+            )
+            log_event(
+                self.log,
+                "file.ingest",
+                "File ingest",
+                path=str(path),
+                sha256=sha,
+                size_bytes=size,
+                mtime=mtime,
+                ext=path.suffix.lower(),
+            )
         # dedupe check
         existing = session.execute(
             text("SELECT id, status FROM files WHERE sha256 = :sha"),
@@ -1110,6 +1153,14 @@ class Processor:
                 out_base = Path(self.cfg["paths"]["output_dir"])
                 dup_dir = out_base / self.cfg["paths"].get("duplicate_dir_name", "DUPLICITY")
                 moved = safe_move(path, dup_dir, path.name)
+                log_event(
+                    self.log,
+                    "job.finish",
+                    "Job finish (duplicate)",
+                    status="DUPLICATE",
+                    moved_to=str(moved),
+                    sha256=sha,
+                )
                 return {"status": "DUPLICATE", "sha256": sha, "moved_to": str(moved), "text_method": None, "text_debug": {}}
             # force re-run: recykluj existující záznam a smaž předchozí výstupy
             file_record = session.get(DocumentFile, int(existing[0]))
@@ -1399,10 +1450,15 @@ class Processor:
                     try:
                         if status_cb:
                             status_cb("OpenAI: extrahuji data...")
-                        try:
-                            self.log.info("OpenAI primary start | file=%s | model=%s | only=%s", path.name, openai_model, openai_only)
-                        except Exception:
-                            pass
+                        log_event(
+                            self.log,
+                            "openai.start",
+                            "OpenAI primary start",
+                            file=path.name,
+                            model=openai_model,
+                            mode="primary",
+                            only=openai_only,
+                        )
                         images_payload, pdf_payload = self._prepare_openai_images(
                             path,
                             page_from=page_from,
@@ -1416,13 +1472,14 @@ class Processor:
                             temperature=temperature,
                             max_output_tokens=max_output_tokens,
                         )
-                        obj, raw, used_model = extract_with_openai(
-                            cfg,
-                            ocr_text=ocr_text,
-                            images=images_payload,
-                            pdf=pdf_payload,
-                            timeout=openai_timeout,
-                        )
+                        with forensic_scope(phase="openai_primary", mode="primary"):
+                            obj, raw, used_model = extract_with_openai(
+                                cfg,
+                                ocr_text=ocr_text,
+                                images=images_payload,
+                                pdf=pdf_payload,
+                                timeout=openai_timeout,
+                            )
                         if isinstance(obj, dict):
                             merged = self._merge_openai_result(extracted, obj, prefer_items=True)
                             if merged:
@@ -1508,10 +1565,15 @@ class Processor:
                 try:
                     if status_cb:
                         status_cb("OpenAI fallback: doplnuji polozky...")
-                    try:
-                        self.log.info("OpenAI fallback start | file=%s | model=%s | only=%s", path.name, fallback_model or openai_model, openai_only)
-                    except Exception:
-                        pass
+                    log_event(
+                        self.log,
+                        "openai.start",
+                        "OpenAI fallback start",
+                        file=path.name,
+                        model=fallback_model or openai_model,
+                        mode="fallback",
+                        only=openai_only,
+                    )
                     images_payload, pdf_payload = self._prepare_openai_images(
                         path,
                         page_from=page_from,
@@ -1525,13 +1587,14 @@ class Processor:
                         temperature=temperature,
                         max_output_tokens=max_output_tokens,
                     )
-                    obj, raw, used_model = extract_with_openai_fallback(
-                        cfg,
-                        ocr_text=ocr_text,
-                        images=images_payload,
-                        pdf=pdf_payload,
-                        timeout=openai_timeout,
-                    )
+                    with forensic_scope(phase="openai_fallback", mode="fallback"):
+                        obj, raw, used_model = extract_with_openai_fallback(
+                            cfg,
+                            ocr_text=ocr_text,
+                            images=images_payload,
+                            pdf=pdf_payload,
+                            timeout=openai_timeout,
+                        )
                     if isinstance(obj, dict):
                         merged = self._merge_openai_result(extracted, obj, prefer_items=True)
                         if merged:
@@ -1656,6 +1719,16 @@ class Processor:
                         file_record.processed_at = dt.datetime.utcnow()
                         session.add(file_record)
                         session.flush()
+                        log_event(
+                            self.log,
+                            "job.finish",
+                            "Job finish (duplicate document)",
+                            status="DUPLICATE",
+                            moved_to=str(moved),
+                            file_id=file_record.id,
+                            duplicate_of_document_id=int(dup[0]),
+                            sha256=sha,
+                        )
                         return {
                             "status": "DUPLICATE",
                             "sha256": sha,
@@ -1763,6 +1836,16 @@ class Processor:
                 page_from=page_from,
                 page_to=page_to,
             )
+            with forensic_scope(document_id=int(doc.id), phase="db_write"):
+                log_event(
+                    self.log,
+                    "db.write",
+                    "DB write document",
+                    doc_id=int(doc.id),
+                    file_id=file_record.id,
+                    requires_review=requires_review,
+                    method=method,
+                )
             if openai_used_model:
                 doc.openai_model = str(openai_used_model)
                 doc.openai_raw_response = openai_raw_response
@@ -1783,6 +1866,20 @@ class Processor:
                     rec = page_audit_map.get(int(pno))
                     if not rec:
                         continue
+                    log_event(
+                        self.log,
+                        "ocr.page",
+                        "OCR page decision",
+                        page_no=int(pno),
+                        chosen_mode=str(rec.get("chosen_mode") or "embedded"),
+                        chosen_score=float(rec.get("chosen_score") or 0.0),
+                        embedded_score=float(rec.get("embedded_score") or 0.0),
+                        ocr_score=float(rec.get("ocr_score") or 0.0),
+                        embedded_len=int(rec.get("embedded_len") or 0),
+                        ocr_len=int(rec.get("ocr_len") or 0),
+                        ocr_conf=float(rec.get("ocr_conf") or 0.0),
+                        token_groups=int(rec.get("token_groups") or 0),
+                    )
                     session.add(DocumentPageAudit(
                         document_id=int(doc.id),
                         file_id=int(file_record.id),
@@ -1821,6 +1918,17 @@ class Processor:
         session.add(file_record)
         session.flush()
 
+        log_event(
+            self.log,
+            "job.finish",
+            "Job finish",
+            status=status,
+            moved_to=str(moved),
+            file_id=file_record.id,
+            document_ids=created_doc_ids,
+            sha256=sha,
+            text_method=text_method,
+        )
         return {
             "status": status,
             "sha256": sha,

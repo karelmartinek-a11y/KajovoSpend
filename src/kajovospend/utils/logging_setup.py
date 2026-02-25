@@ -11,9 +11,11 @@ import traceback
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
 import faulthandler
+
+from kajovospend.utils.forensic_context import get_forensic_fields
 
 if os.name == "nt":
     import msvcrt  # type: ignore
@@ -191,6 +193,10 @@ class ForensicContextFilter(logging.Filter):
         record.python = self._python
         record.user = self._user
         record.cwd = os.getcwd()
+        try:
+            record.forensic = get_forensic_fields()
+        except Exception:
+            record.forensic = None
         return True
 
 
@@ -216,7 +222,14 @@ class JsonLineFormatter(logging.Formatter):
             "cwd": getattr(record, "cwd", None),
             "platform": getattr(record, "platform", None),
             "python": getattr(record, "python", None),
+            "event_name": getattr(record, "event_name", None),
         }
+
+        payload["forensic"] = getattr(record, "forensic", None) or get_forensic_fields()
+
+        extra_obj = getattr(record, "extra_payload", None)
+        if extra_obj:
+            payload["extra"] = extra_obj
 
         if record.exc_info:
             payload["exception"] = "".join(traceback.format_exception(*record.exc_info))
@@ -264,6 +277,25 @@ def _install_forensic_runtime_hooks(log: logging.Logger, log_dir: Path) -> None:
     )
 
 
+def _compute_max_lines() -> int:
+    """
+    Určí max_lines podle priority:
+    1) KAJOVOSPEND_LOG_MAX_LINES
+    2) KAJOVOSPEND_LOG_RETENTION_DAYS * KAJOVOSPEND_LOG_LINES_PER_DAY_ESTIMATE
+    """
+    env_max = os.environ.get("KAJOVOSPEND_LOG_MAX_LINES")
+    if env_max:
+        try:
+            val = int(env_max)
+            if val > 0:
+                return val
+        except Exception:
+            pass
+    retention_days = int(os.environ.get("KAJOVOSPEND_LOG_RETENTION_DAYS", "7") or 7)
+    lines_per_day = int(os.environ.get("KAJOVOSPEND_LOG_LINES_PER_DAY_ESTIMATE", "200000") or 200000)
+    return max(1000, retention_days * lines_per_day)
+
+
 def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
     """
     Configures one shared log file:
@@ -278,10 +310,12 @@ def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(name)
 
+    max_lines = _compute_max_lines()
+
     with _ROOT_CONFIG_LOCK:
         if not _ROOT_CONFIGURED:
-            max_lines = int(os.environ.get("KAJOVOSPEND_LOG_MAX_LINES", "5000"))
             log_file = log_dir / "kajovospend.log"
+            detail = str(os.environ.get("KAJOVOSPEND_LOG_DETAIL", "1")).strip() not in {"0", "false", "False", "FALSE", "no", "NO"}
 
             root = logging.getLogger()
             root.setLevel(logging.DEBUG)
@@ -303,7 +337,7 @@ def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
             root.addHandler(fh)
 
             forensic_file = log_dir / "kajovospend_forensic.jsonl"
-            fh_json = LineCappedFileHandler(forensic_file, max_lines=max_lines * 2, encoding="utf-8")
+            fh_json = LineCappedFileHandler(forensic_file, max_lines=int(max_lines * 2), encoding="utf-8")
             fh_json.setLevel(logging.DEBUG)
             fh_json.setFormatter(JsonLineFormatter())
             fh_json.addFilter(forensic_filter)
@@ -316,16 +350,75 @@ def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
                 ch.addFilter(forensic_filter)
                 root.addHandler(ch)
 
+            setattr(root, "_kajovospend_log_detail", detail)
             _ROOT_CONFIGURED = True
 
     # let everything propagate into the single root handler
     logger.setLevel(logging.DEBUG)
     logger.propagate = True
     _install_forensic_runtime_hooks(logger, log_dir)
+    retention_days = int(os.environ.get("KAJOVOSPEND_LOG_RETENTION_DAYS", "7") or 7)
+    lines_per_day = int(os.environ.get("KAJOVOSPEND_LOG_LINES_PER_DAY_ESTIMATE", "200000") or 200000)
+    detail_flag = str(os.environ.get("KAJOVOSPEND_LOG_DETAIL", "1")).strip() not in {"0", "false", "False", "FALSE", "no", "NO"}
     logger.info(
-        "Logging inicializován: log_dir=%s pid=%s ppid=%s",
+        "Logging inicializov?n: log_dir=%s pid=%s ppid=%s retention_days=%s max_lines=%s lines_per_day_estimate=%s detail=%s",
         log_dir,
         os.getpid(),
         os.getppid() if hasattr(os, "getppid") else "n/a",
+        retention_days,
+        max_lines,
+        lines_per_day,
+        int(detail_flag),
+        extra={
+            "event_name": "logging.start",
+            "extra_payload": {
+                "retention_days": retention_days,
+                "max_lines": max_lines,
+                "lines_per_day_estimate": lines_per_day,
+                "detail": int(detail_flag),
+            },
+        },
     )
     return logger
+
+
+def log_event(logger: logging.Logger, event_name: str, message: str, **extra: Any) -> None:
+    """
+    Helper pro strukturované logování:
+    - doplní event_name a extra_payload
+    - do textového logu přidá čitelný suffix key=value
+    """
+    extra_payload: Dict[str, Any] = extra or {}
+    # respektuj detail flag (pokud je root logger bez detailu, omez velké hodnoty)
+    detail_enabled = True
+    try:
+        root = logging.getLogger()
+        detail_enabled = bool(getattr(root, "_kajovospend_log_detail", True))
+    except Exception:
+        detail_enabled = True
+
+    if not detail_enabled:
+        pruned = {}
+        for k, v in extra_payload.items():
+            try:
+                s = repr(v)
+                if len(s) <= 400:
+                    pruned[k] = v
+            except Exception:
+                continue
+        extra_payload = pruned
+
+    suffix = ""
+    if extra_payload:
+        try:
+            suffix = " | " + " ".join(f"{k}={extra_payload[k]!r}" for k in sorted(extra_payload.keys()))
+        except Exception:
+            suffix = ""
+    logger.info(
+        f"{message}{suffix}",
+        extra={
+            "event_name": event_name,
+            "extra_payload": extra_payload,
+            "forensic": get_forensic_fields(),
+        },
+    )

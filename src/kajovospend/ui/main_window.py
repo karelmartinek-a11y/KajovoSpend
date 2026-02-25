@@ -548,7 +548,7 @@ class _ImportWorker(QObject):
                         session.add(job)
                         session.commit()
 
-                        res = self.processor.process_path(session, p, status_cb=self.progress.emit)
+                        res = self.processor.process_path(session, p, status_cb=self.progress.emit, job_id=int(job.id))
                         job.sha256 = res.get("sha256")
                         job.status = str(res.get("status") or "DONE")
                         job.finished_at = dt.datetime.utcnow()
@@ -3309,7 +3309,7 @@ class MainWindow(QMainWindow):
                 cfg["openai"] = openai_cfg
 
                 proc = Processor(cfg, self.paths, self.log)
-                res = proc.process_path(session, p, status_cb=status_cb, force=True)
+                res = proc.process_path(session, p, status_cb=status_cb, force=True, job_id=None)
                 session.commit()
                 return res
 
