@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+
+from kajovospend.utils.time import utc_now_naive
 from typing import Iterable, Optional
 import re
 
@@ -308,7 +310,7 @@ def update_service_state(session: Session, **kwargs) -> None:
     for k, v in kwargs.items():
         if hasattr(s, k):
             setattr(s, k, v)
-    s.last_seen = dt.datetime.utcnow()
+    s.last_seen = utc_now_naive()
     session.add(s)
 
 

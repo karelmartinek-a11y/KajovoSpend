@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+
+from kajovospend.utils.time import utc_now_naive
 import logging
 from dataclasses import dataclass, field
 import re
@@ -30,7 +32,7 @@ class AresRecord:
     orientation_number: Optional[str] = None
     city: Optional[str] = None
     zip_code: Optional[str] = None
-    fetched_at: dt.datetime = field(default_factory=dt.datetime.utcnow)
+    fetched_at: dt.datetime = field(default_factory=utc_now_naive)
 
 
 class AresError(RuntimeError):
@@ -107,7 +109,7 @@ def fetch_by_ico(
 
     ico_norm = normalize_ico(ico)
 
-    now = dt.datetime.utcnow()
+    now = utc_now_naive()
     cached = _ARES_CACHE.get(ico_norm)
     if cached:
         fetched_at, rec = cached
@@ -115,7 +117,7 @@ def fetch_by_ico(
             return rec
 
     url = f"{_ARES_BASE_URL}/ekonomicke-subjekty/{ico_norm}"
-    start = dt.datetime.utcnow()
+    start = utc_now_naive()
     try:
         resp = requests.get(
             url,
@@ -131,7 +133,7 @@ def fetch_by_ico(
         raise AresError(f"Nepodařilo se načíst ARES pro IČO {ico_norm}: {e}") from e
     finally:
         try:
-            elapsed = (dt.datetime.utcnow() - start).total_seconds()
+            elapsed = (utc_now_naive() - start).total_seconds()
             log.debug("ares-fetch", extra={"ico": ico_norm, "seconds": elapsed})
         except Exception:
             pass

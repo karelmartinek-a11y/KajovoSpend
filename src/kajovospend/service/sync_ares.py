@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+
+from kajovospend.utils.time import utc_now_naive
 from typing import Any, Dict
 
 from sqlalchemy import select
@@ -16,7 +18,7 @@ def sync_pending_suppliers(sf, log, *, ttl_hours: float = 24.0, limit: int = 500
 
     Vrací statistiku běhu (processed/synced/failed/skipped_ttl).
     """
-    now = dt.datetime.utcnow()
+    now = utc_now_naive()
     out = {"processed": 0, "synced": 0, "failed": 0, "skipped_ttl": 0}
 
     with sf() as session:  # type: Session

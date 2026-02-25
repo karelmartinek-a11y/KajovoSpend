@@ -48,6 +48,30 @@ class TestDbNetGrossMigration(unittest.TestCase):
                 self.assertAlmostEqual(float(drow[1]), 21.0, places=2)
                 self.assertEqual(str(drow[2]), "invoice")
 
+
+
+    def test_init_db_is_idempotent_when_run_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "idempotent.db"
+            engine = make_engine(str(db_path))
+
+            init_db(engine)
+            init_db(engine)
+
+            with engine.begin() as con:
+                row = con.execute(text("SELECT COUNT(*) FROM service_state")).scalar_one()
+                self.assertEqual(int(row), 1)
+
+                docs_fts_exists = con.execute(
+                    text("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='documents_fts'")
+                ).scalar_one()
+                self.assertEqual(int(docs_fts_exists), 1)
+
+                idx_exists = con.execute(
+                    text("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_documents_dup_key'")
+                ).scalar_one()
+                self.assertEqual(int(idx_exists), 1)
+
     def test_add_document_maps_legacy_and_fills_new_fields(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "new.db"

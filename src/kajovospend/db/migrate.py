@@ -345,29 +345,6 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
             )
         )
 
-        # Karanténa: staré doklady bez dodavatele vrátit zpět
-        con.execute(
-            text(
-                """
-                UPDATE files
-                SET status='QUARANTINE'
-                WHERE id IN (
-                    SELECT DISTINCT file_id FROM documents
-                    WHERE supplier_id IS NULL OR supplier_ico IS NULL OR TRIM(COALESCE(supplier_ico,''))=''
-                )
-                """
-            )
-        )
-        con.execute(
-            text(
-                """
-                UPDATE documents
-                SET requires_review=1,
-                    review_reasons=COALESCE(review_reasons||'; ','') || 'dodavatel_chybi'
-                WHERE supplier_id IS NULL OR supplier_ico IS NULL OR TRIM(COALESCE(supplier_ico,''))=''
-                """
-            )
-        )
 
 def init_db(engine: Engine) -> None:
     # ensure tables exist

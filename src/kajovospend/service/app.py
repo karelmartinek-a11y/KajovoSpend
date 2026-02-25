@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+
+from kajovospend.utils.time import utc_now_naive
 import os
 import threading
 import time
@@ -170,7 +172,7 @@ class ServiceApp:
         if not job:
             return None
         job.status = "RUNNING"
-        job.started_at = dt.datetime.utcnow()
+        job.started_at = utc_now_naive()
         session.add(job)
         session.flush()
         return job
@@ -182,7 +184,7 @@ class ServiceApp:
         """
         if timeout_sec <= 0:
             return 0
-        cutoff = dt.datetime.utcnow() - dt.timedelta(seconds=int(timeout_sec))
+        cutoff = utc_now_naive() - dt.timedelta(seconds=int(timeout_sec))
         stuck_jobs = session.execute(
             select(ImportJob).where(
                 (ImportJob.status == "RUNNING") &
@@ -194,7 +196,7 @@ class ServiceApp:
         for j in stuck_jobs:
             j.status = "ERROR"
             j.error = f"stuck_timeout>{timeout_sec}s"
-            j.finished_at = dt.datetime.utcnow()
+            j.finished_at = utc_now_naive()
             session.add(j)
             n += 1
         return n
@@ -221,7 +223,7 @@ class ServiceApp:
                     current_path=str(p),
                     current_phase="processing",
                     current_progress=0.0,
-                    heartbeat_at=dt.datetime.utcnow(),
+                    heartbeat_at=utc_now_naive(),
                     inflight=self._inflight_count(),
                     max_workers=int(self._max_workers),
                 )
@@ -234,7 +236,7 @@ class ServiceApp:
                     job.sha256 = res.get("sha256")
                     job.status = res.get("status")
                     job.error = None
-                job.finished_at = dt.datetime.utcnow()
+                job.finished_at = utc_now_naive()
                 session.add(job)
                 try:
                     from kajovospend.utils.logging_setup import log_event
@@ -259,22 +261,22 @@ class ServiceApp:
                     st.inflight = self._inflight_count()
                     st.max_workers = int(self._max_workers)
                     st.current_progress = 100.0
-                    st.heartbeat_at = dt.datetime.utcnow()
+                    st.heartbeat_at = utc_now_naive()
                     st.current_phase = "dispatching"
                     st.current_job_id = None
                     st.current_path = None
                     if job.status in ("PROCESSED",):
-                        st.last_success = dt.datetime.utcnow()
+                        st.last_success = utc_now_naive()
                     elif job.status in ("ERROR",):
                         st.last_error = job.error
-                    st.last_error_at = dt.datetime.utcnow()
+                    st.last_error_at = utc_now_naive()
                 session.commit()
             except Exception as e:
                 self.log.exception(f"Job failed: {e}")
                 try:
                     job.status = "ERROR"
                     job.error = str(e)
-                    job.finished_at = dt.datetime.utcnow()
+                    job.finished_at = utc_now_naive()
                     session.add(job)
                     try:
                         from kajovospend.utils.logging_setup import log_event
@@ -286,9 +288,9 @@ class ServiceApp:
                     update_service_state(
                         session,
                         last_error=str(e),
-                        last_error_at=dt.datetime.utcnow(),
+                        last_error_at=utc_now_naive(),
                         current_phase="error",
-                        heartbeat_at=dt.datetime.utcnow(),
+                        heartbeat_at=utc_now_naive(),
                         inflight=self._inflight_count(),
                     )
                     session.commit()
@@ -330,7 +332,7 @@ class ServiceApp:
                 max_workers=int(self._max_workers),
                 inflight=0,
                 current_phase="idle",
-                heartbeat_at=dt.datetime.utcnow(),
+                heartbeat_at=utc_now_naive(),
                 stuck=False,
                 stuck_reason=None,
             )
@@ -354,7 +356,7 @@ class ServiceApp:
                         update_service_state(
                             session,
                             last_error=f"watchdog: {n_stuck} job(s) stuck_timeout",
-                            last_error_at=dt.datetime.utcnow(),
+                            last_error_at=utc_now_naive(),
                             stuck=True,
                             stuck_reason=f"stuck_timeout>{watchdog_sec}s",
                         )
@@ -370,11 +372,11 @@ class ServiceApp:
                     update_service_state(
                         session,
                         queue_size=queue_size(session),
-                        last_seen=dt.datetime.utcnow(),
+                        last_seen=utc_now_naive(),
                         inflight=self._inflight_count(),
                         max_workers=int(self._max_workers),
                         current_phase="dispatching",
-                        heartbeat_at=dt.datetime.utcnow(),
+                        heartbeat_at=utc_now_naive(),
                     )
                     session.commit()
 
@@ -396,7 +398,7 @@ class ServiceApp:
                         session,
                         inflight=self._inflight_count(),
                         current_phase=("idle" if (self._inflight_count() == 0 and queue_size(session) == 0) else "dispatching"),
-                        heartbeat_at=dt.datetime.utcnow(),
+                        heartbeat_at=utc_now_naive(),
                     )
                     session.commit()
 
@@ -416,11 +418,11 @@ class ServiceApp:
                     update_service_state(
                         session,
                         running=False,
-                        last_seen=dt.datetime.utcnow(),
+                        last_seen=utc_now_naive(),
                         queue_size=queue_size(session),
                         inflight=0,
                         current_phase="shutdown",
-                        heartbeat_at=dt.datetime.utcnow(),
+                        heartbeat_at=utc_now_naive(),
                     )
                     session.commit()
             except Exception:

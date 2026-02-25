@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+
+from kajovospend.utils.time import utc_now_naive
 import os
 import uuid
 from dateutil import parser as dtparser
@@ -1790,7 +1792,7 @@ class Processor:
                         moved = safe_move(path, dup_dir, path.name)
                         file_record.current_path = str(moved)
                         file_record.status = "DUPLICATE"
-                        file_record.processed_at = dt.datetime.utcnow()
+                        file_record.processed_at = utc_now_naive()
                         session.add(file_record)
                         session.flush()
                         self._update_processing_status(id_in, status="DUPLICATE", path_current=str(moved), sha256=sha, last_error="duplicitní doklad")
@@ -2003,7 +2005,7 @@ class Processor:
 
         file_record.current_path = str(moved)
         file_record.status = status
-        file_record.processed_at = dt.datetime.utcnow()
+        file_record.processed_at = utc_now_naive()
         session.add(file_record)
         session.flush()
 

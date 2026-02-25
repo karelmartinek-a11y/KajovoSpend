@@ -28,6 +28,9 @@ class OpenAIConfig:
 
 _MODEL_CACHE: dict[str, Any] = {"ts": 0.0, "ids": []}
 _MODEL_CACHE_TTL_SEC = 300
+_RETRYABLE_HTTP_STATUSES = {408, 409, 429, 500, 502, 503, 504}
+_MAX_HTTP_RETRIES = 2
+_RETRY_BASE_DELAY_SEC = 0.5
 
 # Prefer nejvyssi kvalitu (s vision) – pokud neni dostupna, padame nize.
 _MODEL_PREFER_PRIMARY = [
@@ -574,6 +577,65 @@ def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: 
             raise
 
 
+def _is_retryable_http_status(status_code: int | None) -> bool:
+    return bool(status_code in _RETRYABLE_HTTP_STATUSES)
+
+
+def _openai_post_with_retry(
+    payload: Dict[str, Any],
+    *,
+    timeout: int,
+    log,
+    mode: str,
+    api_key: str,
+    attempt_start: int = 1,
+    max_retries: int = _MAX_HTTP_RETRIES,
+) -> Tuple[requests.Response, float, Optional[str], Optional[str], str, int]:
+    attempt = attempt_start
+    while True:
+        try:
+            resp, latency_ms, resp_hash, openai_request_id, req_id_client = _openai_post_responses(
+                payload,
+                timeout=timeout,
+                log=log,
+                mode=mode,
+                attempt=attempt,
+                api_key=api_key,
+            )
+        except requests.RequestException:
+            if attempt - attempt_start >= max_retries:
+                raise
+            backoff = _RETRY_BASE_DELAY_SEC * (2 ** (attempt - attempt_start))
+            log_event(
+                log,
+                "openai.retry",
+                "OpenAI retry after request exception",
+                attempt_from=attempt,
+                attempt_to=attempt + 1,
+                reason="request_exception",
+                backoff_ms=int(backoff * 1000),
+            )
+            time.sleep(backoff)
+            attempt += 1
+            continue
+
+        if _is_retryable_http_status(resp.status_code) and (attempt - attempt_start) < max_retries:
+            backoff = _RETRY_BASE_DELAY_SEC * (2 ** (attempt - attempt_start))
+            log_event(
+                log,
+                "openai.retry",
+                "OpenAI retry on retryable HTTP status",
+                attempt_from=attempt,
+                attempt_to=attempt + 1,
+                reason=f"http_{resp.status_code}",
+                backoff_ms=int(backoff * 1000),
+            )
+            time.sleep(backoff)
+            attempt += 1
+            continue
+        return resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt
+
+
 def _normalize_extracted_payload(obj: Dict[str, Any]) -> Dict[str, Any]:
     """Prevede odpoved ze schema OpenAI na interni tvar, ktery ocekava processor."""
     out = dict(obj)
@@ -659,8 +721,8 @@ def _run_responses_flow(
     }
 
     attempt = 1
-    resp, latency_ms, resp_hash, openai_request_id, req_id_client = _openai_post_responses(
-        payload, timeout=timeout, log=log, mode=mode, attempt=attempt, api_key=cfg.api_key
+    resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt = _openai_post_with_retry(
+        payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, attempt_start=attempt
     )
     if resp.status_code >= 400 and cfg.use_json_schema:
         err_body = {}
@@ -703,8 +765,8 @@ def _run_responses_flow(
             )
             payload["text"] = {"format": {"type": "json_object"}}
             attempt += 1
-            resp, latency_ms, resp_hash, openai_request_id, req_id_client = _openai_post_responses(
-                payload, timeout=timeout, log=log, mode=mode, attempt=attempt, api_key=cfg.api_key
+            resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt = _openai_post_with_retry(
+                payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, attempt_start=attempt
             )
     resp.raise_for_status()
 
