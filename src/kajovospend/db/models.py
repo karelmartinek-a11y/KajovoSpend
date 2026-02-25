@@ -151,6 +151,7 @@ class ImportJob(Base):
     __tablename__ = "import_jobs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    processing_id_in: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     started_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)

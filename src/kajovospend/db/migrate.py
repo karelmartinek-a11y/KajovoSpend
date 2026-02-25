@@ -256,6 +256,119 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_ean ON items(ean)"))
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_item_code ON items(item_code)"))
 
+        # Import jobs: processing_id_in pro vazbu na zpracovatelskou DB
+        cols_jobs = con.execute(text("PRAGMA table_info('import_jobs')")).fetchall()
+        job_col_names = {row[1] for row in cols_jobs}
+        if "processing_id_in" not in job_col_names:
+            con.execute(text("ALTER TABLE import_jobs ADD COLUMN processing_id_in INTEGER"))
+            con.execute(text("CREATE INDEX IF NOT EXISTS idx_import_jobs_idin ON import_jobs(processing_id_in)"))
+
+        # Items: technické ID + skupiny + ID účtenky/dodavatele
+        cols_items = con.execute(text("PRAGMA table_info('items')")).fetchall()
+        item_col_names = {row[1] for row in cols_items}
+        if "id_item" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN id_item INTEGER"))
+            con.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_items_id_item ON items(id_item)"))
+            con.execute(text("UPDATE items SET id_item = rowid WHERE id_item IS NULL"))
+        if "id_receipt" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN id_receipt INTEGER"))
+        if "id_supplier" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN id_supplier INTEGER"))
+        if "group_id" not in item_col_names:
+            con.execute(text("ALTER TABLE items ADD COLUMN group_id INTEGER"))
+
+        # Item groups table
+        con.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS item_groups (
+                    id_group INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    color TEXT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+        # Receipts/documents: ID_Uctenky
+        cols_docs = con.execute(text("PRAGMA table_info('documents')")).fetchall()
+        doc_col_names = {row[1] for row in cols_docs}
+        if "id_receipt" not in doc_col_names:
+            con.execute(text("ALTER TABLE documents ADD COLUMN id_receipt INTEGER"))
+            con.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_id_receipt ON documents(id_receipt)"))
+            con.execute(text("UPDATE documents SET id_receipt = id WHERE id_receipt IS NULL"))
+
+        # Suppliers: ID_Dodavatele
+        cols_sup = con.execute(text("PRAGMA table_info('suppliers')")).fetchall()
+        sup_col_names = {row[1] for row in cols_sup}
+        if "id_supplier_ext" not in sup_col_names:
+            con.execute(text("ALTER TABLE suppliers ADD COLUMN id_supplier_ext INTEGER"))
+            con.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_suppliers_id_supplier_ext ON suppliers(id_supplier_ext)"))
+            con.execute(text("UPDATE suppliers SET id_supplier_ext = id WHERE id_supplier_ext IS NULL"))
+
+        # Zpětné doplnění id_supplier/id_receipt do items z vazeb (použij prefixy, aby nedošlo ke kolizi)
+        con.execute(
+            text(
+                """
+                UPDATE items
+                SET
+                  id_receipt = COALESCE(items.id_receipt, d.id_receipt, d.id),
+                  id_supplier = COALESCE(items.id_supplier, d.supplier_id)
+                FROM documents d
+                WHERE d.id = items.document_id
+                """
+            )
+        )
+
+        # Tvrdá stěna: soubory/doklady bez dodavatele do karantény
+        con.execute(
+            text(
+                """
+                UPDATE files
+                SET status='QUARANTINE'
+                WHERE id IN (
+                    SELECT DISTINCT file_id FROM documents
+                    WHERE supplier_id IS NULL OR supplier_ico IS NULL OR TRIM(COALESCE(supplier_ico,''))=''
+                )
+                """
+            )
+        )
+        con.execute(
+            text(
+                """
+                UPDATE documents
+                SET requires_review=1,
+                    review_reasons=COALESCE(review_reasons||'; ','') || 'dodavatel_chybi'
+                WHERE supplier_id IS NULL OR supplier_ico IS NULL OR TRIM(COALESCE(supplier_ico,''))=''
+                """
+            )
+        )
+
+        # Karanténa: staré doklady bez dodavatele vrátit zpět
+        con.execute(
+            text(
+                """
+                UPDATE files
+                SET status='QUARANTINE'
+                WHERE id IN (
+                    SELECT DISTINCT file_id FROM documents
+                    WHERE supplier_id IS NULL OR supplier_ico IS NULL OR TRIM(COALESCE(supplier_ico,''))=''
+                )
+                """
+            )
+        )
+        con.execute(
+            text(
+                """
+                UPDATE documents
+                SET requires_review=1,
+                    review_reasons=COALESCE(review_reasons||'; ','') || 'dodavatel_chybi'
+                WHERE supplier_id IS NULL OR supplier_ico IS NULL OR TRIM(COALESCE(supplier_ico,''))=''
+                """
+            )
+        )
+
 def init_db(engine: Engine) -> None:
     # ensure tables exist
     Base.metadata.create_all(engine)

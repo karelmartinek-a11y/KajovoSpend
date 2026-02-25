@@ -21,6 +21,8 @@ from kajovospend.db.queries import (
     rebuild_fts_for_document,
     upsert_supplier,
 )
+from kajovospend.db.processing_session import create_processing_session_factory
+from kajovospend.db.processing_models import IngestFile
 from kajovospend.extract.parser import extract_from_text, postprocess_items_for_db
 from kajovospend.extract.structured_pdf import extract_structured_from_pdf
 from kajovospend.service.file_ops import safe_move
@@ -55,12 +57,79 @@ class Processor:
         self.cfg = cfg
         self.paths = paths
         self.log = logger
+        self.pf = create_processing_session_factory(cfg)
         # OCR engine is optional; if unavailable we quarantine rather than crash service.
         try:
             self.ocr_engine = RapidOcrEngine(paths.models_dir)
         except Exception as e:
             self.log.warning(f"OCR init failed; will quarantine documents. Error: {e}")
             self.ocr_engine = None
+
+    def _update_processing_status(
+        self,
+        id_in: int | None,
+        *,
+        status: str | None = None,
+        path_current: str | None = None,
+        sha256: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        """Best-effort aktualizace zpracovatelské DB (ingest_files)."""
+        if not id_in:
+            return
+        try:
+            with self.pf() as ps:
+                rec = ps.get(IngestFile, int(id_in))
+                if not rec:
+                    return
+                if status:
+                    rec.status = status
+                if path_current:
+                    rec.path_current = path_current
+                if sha256:
+                    rec.sha256 = sha256
+                if last_error:
+                    rec.last_error = last_error
+                ps.add(rec)
+                ps.commit()
+        except Exception:
+            try:
+                self.log.exception("Update ingest_files selhal", exc_info=True)
+            except Exception:
+                pass
+
+    def _update_processing_status(
+        self,
+        id_in: int | None,
+        *,
+        status: str | None = None,
+        path_current: str | None = None,
+        sha256: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        """Best-effort aktualizace zpracovatelské DB (ingest_files)."""
+        if not id_in:
+            return
+        try:
+            with self.pf() as ps:
+                rec = ps.get(IngestFile, int(id_in))
+                if not rec:
+                    return
+                if status:
+                    rec.status = status
+                if path_current:
+                    rec.path_current = path_current
+                if sha256:
+                    rec.sha256 = sha256
+                if last_error:
+                    rec.last_error = last_error
+                ps.add(rec)
+                ps.commit()
+        except Exception:
+            try:
+                self.log.exception("Update ingest_files selhal", exc_info=True)
+            except Exception:
+                pass
 
 
     def _try_qr_spayd_from_image(self, img: Image.Image) -> dict[str, Any]:
@@ -1112,13 +1181,15 @@ class Processor:
             out.append(r)
         return out
 
-    def process_path(self, session, path: Path, status_cb=None, *, force: bool = False, job_id: Optional[int] = None) -> Dict[str, Any]:
+    def process_path(self, session, path: Path, status_cb=None, *, force: bool = False, job_id: Optional[int] = None, id_in: Optional[int] = None) -> Dict[str, Any]:
         # returns dict with outcome
         correlation_id = new_correlation_id()
         job_ref = job_id if job_id is not None else f"pseudo-{uuid.uuid4()}"
         size = path.stat().st_size if path.exists() else 0
         mtime = path.stat().st_mtime if path.exists() else None
         sha = sha256_file(path)
+        self._update_processing_status(id_in, status="QUEUED", path_current=str(path), sha256=sha)
+        self._update_processing_status(id_in, status="QUEUED", path_current=str(path), sha256=sha)
 
         with forensic_scope(correlation_id=correlation_id, job_id=job_ref, file_sha256=sha, phase="ingest"):
             log_event(
@@ -1161,7 +1232,8 @@ class Processor:
                     moved_to=str(moved),
                     sha256=sha,
                 )
-                return {"status": "DUPLICATE", "sha256": sha, "moved_to": str(moved), "text_method": None, "text_debug": {}}
+                self._update_processing_status(id_in, status="DUPLICATE", path_current=str(moved), sha256=sha)
+                return {"status": "DUPLICATE", "sha256": sha, "moved_to": str(moved), "text_method": None, "text_debug": {}, "id_in": id_in}
             # force re-run: recykluj existující záznam a smaž předchozí výstupy
             file_record = session.get(DocumentFile, int(existing[0]))
             if file_record is not None:
@@ -1287,6 +1359,7 @@ class Processor:
                 status="NEW",
                 mime_type="application/pdf" if path.suffix.lower() == ".pdf" else "image",
             )
+            self._update_processing_status(id_in, status="NEW", path_current=str(path), sha256=sha)
 
         created_doc_ids: List[int] = []
         any_requires_review = False
@@ -1698,6 +1771,7 @@ class Processor:
                     session.add(file_record)
                 except Exception:
                     pass
+                self._update_processing_status(id_in, status="QUARANTINE", last_error=file_record.last_error, path_current=file_record.current_path, sha256=sha)
                 continue
 
             # Business duplicita per-doc
@@ -1719,6 +1793,7 @@ class Processor:
                         file_record.processed_at = dt.datetime.utcnow()
                         session.add(file_record)
                         session.flush()
+                        self._update_processing_status(id_in, status="DUPLICATE", path_current=str(moved), sha256=sha, last_error="duplicitní doklad")
                         log_event(
                             self.log,
                             "job.finish",
@@ -1737,6 +1812,7 @@ class Processor:
                             "duplicate_of_document_id": int(dup[0]),
                             "text_method": text_method,
                             "text_debug": text_debug,
+                            "id_in": id_in,
                         }
                 except Exception as e:
                     reasons.append(f"dup-check selhal: {e}")
@@ -1750,6 +1826,7 @@ class Processor:
                     session.add(file_record)
                 except Exception:
                     pass
+                self._update_processing_status(id_in, status="QUARANTINE", last_error=last_error_msg, path_current=file_record.current_path, sha256=sha)
                 continue
 
             supplier_id = None
@@ -1807,6 +1884,18 @@ class Processor:
                         overwrite=False,
                     )
                     supplier_id = s.id
+
+            if not supplier_id:
+                requires_review = True
+                reasons.append("chybí dodavatel – uložení dokladu zablokováno")
+                any_requires_review = True
+                try:
+                    file_record.last_error = "; ".join(dict.fromkeys(reasons)) if reasons else "dodavatel neidentifikován"
+                    session.add(file_record)
+                except Exception:
+                    pass
+                self._update_processing_status(id_in, status="QUARANTINE", last_error=file_record.last_error, path_current=file_record.current_path, sha256=sha)
+                continue
 
             last_error_msg = "; ".join(dict.fromkeys(reasons)) if reasons else "nekompletní vytěžení"
             if requires_review:
@@ -1918,6 +2007,13 @@ class Processor:
         session.add(file_record)
         session.flush()
 
+        self._update_processing_status(
+            id_in,
+            status=status,
+            path_current=file_record.current_path,
+            sha256=sha,
+            last_error=file_record.last_error if status == "QUARANTINE" else None,
+        )
         log_event(
             self.log,
             "job.finish",
@@ -1937,4 +2033,5 @@ class Processor:
             "moved_to": str(moved),
             "text_method": text_method,
             "text_debug": text_debug,
+            "id_in": id_in,
         }

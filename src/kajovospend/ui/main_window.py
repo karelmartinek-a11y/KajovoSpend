@@ -38,6 +38,8 @@ from kajovospend.db.session import make_engine, make_session_factory
 from kajovospend.db.migrate import init_db
 from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem, ImportJob
 from kajovospend.db.queries import upsert_supplier, rebuild_fts_for_document, create_file_record, add_document
+from kajovospend.db.processing_session import create_processing_session_factory
+from kajovospend.db.processing_models import IngestFile
 from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
 from kajovospend.integrations.openai_fallback import (
     OpenAIConfig,
@@ -143,9 +145,7 @@ class TrafficLightDelegate(QStyledItemDelegate):
 
 OPS_STAGE_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("offline", "Offline"),
-    ("openai_primary", "OpenAI prim."),
-    ("openai_fallback", "OpenAI fallback"),
-    ("synthetic", "Syntet."),
+    ("openai_any", "OpenAI"),
 )
 
 
@@ -300,11 +300,18 @@ class TableModel(QAbstractTableModel):
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
         if not index.isValid():
             return None
+        v = self.rows[index.row()][index.column()]
         if role in (Qt.DisplayRole, Qt.EditRole):
-            v = self.rows[index.row()][index.column()]
+            if isinstance(v, dict):
+                v = v.get("color") if role == Qt.DisplayRole else v.get("raw", v.get("color"))
             if isinstance(v, float):
                 return f"{v:,.2f}".replace(",", " ")
             return "" if v is None else str(v)
+        if role == Qt.ToolTipRole:
+            if isinstance(v, dict):
+                return v.get("tooltip") or v.get("raw") or v.get("color") or ""
+            if isinstance(v, str):
+                return v
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
@@ -325,8 +332,8 @@ class EditableItemsModel(QAbstractTableModel):
     COLS = [
         ("name", "Položka"),
         ("quantity", "Množství"),
-        ("unit_price", "Jedn. cena"),
-        ("line_total", "Celkem"),
+        ("unit_price", "Jedn. cena (bez DPH)"),
+        ("line_total", "Celkem (s DPH)"),
         ("vat_rate", "DPH %"),
         ("ean", "EAN"),
         ("item_code", "Kód položky"),
@@ -804,6 +811,15 @@ class MainWindow(QMainWindow):
         self._items_total = 0
         self._items_rows: List[Dict[str, Any]] = []
         self._items_current_path: str | None = None
+        self._items_filter_group_id: int | None = None
+        self._items_filter_group_none: bool = False
+        self._items_filter_vat: float | None = None
+        self._items_filter_ids_receipt: List[int] | None = None
+        self._items_filter_ids_supplier: List[int] | None = None
+        self._items_filter_price_op: str | None = None
+        self._items_filter_price_val: float | None = None
+        self._items_filter_price_min: float | None = None
+        self._items_filter_price_max: float | None = None
 
         # current selections (Účty / NEROZPOZNANÉ)
         self._current_doc_id: int | None = None
@@ -826,6 +842,7 @@ class MainWindow(QMainWindow):
         self.engine = make_engine(str(self.paths.db_path))
         init_db(self.engine)
         self.sf = make_session_factory(self.engine)
+        self.pf = create_processing_session_factory(self.cfg)
         self.processor = Processor(self.cfg, self.paths, self.log)
 
         self.setWindowTitle("KájovoSpend")
@@ -1407,9 +1424,7 @@ class MainWindow(QMainWindow):
         self.ops_table.setShowGrid(True)
         self.ops_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.ops_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.ops_table.setItemDelegateForColumn(0, TrafficLightDelegate(self.ops_table))
-        self.ops_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.ops_table.setColumnWidth(0, 46)
+        self._ops_columns_initialized = False
         ol.addWidget(self.ops_table)
         self.tabs.addTab(self.tab_ops, "PROVOZNÍ PANEL")
 
@@ -1758,6 +1773,34 @@ class MainWindow(QMainWindow):
         stl.addWidget(self.btn_reset_program)
         self.tabs.addTab(self.tab_settings, "NASTAVENÍ")
 
+        # Skupiny položek (správa)
+        self.tab_item_groups = QWidget()
+        gl = QVBoxLayout(self.tab_item_groups)
+        grp_top = QWidget()
+        gtl = QHBoxLayout(grp_top)
+        gtl.setContentsMargins(0, 0, 0, 0)
+        self.groups_table = QTableView()
+        self.groups_table.setAlternatingRowColors(True)
+        self.groups_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.groups_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        gtl.addWidget(self.groups_table, 2)
+
+        grp_form = QWidget()
+        gfl = QFormLayout(grp_form)
+        self.group_name_input = QLineEdit()
+        self.group_color_input = QLineEdit()
+        self.btn_group_save = QPushButton("Uložit / vytvořit")
+        self.btn_group_delete = QPushButton("Smazat")
+        gfl.addRow("Název skupiny", self.group_name_input)
+        gfl.addRow("Barva (volitelné)", self.group_color_input)
+        gfl.addRow(self.btn_group_save)
+        gfl.addRow(self.btn_group_delete)
+        gtl.addWidget(grp_form, 1)
+
+        gl.addWidget(grp_top, 1)
+        self.tab_item_groups.setLayout(gl)
+        self.tabs.addTab(self.tab_item_groups, "SKUPINY POLOŽEK")
+
         # Dodavatelé
         self.tab_suppliers = QWidget()
         spl = QHBoxLayout(self.tab_suppliers)
@@ -1851,7 +1894,7 @@ class MainWindow(QMainWindow):
         items_top_l = QHBoxLayout(items_top)
         items_top_l.setContentsMargins(0, 0, 0, 0)
         self.items_filter = QLineEdit()
-        self.items_filter.setPlaceholderText("Vyhledat v položkách (název, IČO, číslo dokladu...)")
+        self.items_filter.setPlaceholderText("Fulltext: slova = OR, použij AND pro průnik (název, IČO, číslo dokladu...)")
         self.btn_items_search = QPushButton("Hledat")
         self.btn_items_more = QPushButton("Načíst další")
         self.lbl_items_page = QLabel("0 / 0")
@@ -1860,6 +1903,46 @@ class MainWindow(QMainWindow):
         items_top_l.addWidget(self.btn_items_more)
         items_top_l.addWidget(self.lbl_items_page)
         items_layout.addWidget(items_top)
+
+        # Filtry
+        items_filters = QWidget()
+        fl = QHBoxLayout(items_filters)
+        fl.setContentsMargins(0, 0, 0, 0)
+        self.items_group_filter = QComboBox()
+        self.items_group_filter.addItem("Skupina: všechny", None)
+        self.items_group_filter.addItem("Skupina: bez skupiny", "NONE")
+        self.items_vat_filter = QComboBox()
+        self.items_vat_filter.addItem("DPH: všechny", None)
+        for rate in [0, 10, 12, 15, 21]:
+            self.items_vat_filter.addItem(f"DPH {rate} %", float(rate))
+        self.items_price_op = QComboBox()
+        self.items_price_op.addItems(["=", ">", "<", "between"])
+        self.items_price_val = QDoubleSpinBox(); self.items_price_val.setMaximum(1e9); self.items_price_val.setDecimals(4)
+        self.items_price_min = QDoubleSpinBox(); self.items_price_min.setMaximum(1e9); self.items_price_min.setDecimals(4)
+        self.items_price_max = QDoubleSpinBox(); self.items_price_max.setMaximum(1e9); self.items_price_max.setDecimals(4)
+        self.items_price_min.setEnabled(False); self.items_price_max.setEnabled(False)
+        self.items_price_op.currentTextChanged.connect(self._on_price_op_changed)
+        self.items_ids_receipt = QLineEdit(); self.items_ids_receipt.setPlaceholderText("ID účtenek (čárkami)")
+        self.items_ids_supplier = QLineEdit(); self.items_ids_supplier.setPlaceholderText("ID dodavatelů (čárkami)")
+        self.btn_items_select_all = QPushButton("Označit vše (výsledek)")
+        self.btn_items_assign_group = QPushButton("Přiřadit skupinu")
+        self.items_group_assign = QLineEdit(); self.items_group_assign.setPlaceholderText("Název nové/existující skupiny")
+
+        fl.addWidget(self.items_group_filter)
+        fl.addWidget(self.items_vat_filter)
+        fl.addWidget(QLabel("Cena/ks"))
+        fl.addWidget(self.items_price_op)
+        fl.addWidget(self.items_price_val)
+        fl.addWidget(QLabel("od"))
+        fl.addWidget(self.items_price_min)
+        fl.addWidget(QLabel("do"))
+        fl.addWidget(self.items_price_max)
+        fl.addWidget(self.items_ids_receipt)
+        fl.addWidget(self.items_ids_supplier)
+        fl.addWidget(self.btn_items_select_all)
+        fl.addWidget(self.items_group_assign, 1)
+        fl.addWidget(self.btn_items_assign_group)
+        items_layout.addWidget(items_filters)
 
         items_split = QSplitter()
         items_split.setOrientation(Qt.Horizontal)
@@ -1871,7 +1954,7 @@ class MainWindow(QMainWindow):
         self.items_table.setAlternatingRowColors(True)
         self.items_table.setShowGrid(True)
         self.items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.items_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.items_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         il.addWidget(self.items_table, 1)
         items_split.addWidget(items_left)
@@ -2008,6 +2091,22 @@ class MainWindow(QMainWindow):
         self.btn_sup_ares_detail.clicked.connect(self.on_supplier_ares)
         self.sup_table.clicked.connect(self.on_supplier_selected)
 
+        self.btn_items_search.clicked.connect(lambda: self._load_items_page_v2(reset=True))
+        self.btn_items_more.clicked.connect(lambda: self._load_items_page_v2(reset=False))
+        self.items_table.doubleClicked.connect(self._items_open_from_doubleclick_v2)
+        self.items_table.clicked.connect(self._items_selection_changed_v2)
+        self.btn_items_select_all.clicked.connect(self._items_select_all_filtered)
+        self.btn_items_assign_group.clicked.connect(self._items_assign_group_bulk)
+        self.btn_group_save.clicked.connect(self._group_save)
+        self.btn_group_delete.clicked.connect(self._group_delete)
+        self.groups_table.clicked.connect(self._group_row_clicked)
+
+        # Po inicializaci načti skupiny
+        try:
+            self._groups_refresh()
+        except Exception:
+            pass
+
         self.btn_unproc_refresh.clicked.connect(self.refresh_unprocessed)
         self.btn_unproc_save.clicked.connect(self.on_unproc_save_manual)
         self.btn_unproc_item_add.clicked.connect(self._unproc_item_add)
@@ -2101,9 +2200,39 @@ class MainWindow(QMainWindow):
         limit = int(self._items_page_size)
         offset = int(self._items_offset or 0)
 
+        ids_receipt = self._parse_int_list(self.items_ids_receipt.text())
+        ids_supplier = self._parse_int_list(self.items_ids_supplier.text())
+        price_op = self.items_price_op.currentText()
+        if price_op == "between":
+            price_min = float(self.items_price_min.value())
+            price_max = float(self.items_price_max.value())
+            price_val = None
+        else:
+            price_min = None
+            price_max = None
+            price_val = float(self.items_price_val.value())
+        group_choice = self.items_group_filter.currentData()
+        group_id = None if group_choice in (None, "NONE") else group_choice
+        group_none = group_choice == "NONE"
+        vat_choice = self.items_vat_filter.currentData()
+
         with self.sf() as session:
             total = db_api.count_items(session, q=q)
-            rows = db_api.list_items(session, q=q, limit=limit, offset=offset)
+            rows = db_api.list_items(
+                session,
+                q=q,
+                limit=limit,
+                offset=offset,
+                group_id=group_id,
+                group_none=group_none,
+                vat_rate=vat_choice,
+                ids_receipt=ids_receipt,
+                ids_supplier=ids_supplier,
+                price_op=price_op,
+                price_val=price_val,
+                price_min=price_min,
+                price_max=price_max,
+            )
 
         if reset:
             self._items_rows = []
@@ -2111,7 +2240,20 @@ class MainWindow(QMainWindow):
         self._items_total = int(total or 0)
         self._items_offset = len(self._items_rows)
 
-        headers = ["Datum", "Dodavatel", "Položka", "Množství", "DPH %", "Celkem s DPH", "Doklad", "IČO"]
+        headers = [
+            "ID položky",
+            "Název",
+            "Cena/ks bez DPH",
+            "Množství",
+            "ID účtenky",
+            "ID dodavatele",
+            "Skupina",
+            "DPH %",
+            "Celkem s DPH",
+            "Datum",
+            "Doklad",
+            "IČO",
+        ]
         trows = []
         for r in self._items_rows:
             issue = r.get("issue_date")
@@ -2119,14 +2261,27 @@ class MainWindow(QMainWindow):
                 issue_s = issue.strftime("%Y-%m-%d")
             else:
                 issue_s = str(issue or "")
-            supplier = (r.get("supplier_name") or "").strip() or "(neznámý)"
             item_name = (r.get("item_name") or "").strip()
+            unit_net = r.get("unit_price_net")
             qty = r.get("quantity")
             vat = r.get("vat_rate")
-            total_ln = r.get("line_total")
+            total_ln = r.get("line_total_gross")
             dn = (r.get("doc_number") or "").strip()
             ico = (r.get("supplier_ico") or "").strip()
-            trows.append([issue_s, supplier, item_name, qty, vat, total_ln, dn, ico])
+            trows.append([
+                r.get("id_item"),
+                item_name,
+                unit_net,
+                qty,
+                r.get("id_receipt"),
+                r.get("id_supplier"),
+                r.get("group_id") if r.get("group_id") is not None else "",
+                vat,
+                total_ln,
+                issue_s,
+                dn,
+                ico,
+            ])
 
         self.items_table.setModel(TableModel(headers, trows))
         self.items_table.resizeColumnsToContents()
@@ -2156,6 +2311,72 @@ class MainWindow(QMainWindow):
                 pass
         self._items_selection_changed_v2(None, None)
 
+    def _parse_int_list(self, txt: str | None) -> List[int]:
+        out: List[int] = []
+        if not txt:
+            return out
+        for part in str(txt).replace(";", ",").split(","):
+            p = part.strip()
+            if not p:
+                continue
+            try:
+                out.append(int(p))
+            except Exception:
+                pass
+        return out
+
+    def _on_price_op_changed(self, op: str) -> None:
+        is_between = (op or "").lower() == "between"
+        self.items_price_min.setEnabled(is_between)
+        self.items_price_max.setEnabled(is_between)
+        self.items_price_val.setEnabled(not is_between)
+
+    def _items_select_all_filtered(self) -> None:
+        try:
+            m = self.items_table.model()
+            if not m:
+                return
+            self.items_table.selectAll()
+        except Exception:
+            pass
+
+    def _items_assign_group_bulk(self) -> None:
+        try:
+            m = self.items_table.model()
+            sm = self.items_table.selectionModel()
+            if not m or not sm or not sm.hasSelection():
+                QMessageBox.information(self, "Přiřadit skupinu", "Vyberte alespoň jednu položku.")
+                return
+            rows = [int(i.row()) for i in sm.selectedRows()]
+            ids = []
+            for r in rows:
+                try:
+                    ids.append(int(m.index(r, 0).data()))
+                except Exception:
+                    pass
+            if not ids:
+                return
+            group_name = (self.items_group_assign.text() or "").strip()
+            if not group_name:
+                QMessageBox.information(self, "Přiřadit skupinu", "Zadejte název skupiny.")
+                return
+            with self.sf() as session:
+                # ensure group exists
+                gid = None
+                grp = session.execute(text("SELECT id_group FROM item_groups WHERE name = :n"), {"n": group_name}).fetchone()
+                if grp:
+                    gid = int(grp[0])
+                else:
+                    session.execute(text("INSERT INTO item_groups (name) VALUES (:n)"), {"n": group_name})
+                    gid = int(session.execute(text("SELECT last_insert_rowid()")).scalar_one())
+                session.execute(text("UPDATE items SET group_id = :gid WHERE id_item IN :ids"), {"gid": gid, "ids": tuple(ids)})
+                session.commit()
+            self._groups_refresh()
+            self._load_items_page_v2(reset=True)
+            QMessageBox.information(self, "Přiřazeno", f"Přiřazeno {len(ids)} položek do skupiny '{group_name}'.")
+        except Exception as e:
+            QMessageBox.warning(self, "Chyba", f"Přiřazení skupiny selhalo: {e}")
+
     def _items_selection_changed_v2(self, selected, deselected) -> None:
         try:
             sm = self.items_table.selectionModel()
@@ -2167,6 +2388,7 @@ class MainWindow(QMainWindow):
                 self.items_src.setText("")
                 self.lbl_items_doc.setText("")
                 return
+            # použij první pro detail, ale zachovej multiselect pro bulk akce
             row = int(idxs[0].row())
             meta = self._items_rows[row]
         except Exception:
@@ -2185,13 +2407,96 @@ class MainWindow(QMainWindow):
         ico = (meta.get("supplier_ico") or "").strip()
         dn = (meta.get("doc_number") or "").strip()
         doc_total = meta.get("doc_total_with_vat")
-        self.lbl_items_doc.setText(f"{issue_s} | {supplier} | IČO {ico} | Doklad {dn} | Celkem {doc_total}")
+        try:
+            total_txt = f"{float(doc_total or 0.0):,.2f}".replace(",", " ")
+        except Exception:
+            total_txt = str(doc_total or "")
+        self.lbl_items_doc.setText(
+            f"{issue_s} | {supplier} | IČO {ico} | Doklad {dn} | Celkem (s DPH) {total_txt}"
+        )
 
         if path:
             QTimer.singleShot(0, lambda: self._load_preview(self.items_preview, path))
         else:
             self.items_preview.clear()
 
+    def _group_row_clicked(self, index: QModelIndex):
+        try:
+            m = self.groups_table.model()
+            if not m or not index.isValid():
+                return
+            row = int(index.row())
+            gid = m.index(row, 0).data()
+            name = m.index(row, 1).data()
+            color = m.index(row, 2).data()
+            self.group_name_input.setText(str(name or ""))
+            self.group_color_input.setText(str(color or ""))
+        except Exception:
+            pass
+
+    def _group_save(self) -> None:
+        name = (self.group_name_input.text() or "").strip()
+        color = (self.group_color_input.text() or "").strip() or None
+        if not name:
+            QMessageBox.information(self, "Skupina položek", "Zadejte název skupiny.")
+            return
+        try:
+            with self.sf() as session:
+                row = session.execute(text("SELECT id_group FROM item_groups WHERE name = :n"), {"n": name}).fetchone()
+                if row:
+                    gid = int(row[0])
+                    session.execute(text("UPDATE item_groups SET color = :c WHERE id_group = :gid"), {"c": color, "gid": gid})
+                else:
+                    session.execute(text("INSERT INTO item_groups (name, color) VALUES (:n, :c)"), {"n": name, "c": color})
+                session.commit()
+            self._groups_refresh()
+            QMessageBox.information(self, "Skupina položek", "Uloženo.")
+        except Exception as e:
+            QMessageBox.warning(self, "Chyba", f"Uložení skupiny selhalo: {e}")
+
+    def _group_delete(self) -> None:
+        name = (self.group_name_input.text() or "").strip()
+        if not name:
+            QMessageBox.information(self, "Skupina položek", "Vyberte skupinu k odstranění.")
+            return
+        try:
+            with self.sf() as session:
+                row = session.execute(text("SELECT id_group FROM item_groups WHERE name = :n"), {"n": name}).fetchone()
+                if not row:
+                    QMessageBox.information(self, "Skupina položek", "Skupina neexistuje.")
+                    return
+                gid = int(row[0])
+                session.execute(text("DELETE FROM item_groups WHERE id_group = :gid"), {"gid": gid})
+                session.execute(text("UPDATE items SET group_id = NULL WHERE group_id = :gid"), {"gid": gid})
+                session.commit()
+            self.group_name_input.clear()
+            self.group_color_input.clear()
+            self._groups_refresh()
+            QMessageBox.information(self, "Skupina položek", "Skupina smazána a položky odpojeny.")
+        except Exception as e:
+            QMessageBox.warning(self, "Chyba", f"Smazání skupiny selhalo: {e}")
+
+    def _groups_refresh(self) -> None:
+        try:
+            with self.sf() as session:
+                rows = session.execute(text("SELECT id_group, name, COALESCE(color,'') AS color FROM item_groups ORDER BY name")).mappings().all()
+            headers = ["ID", "Název", "Barva"]
+            trows = [[int(r["id_group"]), r["name"], r["color"]] for r in rows]
+            self.groups_table.setModel(TableModel(headers, trows))
+            self.groups_table.resizeColumnsToContents()
+            # refresh combo pro položky
+            self.items_group_filter.blockSignals(True)
+            self.items_group_filter.clear()
+            self.items_group_filter.addItem("Skupina: všechny", None)
+            self.items_group_filter.addItem("Skupina: bez skupiny", "NONE")
+            for r in rows:
+                self.items_group_filter.addItem(f"{r['name']} (ID {r['id_group']})", int(r["id_group"]))
+            self.items_group_filter.blockSignals(False)
+        except Exception as e:
+            try:
+                self.log.warning("groups_refresh failed: %s", e)
+            except Exception:
+                pass
     def _items_open_selected_v2(self) -> None:
         self._open_file_path(self._items_current_path)
 
@@ -3347,6 +3652,19 @@ class MainWindow(QMainWindow):
 
         _SilentRunner.run(self, fn, ok, err, timeout_ms=120_000)
 
+    def _open_ops_file(self, path: str | None) -> None:
+        """Otevře soubor asociovanou aplikací OS (best-effort)."""
+        if not path:
+            return
+        p = Path(path)
+        if not p.exists():
+            QMessageBox.warning(self, "Soubor nenalezen", f"Soubor {p} neexistuje.")
+            return
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+        except Exception as e:
+            QMessageBox.warning(self, "Nelze otevřít", f"Soubor se nepodařilo otevřít: {e}")
+
     def refresh_suppliers(self):
         q = self.sup_filter.text()
         try:
@@ -3690,7 +4008,7 @@ class MainWindow(QMainWindow):
         shown = min(self._doc_offset + len(docs), self._doc_total)
         self.lbl_docs_page.setText(f"{shown} / {self._doc_total}")
 
-        headers = ["ID", "Datum", "IČO", "Číslo", "Účet", "Celkem", "Měna", "Kontrola"]
+        headers = ["ID", "Datum", "IČO", "Číslo", "Účet", "Celkem vč. DPH", "Měna", "Kontrola"]
         new_rows: List[List[Any]] = []
         for d, f in docs:
             new_rows.append([
@@ -3774,7 +4092,7 @@ class MainWindow(QMainWindow):
         src = f.current_path if f else ""
         self.doc_src_line.setText(src or "")
 
-        item_headers = ["#", "Název", "Množství", "DPH", "Cena"]
+        item_headers = ["#", "Název", "Množství", "DPH %", "Cena (s DPH)"]
         item_rows: List[List[Any]] = []
         for it in items:
             item_rows.append([it.line_no, it.name, it.quantity, it.vat_rate, it.line_total])
@@ -3799,75 +4117,29 @@ class MainWindow(QMainWindow):
     def refresh_unprocessed(self):
         """Seznam karanténních souborů (FS + DB), řádek = jeden soubor."""
         try:
-            exts = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
-            paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
-            out_base = Path(paths_cfg.get("output_dir", "") or "")
-            qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
+            with self.pf() as ps:
+                recs = ps.query(IngestFile).order_by(IngestFile.created_at.desc()).all()
 
-            fs_rows = []
-            if qdir.exists():
-                for p in qdir.rglob("*"):
-                    if p.is_file() and p.suffix.lower() in exts:
-                        st = p.stat()
-                        fs_rows.append({
-                            "path": str(p),
-                            "file_id": None,
-                            "size": st.st_size,
-                            "mtime": dt.datetime.fromtimestamp(st.st_mtime),
-                            "source": "FS",
-                        })
-
-            with self.sf() as session:
-                db_files = session.execute(
-                    select(DocumentFile).where(DocumentFile.status == "QUARANTINE").order_by(DocumentFile.created_at.desc())
-                ).scalars().all()
-                db_rows = []
-                for f in db_files:
-                    p = Path(f.current_path or f.original_name or "")
-                    st = None
-                    try:
-                        if p.exists():
-                            st = p.stat()
-                        elif qdir.joinpath(p.name).exists():
-                            p = qdir.joinpath(p.name)
-                            st = p.stat()
-                    except Exception:
-                        st = None
-                    db_rows.append({
-                        "path": str(p),
-                        "file_id": int(f.id),
-                        "size": st.st_size if st else None,
-                        "mtime": dt.datetime.fromtimestamp(st.st_mtime) if st else f.created_at,
-                        "source": "DB",
-                    })
-
-            # merge by path/name to avoid dup rows
-            by_name = {}
-            for r in fs_rows + db_rows:
-                key = Path(r["path"]).name
-                by_name[key] = r
-            self._unproc_rows = list(by_name.values())
-
+            self._unproc_rows = []
             table_rows = []
-            for r in self._unproc_rows:
-                size = r.get("size")
-                if size is None:
-                    size_txt = ""
-                else:
-                    size_txt = f"{size/1024.0:.0f} KB" if size < 1024*1024 else f"{size/1024/1024:.2f} MB"
-                mtime = r.get("mtime")
-                mtime_txt = mtime.isoformat(sep=" ", timespec="seconds") if hasattr(mtime, "isoformat") else ""
+            for r in recs:
+                size = r.size
+                size_txt = "" if size is None else (f"{size/1024.0:.0f} KB" if size < 1024 * 1024 else f"{size/1024/1024:.2f} MB")
+                mtime = r.mtime
+                mtime_txt = mtime.isoformat(sep=" ", timespec="seconds") if mtime else ""
+                path_cur = r.path_current or r.path_original or ""
                 table_rows.append([
-                    "🔴",
-                    Path(r["path"]).name,
+                    int(r.id_in),
+                    str(r.status or ""),
+                    Path(path_cur).name,
                     size_txt,
                     mtime_txt,
-                    r.get("source") or "",
-                    r.get("file_id"),
-                    r.get("path"),
+                    "processing",
+                    path_cur,
                 ])
+                self._unproc_rows.append({"id_in": int(r.id_in), "path": path_cur})
 
-            headers = ["Stav", "Soubor", "Velikost", "Čas", "Zdroj", "file_id", "path"]
+            headers = ["ID_IN", "Stav", "Soubor", "Velikost", "Čas", "Zdroj", "path"]
             self.unproc_table.setModel(TableModel(headers, table_rows))
             self.unproc_table.resizeColumnsToContents()
             # auto-select first
@@ -3996,18 +4268,20 @@ class MainWindow(QMainWindow):
         qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
         ddir = out_base / paths_cfg.get("duplicate_dir_name", "DUPLICITY")
 
+        meta_paths: List[str] = []
+
         for f in files:
             status = (f.status or "").upper()
             if status == "PROCESSED":
-                light = "green"; result = "Kompletně vytěženo"
+                light = "green"; result = {"color": "green", "tooltip": "Kompletně vytěženo"}
             elif status == "DUPLICATE":
-                light = "red"; result = "Duplicita"
+                light = "red"; result = {"color": "red", "tooltip": "Duplicita"}
             elif status == "QUARANTINE":
-                light = "red"; result = "Karanténa (nekompletní)"
+                light = "red"; result = {"color": "red", "tooltip": "Karanténa (nekompletní)"}
             elif status == "ERROR":
-                light = "red"; result = "Chyba"
+                light = "red"; result = {"color": "red", "tooltip": "Chyba"}
             else:
-                light = "orange"; result = status or "-"
+                light = "orange"; result = {"color": "orange", "tooltip": status or "-"}
 
             size = ""
             mtime = ""
@@ -4028,49 +4302,58 @@ class MainWindow(QMainWindow):
                 pass
 
             # statusy per-stage
-            stage_colors: Dict[str, str] = {}
+            stage_colors: Dict[str, Dict[str, str]] = {}
             try:
                 docs = list(f.documents or [])
             except Exception:
                 docs = []
             stage_used: Dict[str, bool] = {code: False for code, _ in OPS_STAGE_COLUMNS}
-            synthetic_used = False
             for d in docs:
                 method = str(getattr(d, "extraction_method", "") or "").lower()
-                rr = (getattr(d, "review_reasons", "") or "").lower()
-                if "syntet" in rr:
-                    synthetic_used = True
                 if method in ("offline", "pdf_hybrid", "image_ocr", "offline_ensemble", "structured_pdf_attachment"):
                     stage_used["offline"] = True
-                if method in ("openai_primary", "openai_only"):
-                    stage_used["openai_primary"] = True
-                if method == "openai_fallback":
-                    stage_used["openai_fallback"] = True
-            stage_used["synthetic"] = synthetic_used
+                if method.startswith("openai"):
+                    stage_used["openai_any"] = True
 
             for code, _label in OPS_STAGE_COLUMNS:
                 if not stage_used.get(code):
-                    stage_colors[code] = ""
+                    stage_colors[code] = {"color": "", "tooltip": "Nespuštěno"}
                 else:
-                    stage_colors[code] = "green" if status == "PROCESSED" else "red"
+                    stage_colors[code] = {
+                        "color": "green" if status == "PROCESSED" else "red",
+                        "tooltip": "OK" if status == "PROCESSED" else "Zastaveno",
+                    }
 
             rows.append(
                 [
+                    int(getattr(f, "id", -1)),
                     light,
-                    f.processed_at.isoformat(sep=" ", timespec="seconds") if getattr(f, "processed_at", None) else "",
                     f.original_name or "",
-                    f.current_path or "",
+                    mtime,
                     size,
                     status,
-                    result if not f.last_error else f.last_error,
-                    *[stage_colors.get(code, "") for code, _ in OPS_STAGE_COLUMNS],
+                    result if not f.last_error else {"color": "red", "tooltip": f.last_error},
+                    *[stage_colors.get(code, {"color": ""}) for code, _ in OPS_STAGE_COLUMNS],
                     "offline_retry",
                     "openai_retry",
                 ]
             )
             meta_ids.append(int(getattr(f, "id", -1)))
+            meta_paths.append(str(f.current_path or f.original_name or ""))
 
-        headers = ["", "Zpracováno", "Soubor", "Cesta", "Velikost", "Status", "Výsledek / chyba"] + [label for _c, label in OPS_STAGE_COLUMNS] + ["Zopakovat offline", "Zopakovat OpenAI"]
+        headers = [
+            "#",
+            "Semafor",
+            "Soubor",
+            "Poslední změna",
+            "Velikost",
+            "Status",
+            "Výsledek",
+            *[label for _c, label in OPS_STAGE_COLUMNS],
+            "Zopakovat offline",
+            "Zopakovat OpenAI",
+            "Otevřít",
+        ]
         snapshot: Tuple[Tuple[str, ...], ...] = tuple(tuple(str(x) for x in r) for r in rows)
         if snapshot == getattr(self, "_ops_last_snapshot", None):
             return
@@ -4078,36 +4361,63 @@ class MainWindow(QMainWindow):
 
         self.ops_table.setModel(TableModel(headers, rows))
         # traffic lights pro status a per-stage sloupce
-        self.ops_table.setItemDelegateForColumn(0, TrafficLightDelegate(self.ops_table))
+        self.ops_table.setItemDelegateForColumn(1, TrafficLightDelegate(self.ops_table))
+        self.ops_table.setItemDelegateForColumn(6, TrafficLightDelegate(self.ops_table))
         base = 7
         for i, _ in enumerate(OPS_STAGE_COLUMNS):
             self.ops_table.setItemDelegateForColumn(base + i, TrafficLightDelegate(self.ops_table))
-            try:
-                self.ops_table.horizontalHeader().setSectionResizeMode(base + i, QHeaderView.ResizeToContents)
-            except Exception:
-                pass
         try:
-            self.ops_table.horizontalHeader().setSectionResizeMode(len(headers) - 2, QHeaderView.ResizeToContents)
-            self.ops_table.horizontalHeader().setSectionResizeMode(len(headers) - 1, QHeaderView.ResizeToContents)
+            hh = self.ops_table.horizontalHeader()
+            hh.setSectionResizeMode(QHeaderView.Interactive)
+            if not getattr(self, "_ops_columns_initialized", False):
+                defaults = {
+                    0: 70,   # ID
+                    1: 46,   # semafor
+                    2: 260,  # soubor
+                    3: 170,  # poslední změna
+                    4: 90,   # velikost
+                    5: 110,  # status
+                    6: 120,  # výsledek
+                    7: 80,   # offline
+                    8: 80,   # openai
+                    9: 110,  # zopakovat offline
+                    10: 120, # zopakovat openai
+                    11: 90,  # otevřít
+                }
+                for col, width in defaults.items():
+                    try:
+                        hh.resizeSection(col, width)
+                    except Exception:
+                        pass
+                self._ops_columns_initialized = True
+            hh.setSectionResizeMode(len(headers) - 3, QHeaderView.ResizeToContents)
+            hh.setSectionResizeMode(len(headers) - 2, QHeaderView.ResizeToContents)
+            hh.setSectionResizeMode(len(headers) - 1, QHeaderView.ResizeToContents)
         except Exception:
             pass
         # akční tlačítka
         try:
             model = self.ops_table.model()
             if model:
-                off_col = len(headers) - 2
-                on_col = len(headers) - 1
+                off_col = len(headers) - 3
+                on_col = len(headers) - 2
+                open_col = len(headers) - 1
                 for r_idx, file_id in enumerate(meta_ids):
                     idx_off = model.index(r_idx, off_col)
                     idx_on = model.index(r_idx, on_col)
+                    idx_open = model.index(r_idx, open_col)
                     btn_off = QPushButton("Offline")
                     btn_on = QPushButton("OpenAI")
+                    btn_open = QPushButton("Otevřít")
                     btn_off.setProperty("file_id", file_id)
                     btn_on.setProperty("file_id", file_id)
+                    btn_open.setProperty("file_path", meta_paths[r_idx] if r_idx < len(meta_paths) else "")
                     btn_off.clicked.connect(lambda _=None, fid=file_id: self._retry_extract(fid, use_openai=False))
                     btn_on.clicked.connect(lambda _=None, fid=file_id: self._retry_extract(fid, use_openai=True))
+                    btn_open.clicked.connect(lambda _=None, p=btn_open.property("file_path"): self._open_ops_file(p))
                     self.ops_table.setIndexWidget(idx_off, btn_off)
                     self.ops_table.setIndexWidget(idx_on, btn_on)
+                    self.ops_table.setIndexWidget(idx_open, btn_open)
         except Exception:
             pass
         try:
@@ -4124,7 +4434,7 @@ class MainWindow(QMainWindow):
                 return
             row = int(index.row())
             meta = {
-                "file_id": model.rows[row][5] if hasattr(model, "rows") else None,
+                "file_id": None,
                 "path": model.rows[row][6] if hasattr(model, "rows") else None,
             }
             self._current_unproc = meta

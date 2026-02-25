@@ -13,6 +13,8 @@ from sqlalchemy import select
 
 from kajovospend.db.models import ImportJob, ServiceState
 from kajovospend.db.queries import update_service_state, queue_size
+from kajovospend.db.processing_session import create_processing_session_factory
+from kajovospend.db.processing_models import IngestFile
 from kajovospend.service.watcher import DirectoryWatcher
 from kajovospend.service.processor import Processor, safe_move
 
@@ -21,6 +23,7 @@ class ServiceApp:
     def __init__(self, cfg: Dict[str, Any], session_factory, paths, logger):
         self.cfg = cfg
         self.sf = session_factory
+        self.pf = create_processing_session_factory(cfg)
         self.paths = paths
         self.log = logger
         self._stop = threading.Event()
@@ -33,6 +36,15 @@ class ServiceApp:
         self._processor = Processor(cfg, paths, logger)
         self._supported_ext = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
+        # Tvrdá stěna: po startu přesunout doklady bez dodavatele do karantény (fyzicky)
+        try:
+            self._quarantine_missing_suppliers()
+        except Exception as exc:
+            try:
+                self.log.warning("Quarantine enforcement failed: %s", exc)
+            except Exception:
+                pass
+
     def _drop_future(self, fut: Future) -> None:
         # callback runs in worker thread; keep it tiny and safe
         try:
@@ -42,6 +54,34 @@ class ServiceApp:
             # never let bookkeeping crash service threads
             pass
 
+    def _quarantine_missing_suppliers(self) -> None:
+        """Přesuň fyzicky soubory, jejichž doklady nemají dodavatele, do karantény."""
+        out_base = Path(self.cfg["paths"]["output_dir"])
+        qdir = out_base / self.cfg["paths"].get("quarantine_dir_name", "KARANTENA")
+        qdir.mkdir(parents=True, exist_ok=True)
+        with self.sf() as session:
+            rows = session.execute(
+                text(
+                    """
+                    SELECT DISTINCT f.id AS file_id, f.current_path AS path
+                    FROM files f
+                    JOIN documents d ON d.file_id = f.id
+                    WHERE (d.supplier_id IS NULL OR d.supplier_ico IS NULL OR TRIM(COALESCE(d.supplier_ico,''))='')
+                """
+                )
+            ).fetchall()
+            for file_id, pth in rows:
+                try:
+                    src = Path(pth or "")
+                    moved = safe_move(src, qdir, src.name)
+                    session.execute(
+                        text("UPDATE files SET status='QUARANTINE', current_path=:p WHERE id=:fid"),
+                        {"p": str(moved), "fid": file_id},
+                    )
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    continue
     def _inflight_count(self) -> int:
         with self._inflight_lock:
             # prune done futures (in case callback didn't run for any reason)
@@ -92,12 +132,26 @@ class ServiceApp:
         time.sleep(0.2)
         if self._stop.is_set():
             return
+        # Nejprve registruj ve zpracovatelské DB a získej stabilní ID_IN.
+        id_in = None
+        try:
+            with self.pf() as ps:
+                ingest = IngestFile.from_path(p, status="QUEUED")
+                ps.add(ingest)
+                ps.flush()
+                id_in = int(ingest.id_in)
+                ps.commit()
+        except Exception as exc:
+            try:
+                self.log.exception("Nelze zapsat ingest_files: %s", exc)
+            except Exception:
+                pass
         with self.sf() as session:
             # if already queued for this path and not finished, skip
             existing = session.execute(select(ImportJob).where(ImportJob.path == str(p), ImportJob.status.in_(["QUEUED", "RUNNING"])) ).scalar_one_or_none()
             if existing:
                 return
-            job = ImportJob(path=str(p), status="QUEUED")
+            job = ImportJob(path=str(p), status="QUEUED", processing_id_in=id_in)
             session.add(job)
             session.commit()
             try:
@@ -151,6 +205,7 @@ class ServiceApp:
             if not job:
                 return
             p = Path(job.path)
+            id_in = int(job.processing_id_in or 0) if job.processing_id_in else None
             try:
                 # best-effort "current job" observability
                 try:
@@ -175,7 +230,7 @@ class ServiceApp:
                     job.status = "ERROR"
                     job.error = "file_missing"
                 else:
-                    res = self._processor.process_path(session, p, job_id=int(job.id))
+                    res = self._processor.process_path(session, p, job_id=int(job.id), id_in=id_in)
                     job.sha256 = res.get("sha256")
                     job.status = res.get("status")
                     job.error = None

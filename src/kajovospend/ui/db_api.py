@@ -495,16 +495,51 @@ def count_items(session: Session, q: str = "") -> int:
         return 0
 
 
+def _parse_fulltext(query: str) -> tuple[str, Dict[str, Any]]:
+    """
+    Převod dotazu na MATCH syntaxi s podporou 'AND'. Výchozí je OR mezi slovy.
+    Příklad: "mléko AND bio" -> '(mléko) AND (bio)'
+    """
+    q = (query or "").strip()
+    if not q:
+        return "", {}
+    tokens = q.split()
+    parts = []
+    buf = []
+    use_and = False
+    for t in tokens:
+        if t.upper() == "AND":
+            use_and = True
+            continue
+        buf.append(t)
+    if use_and:
+        parts = [f'({t})' for t in buf]
+        match = " AND ".join(parts)
+    else:
+        match = " ".join(buf)
+    return match, {}
+
+
 def list_items(
     session: Session,
     q: str = "",
     *,
     limit: int | None = None,
     offset: int = 0,
+    group_id: int | None = None,
+    group_none: bool = False,
+    vat_rate: float | None = None,
+    ids_receipt: List[int] | None = None,
+    ids_supplier: List[int] | None = None,
+    price_op: str | None = None,
+    price_val: float | None = None,
+    price_min: float | None = None,
+    price_max: float | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Paginated list of line items for UI tab "POLOŽKY".
-    Returns dict rows with doc context + file path (for preview/open).
+    - fulltext: default OR mezi slovy, explicitní AND kombinuje termy.
+    - filtry: group_id / bez skupiny, DPH, ID_Uctenky, ID_Dodavatele, cena (=,>,<,between).
     """
     try:
         q = (q or "").strip()
@@ -515,109 +550,112 @@ def list_items(
             params["lim"] = int(limit)
             params["off"] = int(offset or 0)
 
+        where = ["f.status != 'QUARANTINE'"]
+
+        # Skupiny
+        if group_id is not None:
+            where.append("i.group_id = :gid")
+            params["gid"] = int(group_id)
+        if group_none:
+            where.append("(i.group_id IS NULL)")
+
+        # DPH filtr
+        if vat_rate is not None:
+            where.append("COALESCE(i.vat_rate,0) = :vat")
+            params["vat"] = float(vat_rate)
+
+        # ID účtenek
+        if ids_receipt:
+            where.append("i.id_receipt IN :idr")
+            params["idr"] = tuple(int(x) for x in ids_receipt)
+
+        # ID dodavatelů
+        if ids_supplier:
+            where.append("i.id_supplier IN :idsup")
+            params["idsup"] = tuple(int(x) for x in ids_supplier)
+
+        # Cena/ks bez DPH (použijeme unit_price_net fallback z line_total_net/qty)
+        price_expr = "COALESCE(i.unit_price_net, CASE WHEN i.quantity IS NOT NULL AND i.quantity != 0 THEN i.line_total_net / i.quantity ELSE NULL END)"
+        if price_op in ("eq", "=") and price_val is not None:
+            where.append(f"{price_expr} = :pval")
+            params["pval"] = float(price_val)
+        elif price_op in (">", "gt") and price_val is not None:
+            where.append(f"{price_expr} > :pval")
+            params["pval"] = float(price_val)
+        elif price_op in ("<", "lt") and price_val is not None:
+            where.append(f"{price_expr} < :pval")
+            params["pval"] = float(price_val)
+        elif price_op in ("between", "range") and price_min is not None and price_max is not None:
+            where.append(f"{price_expr} BETWEEN :pmin AND :pmax")
+            params["pmin"] = float(price_min)
+            params["pmax"] = float(price_max)
+
+        where_sql = " AND ".join(where) if where else "1=1"
+
+        # fulltext
         if q:
             _ensure_items_fts2_populated(session)
+            match, extra = _parse_fulltext(q)
+            params.update(extra)
             try:
                 sql_ids = f"""
                 WITH hits AS (
                   SELECT item_id, bm25(items_fts2) AS rank
                   FROM items_fts2
-                  WHERE items_fts2 MATCH :q
+                  WHERE items_fts2 MATCH :match
                 )
                 SELECT item_id
                 FROM hits
                 ORDER BY rank ASC
                 {lim_sql}
                 """
-                params2 = dict(params)
-                params2["q"] = q
-                rows = session.execute(text(sql_ids), params2).fetchall()
+                params_ids = dict(params)
+                params_ids["match"] = match
+                rows = session.execute(text(sql_ids), params_ids).fetchall()
                 ids = [int(r.item_id) for r in rows]
                 if not ids:
                     return []
-
-                sql = """
-                SELECT
-                  i.id            AS item_id,
-                  i.document_id   AS document_id,
-                  i.line_no       AS line_no,
-                  i.name          AS item_name,
-                  i.quantity      AS quantity,
-                  i.vat_rate      AS vat_rate,
-                  i.line_total    AS line_total,
-                  d.issue_date    AS issue_date,
-                  d.total_with_vat AS doc_total_with_vat,
-                  d.doc_number    AS doc_number,
-                  d.supplier_ico  AS supplier_ico,
-                  s.name          AS supplier_name,
-                  f.current_path  AS current_path
-                FROM items i
-                JOIN documents d ON d.id = i.document_id
-                JOIN files f ON f.id = d.file_id
-                LEFT JOIN suppliers s ON s.id = d.supplier_id
-                WHERE i.id IN :ids
-                  AND f.status != 'QUARANTINE'
-                """
-                rows2 = session.execute(text(sql), {"ids": tuple(ids)}).mappings().all()
-                by_id = {int(r["item_id"]): dict(r) for r in rows2}
-                return [by_id[i] for i in ids if i in by_id]
+                params["ids"] = tuple(ids)
+                where_sql_ids = where_sql + " AND i.id IN :ids"
             except Exception:
-                # Fallback to LIKE search
-                qq = f"%{q}%"
-                sql = f"""
-                SELECT
-                  i.id            AS item_id,
-                  i.document_id   AS document_id,
-                  i.line_no       AS line_no,
-                  i.name          AS item_name,
-                  i.quantity      AS quantity,
-                  i.vat_rate      AS vat_rate,
-                  i.line_total    AS line_total,
-                  d.issue_date    AS issue_date,
-                  d.total_with_vat AS doc_total_with_vat,
-                  d.doc_number    AS doc_number,
-                  d.supplier_ico  AS supplier_ico,
-                  s.name          AS supplier_name,
-                  f.current_path  AS current_path
-                FROM items i
-                JOIN documents d ON d.id = i.document_id
-                JOIN files f ON f.id = d.file_id
-                LEFT JOIN suppliers s ON s.id = d.supplier_id
-                WHERE f.status != 'QUARANTINE'
-                  AND (i.name LIKE :qq OR d.supplier_ico LIKE :qq OR d.doc_number LIKE :qq)
-                ORDER BY d.issue_date DESC NULLS LAST, d.id DESC, i.line_no ASC
-                {lim_sql}
-                """
-                params2 = dict(params)
-                params2["qq"] = qq
-                return [dict(r) for r in session.execute(text(sql), params2).mappings().all()]
+                # fallback LIKE
+                like = f"%{q}%"
+                where_sql_ids = where_sql + " AND (i.name LIKE :like OR d.supplier_ico LIKE :like OR d.doc_number LIKE :like)"
+                params["like"] = like
+            where_sql_final = where_sql_ids
+        else:
+            where_sql_final = where_sql
 
         sql = f"""
         SELECT
-          i.id            AS item_id,
-          i.document_id   AS document_id,
-          i.line_no       AS line_no,
-          i.name          AS item_name,
-          i.quantity      AS quantity,
-          i.vat_rate      AS vat_rate,
-          i.line_total    AS line_total,
-          d.issue_date    AS issue_date,
+          i.id_item      AS id_item,
+          i.id_receipt   AS id_receipt,
+          i.id_supplier  AS id_supplier,
+          i.document_id  AS document_id,
+          i.line_no      AS line_no,
+          i.name         AS item_name,
+          i.quantity     AS quantity,
+          i.vat_rate     AS vat_rate,
+          i.unit_price_net AS unit_price_net,
+          i.line_total_net AS line_total_net,
+          i.line_total    AS line_total_gross,
+          i.group_id     AS group_id,
+          d.issue_date   AS issue_date,
           d.total_with_vat AS doc_total_with_vat,
-          d.doc_number    AS doc_number,
-          d.supplier_ico  AS supplier_ico,
-          s.name          AS supplier_name,
-          f.current_path  AS current_path
+          d.doc_number   AS doc_number,
+          d.supplier_ico AS supplier_ico,
+          s.name         AS supplier_name,
+          f.current_path AS current_path
         FROM items i
         JOIN documents d ON d.id = i.document_id
         JOIN files f ON f.id = d.file_id
         LEFT JOIN suppliers s ON s.id = d.supplier_id
-        WHERE f.status != 'QUARANTINE'
+        WHERE {where_sql_final}
         ORDER BY d.issue_date DESC NULLS LAST, d.id DESC, i.line_no ASC
         {lim_sql}
         """
         return [dict(r) for r in session.execute(text(sql), params).mappings().all()]
     except OperationalError:
-        # DB not initialized yet; avoid breaking GUI.
         return []
 
 
