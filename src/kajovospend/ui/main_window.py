@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import copy
 import datetime as dt
+
+from kajovospend.utils.time import utc_now_naive
 import os
 import threading
 from io import BytesIO
@@ -551,14 +553,14 @@ class _ImportWorker(QObject):
                 self.progress.emit(f"Zpracovávám {i}/{total}: {p.name}")
                 try:
                     with self.sf() as session:
-                        job = ImportJob(path=str(p), status="RUNNING", started_at=dt.datetime.utcnow())
+                        job = ImportJob(path=str(p), status="RUNNING", started_at=utc_now_naive())
                         session.add(job)
                         session.commit()
 
                         res = self.processor.process_path(session, p, status_cb=self.progress.emit, job_id=int(job.id))
                         job.sha256 = res.get("sha256")
                         job.status = str(res.get("status") or "DONE")
-                        job.finished_at = dt.datetime.utcnow()
+                        job.finished_at = utc_now_naive()
                         session.add(job)
                         session.commit()
                         imported += 1
@@ -568,8 +570,8 @@ class _ImportWorker(QObject):
                             job = ImportJob(
                                 path=str(p),
                                 status="ERROR",
-                                started_at=dt.datetime.utcnow(),
-                                finished_at=dt.datetime.utcnow(),
+                                started_at=utc_now_naive(),
+                                finished_at=utc_now_naive(),
                                 error=str(e),
                             )
                             session.add(job)
@@ -2844,7 +2846,7 @@ class MainWindow(QMainWindow):
         """Zachováno kvůli zpětné kompatibilitě, aktuálně se nepoužívá."""
         return
 
-    def _on_unrec_selected_v2(self, index: QModelIndex) -> None:  # pragma: no cover - legacy stub
+    def _on_unrec_selected_v2(self, index: QModelIndex) -> None:  # pragma: no cover - zachovana kompatibilita
         return
 
     def _render_pdf_preview_bytes(self, path: Path, dpi: int = 160) -> bytes | None:
@@ -4586,7 +4588,7 @@ class MainWindow(QMainWindow):
             moved = safe_move(path, out_base, path.name)
             file_rec.current_path = str(moved)
             file_rec.status = "PROCESSED"
-            file_rec.processed_at = dt.datetime.utcnow()
+            file_rec.processed_at = utc_now_naive()
             session.add(file_rec)
             session.add(doc)
             rebuild_fts_for_document(session, doc.id, full_text="\n".join([r.get("name","") for r in items_rows]))

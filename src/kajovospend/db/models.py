@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+
+from kajovospend.utils.time import utc_now_naive
 from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from typing import List
@@ -43,7 +45,7 @@ class DocumentFile(Base):
     current_path: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(24), index=True)  # NEW/PROCESSED/QUARANTINE/DUPLICATE/ERROR
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utc_now_naive)
     processed_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     # one file can contain multiple documents (e.g., multiple receipts in one PDF)
@@ -81,8 +83,8 @@ class Document(Base):
     requires_review: Mapped[bool] = mapped_column(Boolean, default=False)
     review_reasons: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utc_now_naive)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
 
     file: Mapped[DocumentFile] = relationship(back_populates="documents")
     supplier: Mapped[Supplier | None] = relationship(back_populates="documents")
@@ -152,7 +154,7 @@ class ImportJob(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     processing_id_in: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utc_now_naive)
     started_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
