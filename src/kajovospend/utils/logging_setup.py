@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
+import platform
+import socket
+import sys
 import threading
+import traceback
 from collections import deque
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+
+import faulthandler
 
 if os.name == "nt":
     import msvcrt  # type: ignore
@@ -162,6 +171,97 @@ class LineCappedFileHandler(logging.Handler):
 
 _ROOT_CONFIGURED = False
 _ROOT_CONFIG_LOCK = threading.Lock()
+_FORENSIC_HOOKS_INSTALLED = False
+_FAULT_HANDLER_STREAM = None
+
+
+class ForensicContextFilter(logging.Filter):
+    """Doplní do každého záznamu detailní forenzní metadata."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._hostname = socket.gethostname()
+        self._platform = platform.platform(terse=False)
+        self._python = sys.version.replace("\n", " ").strip()
+        self._user = os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.hostname = self._hostname
+        record.platform = self._platform
+        record.python = self._python
+        record.user = self._user
+        record.cwd = os.getcwd()
+        return True
+
+
+class JsonLineFormatter(logging.Formatter):
+    """Serializuje log record do JSONL pro strojové forenzní čtení."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "funcName": record.funcName,
+            "line": record.lineno,
+            "pathname": record.pathname,
+            "process": record.process,
+            "processName": record.processName,
+            "thread": record.thread,
+            "threadName": record.threadName,
+            "hostname": getattr(record, "hostname", None),
+            "user": getattr(record, "user", None),
+            "cwd": getattr(record, "cwd", None),
+            "platform": getattr(record, "platform", None),
+            "python": getattr(record, "python", None),
+        }
+
+        if record.exc_info:
+            payload["exception"] = "".join(traceback.format_exception(*record.exc_info))
+
+        if record.stack_info:
+            payload["stack"] = record.stack_info
+
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _install_forensic_runtime_hooks(log: logging.Logger, log_dir: Path) -> None:
+    global _FAULT_HANDLER_STREAM
+    global _FORENSIC_HOOKS_INSTALLED
+    if _FORENSIC_HOOKS_INSTALLED:
+        return
+
+    _FORENSIC_HOOKS_INSTALLED = True
+
+    def _sys_excepthook(exc_type, exc, tb):
+        log.critical("Nezachycená výjimka v hlavním vlákně", exc_info=(exc_type, exc, tb))
+
+    def _threading_excepthook(args: threading.ExceptHookArgs) -> None:
+        log.critical(
+            "Nezachycená výjimka ve vlákně name=%s ident=%s",
+            getattr(args.thread, "name", "unknown"),
+            getattr(args.thread, "ident", "unknown"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _sys_excepthook
+    threading.excepthook = _threading_excepthook
+    logging.captureWarnings(True)
+
+    try:
+        crash_file = log_dir / "kajovospend_faulthandler.log"
+        _FAULT_HANDLER_STREAM = open(crash_file, "a", encoding="utf-8", errors="backslashreplace")
+        faulthandler.enable(_FAULT_HANDLER_STREAM, all_threads=True)
+    except Exception:
+        log.exception("Nepodařilo se aktivovat faulthandler")
+
+    log.info(
+        "Forenzní runtime hooky aktivní; cmdline=%s env_debug=%s",
+        sys.argv,
+        os.environ.get("KAJOVOSPEND_DEBUG", ""),
+    )
 
 
 def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
@@ -189,19 +289,31 @@ def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
             fmt = logging.Formatter(
                 "%(asctime)s.%(msecs)03d %(levelname)s "
                 "pid=%(process)d tid=%(threadName)s "
+                "host=%(hostname)s user=%(user)s "
                 "[%(name)s:%(funcName)s:%(lineno)d] %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             )
 
+            forensic_filter = ForensicContextFilter()
+
             fh = LineCappedFileHandler(log_file, max_lines=max_lines, encoding="utf-8")
             fh.setLevel(logging.DEBUG)
             fh.setFormatter(fmt)
+            fh.addFilter(forensic_filter)
             root.addHandler(fh)
+
+            forensic_file = log_dir / "kajovospend_forensic.jsonl"
+            fh_json = LineCappedFileHandler(forensic_file, max_lines=max_lines * 2, encoding="utf-8")
+            fh_json.setLevel(logging.DEBUG)
+            fh_json.setFormatter(JsonLineFormatter())
+            fh_json.addFilter(forensic_filter)
+            root.addHandler(fh_json)
 
             if os.environ.get("KAJOVOSPEND_LOG_CONSOLE", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
                 ch = logging.StreamHandler()
                 ch.setLevel(logging.DEBUG)
                 ch.setFormatter(fmt)
+                ch.addFilter(forensic_filter)
                 root.addHandler(ch)
 
             _ROOT_CONFIGURED = True
@@ -209,4 +321,11 @@ def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
     # let everything propagate into the single root handler
     logger.setLevel(logging.DEBUG)
     logger.propagate = True
+    _install_forensic_runtime_hooks(logger, log_dir)
+    logger.info(
+        "Logging inicializován: log_dir=%s pid=%s ppid=%s",
+        log_dir,
+        os.getpid(),
+        os.getppid() if hasattr(os, "getppid") else "n/a",
+    )
     return logger
