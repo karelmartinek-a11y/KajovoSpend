@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -44,6 +45,10 @@ _MODEL_PREFER_FALLBACK = [
     "gpt-4.1-mini",
     "gpt-4o-mini",
 ]
+
+
+class SchemaInvariantError(ValueError):
+    """Schéma porušuje interní invarianty požadované OpenAI strict json_schema."""
 
 
 def _canonical_json(obj: Any) -> str:
@@ -194,7 +199,79 @@ _JSON_SCHEMA: Dict[str, Any] = {
         "payment",
     ],
 }
-_JSON_SCHEMA_HASH = _sha256_json(_JSON_SCHEMA)
+
+
+def canonicalize_openai_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Zkanonizuje schema pro OpenAI strict režim:
+    - každý object node s properties má required = všechny keys v properties
+    - pokud object node nemá additionalProperties, doplní false
+    """
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            out = {k: _walk(v) for k, v in node.items()}
+            node_type = out.get("type")
+            has_object = node_type == "object" or (isinstance(node_type, list) and "object" in node_type)
+            props = out.get("properties")
+            if has_object and isinstance(props, dict):
+                out["required"] = sorted(props.keys())
+                if "additionalProperties" not in out:
+                    out["additionalProperties"] = False
+            return out
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        return node
+
+    return _walk(schema)
+
+
+def _extract_schema_path_hint(error_message: str | None) -> Optional[str]:
+    if not error_message:
+        return None
+    match = re.search(r"context\s*\(([^\)]+)\)", error_message)
+    if not match:
+        return None
+    items = [part.strip().strip("'\"") for part in match.group(1).split(",")]
+    cleaned = [it for it in items if it]
+    if not cleaned:
+        return None
+    return "$." + ".".join(cleaned)
+
+
+def validate_schema_invariants_or_raise(schema: Dict[str, Any], *, log: logging.Logger | None = None) -> None:
+    """Fail-fast kontrola konzistence OpenAI json_schema."""
+
+    def _walk(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            node_type = node.get("type")
+            has_object = node_type == "object" or (isinstance(node_type, list) and "object" in node_type)
+            props = node.get("properties")
+            if has_object and isinstance(props, dict):
+                required = node.get("required")
+                if not isinstance(required, list):
+                    if log:
+                        log.error("Schema invariant porusen: required neni list", extra={"schema_path": path})
+                    raise SchemaInvariantError(f"{path}: required must be list")
+                missing = sorted(key for key in props.keys() if key not in required)
+                if missing:
+                    if log:
+                        log.error(
+                            "Schema invariant porusen: required neobsahuje vsechny properties",
+                            extra={"schema_path": path, "missing_required_keys": missing},
+                        )
+                    raise SchemaInvariantError(f"{path}: missing required keys {missing}")
+            for key, value in node.items():
+                _walk(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            for idx, value in enumerate(node):
+                _walk(value, f"{path}[{idx}]")
+
+    _walk(schema, "$")
+
+
+_OPENAI_JSON_SCHEMA: Dict[str, Any] = canonicalize_openai_schema(_JSON_SCHEMA)
+_JSON_SCHEMA_HASH = _sha256_json(_OPENAI_JSON_SCHEMA)
 
 
 def _list_models_cached(api_key: str) -> List[str]:
@@ -228,10 +305,11 @@ def _b64_data_url(mime: str, data: bytes) -> str:
 
 def _build_text_format(use_json_schema: bool) -> Dict[str, Any]:
     if use_json_schema:
+        validate_schema_invariants_or_raise(_OPENAI_JSON_SCHEMA)
         return {
             "type": "json_schema",
             "name": "receipt_extract",
-            "schema": _JSON_SCHEMA,
+            "schema": _OPENAI_JSON_SCHEMA,
             "strict": True,
         }
     return {"type": "json_object"}
@@ -330,6 +408,8 @@ def ensure_schema_defaults(obj: Dict[str, Any]) -> Dict[str, Any]:
     Doplňuje chybějící klíče dle _JSON_SCHEMA na výchozí hodnoty (null/{} / [] podle typu).
     """
 
+    schema_root = _OPENAI_JSON_SCHEMA
+
     def _default_for(schema: Dict[str, Any]):
         t = schema.get("type")
         if isinstance(t, list):
@@ -357,11 +437,11 @@ def ensure_schema_defaults(obj: Dict[str, Any]) -> Dict[str, Any]:
             return [_fill(x, item_schema) for x in data]
         return data
 
-    filled = _fill(obj or {}, _JSON_SCHEMA)
+    filled = _fill(obj or {}, schema_root)
     # top-level required fill
-    for req in _JSON_SCHEMA.get("required", []):
+    for req in schema_root.get("required", []):
         if req not in filled:
-            schema_for = _JSON_SCHEMA.get("properties", {}).get(req, {})
+            schema_for = schema_root.get("properties", {}).get(req, {})
             filled[req] = _default_for(schema_for)
             filled[req] = _fill(filled[req], schema_for)
     return filled
@@ -381,7 +461,10 @@ def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: 
 
     prompt_text = ""
     try:
-        prompt_text = payload["input"][0]["content"][0].get("text", "")
+        for part in payload.get("input", [])[0].get("content", []):
+            if part.get("type") == "input_text":
+                prompt_text = part.get("text", "")
+                break
     except Exception:
         prompt_text = ""
     prompt_meta = {
@@ -551,6 +634,8 @@ def _run_responses_flow(
     mode: str,
 ) -> Tuple[Optional[Dict[str, Any]], str, str]:
     log = logging.getLogger(__name__)
+    if cfg.use_json_schema:
+        validate_schema_invariants_or_raise(_OPENAI_JSON_SCHEMA, log=log)
     model = _resolve_model(cfg.api_key, cfg.model if mode == "primary" else (cfg.fallback_model or cfg.model), _MODEL_PREFER_PRIMARY if mode == "primary" else _MODEL_PREFER_FALLBACK)
     prompt = _build_prompt(ocr_text, mode=mode)
 
@@ -589,12 +674,18 @@ def _run_responses_flow(
             err_code = err_body.get("error", {}).get("code")
             err_type = err_body.get("error", {}).get("type")
         if err_code == "invalid_json_schema" or err_type == "invalid_json_schema":
+            error_message = None
+            if isinstance(err_body, dict):
+                error_message = err_body.get("error", {}).get("message")
+            schema_path_hint = _extract_schema_path_hint(error_message)
             log_event(
                 log,
                 "openai.error",
                 "OpenAI invalid_json_schema – no fallback",
                 http_status=resp.status_code,
                 reason="invalid_json_schema",
+                schema_hash=_JSON_SCHEMA_HASH,
+                schema_path_hint=schema_path_hint,
                 openai_request_id=openai_request_id,
                 openai_request_id_client=req_id_client,
             )
@@ -653,7 +744,7 @@ def _run_responses_flow(
 
     validation_errors: List[str] = []
     if isinstance(obj, dict) and cfg.use_json_schema:
-        validation_errors = _validate_against_schema(obj, _JSON_SCHEMA)
+        validation_errors = _validate_against_schema(obj, _OPENAI_JSON_SCHEMA)
         log_event(
             log,
             "structured_output.validate",
@@ -700,4 +791,3 @@ def extract_with_openai_fallback(
     timeout: int = 40,
 ) -> Tuple[Optional[Dict[str, Any]], str, str]:
     return _run_responses_flow(cfg, ocr_text, images, pdf, timeout, mode="fallback")
-
