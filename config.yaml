@@ -38,11 +38,11 @@ ocr:
     max_candidates: 8
 openai:
   enabled: true
-  auto_enable: true
+  auto_enable: false
   api_key: ''
   model: auto
   fallback_model: gpt-4.1
-  primary_enabled: true
+  primary_enabled: false
   use_json_schema: true
   only_openai: true
   temperature: 0.0
@@ -52,8 +52,8 @@ openai:
   image_max_pages: 3
   image_enhance: true
   image_variants: 2
-  allow_synthetic_items: true
-  fallback_enabled: true
+  allow_synthetic_items: false
+  fallback_enabled: false
 performance:
   docs_page_size: 500
   supplier_debounce_ms: 250
