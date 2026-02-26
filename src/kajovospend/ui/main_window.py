@@ -4287,7 +4287,8 @@ class MainWindow(QMainWindow):
 
             size = ""
             mtime = ""
-            doc_path = Path(str(f.current_path or f.original_name or ""))
+            path_txt = str(f.current_path or f.original_name or "")
+            doc_path = Path(path_txt)
             try:
                 cand_paths = [doc_path, out_base / doc_path.name, qdir / doc_path.name, ddir / doc_path.name]
                 for cand in cand_paths:
@@ -4338,10 +4339,11 @@ class MainWindow(QMainWindow):
                     *[stage_colors.get(code, {"color": ""}) for code, _ in OPS_STAGE_COLUMNS],
                     "offline_retry",
                     "openai_retry",
+                    path_txt,
                 ]
             )
             meta_ids.append(int(getattr(f, "id", -1)))
-            meta_paths.append(str(f.current_path or f.original_name or ""))
+            meta_paths.append(path_txt)
 
         headers = [
             "#",
