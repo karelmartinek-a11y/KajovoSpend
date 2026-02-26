@@ -325,6 +325,39 @@ class TableModel(QAbstractTableModel):
         return str(section + 1)
 
 
+class OpsTableModel(TableModel):
+    def __init__(self, headers: List[str], rows: List[List[Any]], checked_rows: set[int] | None = None):
+        super().__init__(headers, rows)
+        self.checked_rows: set[int] = checked_rows or set()
+
+    def flags(self, index: QModelIndex):
+        if not index.isValid():
+            return Qt.NoItemFlags
+        flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        if index.column() == 0:
+            flags |= Qt.ItemIsUserCheckable
+        return flags
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        if index.column() == 0 and role == Qt.CheckStateRole:
+            return Qt.Checked if index.row() in self.checked_rows else Qt.Unchecked
+        if index.column() == 0 and role == Qt.DisplayRole:
+            return ""
+        return super().data(index, role)
+
+    def setData(self, index: QModelIndex, value: Any, role: int = Qt.EditRole) -> bool:
+        if not index.isValid() or index.column() != 0 or role != Qt.CheckStateRole:
+            return False
+        if value == Qt.Checked:
+            self.checked_rows.add(index.row())
+        else:
+            self.checked_rows.discard(index.row())
+        self.dataChanged.emit(index, index, [Qt.CheckStateRole])
+        return True
+
+
 class EditableItemsModel(QAbstractTableModel):
     """
     Editovatelný model položek (LineItem) – používá se pro Účty i NEROZPOZNANÉ.
@@ -1415,22 +1448,30 @@ class MainWindow(QMainWindow):
         self.ops_filter = QLineEdit()
         self.ops_filter.setPlaceholderText("Fulltext (název souboru, status, chyba)")
         self.ops_refresh_btn = QPushButton("Obnovit")
+        self.btn_ops_retry_all = QPushButton("Další pokus: vše nevytěžené")
+        self.btn_ops_bulk_retry = QPushButton("Hromadně: další pokus")
+        self.btn_ops_bulk_delete = QPushButton("Hromadně: smazat soubory")
         self.ops_filter.textChanged.connect(self.refresh_ops)
         self.ops_refresh_btn.clicked.connect(self.refresh_ops)
         ops_top_l.addWidget(self.ops_filter, 1)
         ops_top_l.addWidget(self.ops_refresh_btn)
+        ops_top_l.addWidget(self.btn_ops_retry_all)
+        ops_top_l.addWidget(self.btn_ops_bulk_retry)
+        ops_top_l.addWidget(self.btn_ops_bulk_delete)
         ol.addWidget(ops_top)
 
         self.ops_table = QTableView()
         self.ops_table.setAlternatingRowColors(True)
         self.ops_table.setShowGrid(True)
         self.ops_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.ops_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ops_table.verticalHeader().setVisible(False)
+        self.ops_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._ops_columns_initialized = False
+        self.ops_table.clicked.connect(self._on_ops_table_clicked)
         ol.addWidget(self.ops_table)
         self.tabs.addTab(self.tab_ops, "PROVOZNÍ PANEL")
 
-        # NEZPRACOVANÉ (karanténa + duplicitní vstupy mimo DB)
+        # NEZPRACOVANÉ (jen karanténa bez duplicit)
         self.tab_unprocessed = QWidget()
         ul = QVBoxLayout(self.tab_unprocessed)
         self.unproc_split = QSplitter(Qt.Horizontal)
@@ -1443,7 +1484,8 @@ class MainWindow(QMainWindow):
         self.unproc_table.setAlternatingRowColors(True)
         self.unproc_table.setShowGrid(True)
         self.unproc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.unproc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.unproc_table.verticalHeader().setVisible(False)
+        self.unproc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.unproc_table.clicked.connect(self.on_unproc_selected)
         lul.addWidget(self.unproc_table)
 
@@ -1957,7 +1999,8 @@ class MainWindow(QMainWindow):
         self.items_table.setShowGrid(True)
         self.items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.items_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.items_table.verticalHeader().setVisible(False)
+        self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         il.addWidget(self.items_table, 1)
         items_split.addWidget(items_left)
 
@@ -2021,6 +2064,7 @@ class MainWindow(QMainWindow):
         self.docs_table.setShowGrid(True)
         self.docs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.docs_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.docs_table.verticalHeader().setVisible(False)
         self.docs_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         ll.addWidget(self.docs_table, 1)
         splitter.addWidget(left)
@@ -2041,7 +2085,8 @@ class MainWindow(QMainWindow):
         self.doc_items_table.setAlternatingRowColors(True)
         self.doc_items_table.setShowGrid(True)
         self.doc_items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.doc_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.doc_items_table.verticalHeader().setVisible(False)
+        self.doc_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         rl.addWidget(self.doc_items_table, 2)
 
         items_bar = QWidget()
@@ -2110,6 +2155,9 @@ class MainWindow(QMainWindow):
             pass
 
         self.btn_unproc_refresh.clicked.connect(self.refresh_unprocessed)
+        self.btn_ops_retry_all.clicked.connect(self._retry_all_unprocessed_files)
+        self.btn_ops_bulk_retry.clicked.connect(self._ops_retry_selected)
+        self.btn_ops_bulk_delete.clicked.connect(self._ops_delete_selected)
         self.btn_unproc_save.clicked.connect(self.on_unproc_save_manual)
         self.btn_unproc_item_add.clicked.connect(self._unproc_item_add)
         self.btn_unproc_item_del.clicked.connect(self._unproc_item_del)
@@ -2135,6 +2183,7 @@ class MainWindow(QMainWindow):
         self.btn_items_add.clicked.connect(self._docs_item_add_v2)
         self.btn_items_del.clicked.connect(self._docs_item_del_v2)
         self.btn_items_save.clicked.connect(self._docs_items_save_v2)
+        self.doc_items_table.clicked.connect(self._open_item_from_doc_items)
 
     def _docs_selection_changed_v2(self, *_args) -> None:
         try:
@@ -2244,16 +2293,17 @@ class MainWindow(QMainWindow):
 
         headers = [
             "ID položky",
-            "Název",
-            "Cena/ks bez DPH",
-            "Množství",
-            "ID účtenky",
+            "Název položky",
+            "Cena za 1 ks bez DPH",
+            "Počet kusů",
+            "Číslo účtenky",
+            "ID účtenky (KajovoSpend)",
+            "Název dodavatele",
             "ID dodavatele",
             "Skupina",
             "DPH %",
             "Celkem s DPH",
             "Datum",
-            "Doklad",
             "IČO",
         ]
         trows = []
@@ -2270,23 +2320,24 @@ class MainWindow(QMainWindow):
             total_ln = r.get("line_total_gross")
             dn = (r.get("doc_number") or "").strip()
             ico = (r.get("supplier_ico") or "").strip()
+            supplier_name = (r.get("supplier_name") or "").strip()
             trows.append([
                 r.get("id_item"),
                 item_name,
                 unit_net,
                 qty,
+                dn,
                 r.get("id_receipt"),
+                supplier_name,
                 r.get("id_supplier"),
                 r.get("group_id") if r.get("group_id") is not None else "",
                 vat,
                 total_ln,
                 issue_s,
-                dn,
                 ico,
             ])
 
         self.items_table.setModel(TableModel(headers, trows))
-        self.items_table.resizeColumnsToContents()
         self.lbl_items_page.setText(f"{self._items_offset} / {self._items_total}")
         self.btn_items_more.setEnabled(self._items_offset < self._items_total)
 
@@ -2505,10 +2556,77 @@ class MainWindow(QMainWindow):
     def _items_open_from_doubleclick_v2(self, index) -> None:
         try:
             row = int(index.row())
+            col = int(index.column())
             meta = self._items_rows[row]
         except Exception:
             return
+
+        # Klik na číslo účtenky / ID účtenky otevře detail v kartě ÚČTY.
+        if col in (4, 5):
+            self._open_receipt_in_docs_tab(int(meta.get("document_id") or 0))
+            return
+
         self._open_file_path(meta.get("current_path"))
+
+    def _open_receipt_in_docs_tab(self, doc_id: int) -> None:
+        if not doc_id:
+            return
+        try:
+            self.tabs.setCurrentWidget(self.tab_docs)
+            for idx, row in enumerate(getattr(self, "_docs_listing", [])):
+                if int(row.get("doc_id") or 0) == int(doc_id):
+                    model = self.docs_table.model()
+                    if model is None:
+                        return
+                    qidx = model.index(idx, 0)
+                    self.docs_table.setCurrentIndex(qidx)
+                    self.docs_table.selectRow(idx)
+                    self._on_doc_selected_v2(qidx)
+                    return
+            # Pokud doklad není v aktuální stránce, proveď nové načtení a zkus znovu.
+            self._docs_new_search_v2()
+            for idx, row in enumerate(getattr(self, "_docs_listing", [])):
+                if int(row.get("doc_id") or 0) == int(doc_id):
+                    model = self.docs_table.model()
+                    if model is None:
+                        return
+                    qidx = model.index(idx, 0)
+                    self.docs_table.setCurrentIndex(qidx)
+                    self.docs_table.selectRow(idx)
+                    self._on_doc_selected_v2(qidx)
+                    return
+        except Exception:
+            pass
+
+    def _open_item_from_doc_items(self, index: QModelIndex) -> None:
+        try:
+            row = int(index.row())
+            model = getattr(self, "_current_doc_items_model", None)
+            if model is None:
+                return
+            rows = model.rows()
+            if row < 0 or row >= len(rows):
+                return
+            item_id = int(rows[row].get("id") or 0)
+            if not item_id:
+                return
+            self.tabs.setCurrentWidget(self.tab_items)
+            self._items_new_search_v2()
+            m = self.items_table.model()
+            if not m:
+                return
+            for r in range(m.rowCount()):
+                try:
+                    if int(m.index(r, 0).data()) == item_id:
+                        idx = m.index(r, 0)
+                        self.items_table.setCurrentIndex(idx)
+                        self.items_table.selectRow(r)
+                        self._items_selection_changed_v2(None, None)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     # ---------------------------
     # V2: Účty + NEROZPOZNANÉ
@@ -2649,14 +2767,15 @@ class MainWindow(QMainWindow):
                         "date": d.issue_date.isoformat() if d.issue_date else "",
                         "total": float(d.total_with_vat or 0.0) if d.total_with_vat is not None else 0.0,
                         "supplier": (sup_names.get(int(d.supplier_id)) if d.supplier_id else "") or (d.supplier_ico or "") or "",
+                        "doc_number": (d.doc_number or "") if getattr(d, "doc_number", None) is not None else "",
                         "items_count": counts.get(did, 0),
                         "status": f.status or "",
                     }
                 )
 
         # render table
-        headers = ["Datum", "Celkem vč. DPH", "Dodavatel", "Počet položek", "Stav"]
-        trows = [[r["date"], r["total"], r["supplier"], r["items_count"], r["status"]] for r in self._docs_listing]
+        headers = ["Datum", "Číslo účtenky", "Celkem vč. DPH", "Dodavatel", "Počet položek", "Stav"]
+        trows = [[r["date"], r.get("doc_number", ""), r["total"], r["supplier"], r["items_count"], r["status"]] for r in self._docs_listing]
         self.docs_table.setModel(TableModel(headers, trows))
         self._doc_offset = len(self._docs_listing)
         self.lbl_docs_page.setText(f"{self._doc_offset} / {self._doc_total}")
@@ -3667,6 +3786,90 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Nelze otevřít", f"Soubor se nepodařilo otevřít: {e}")
 
+
+    def _on_ops_table_clicked(self, index: QModelIndex) -> None:
+        try:
+            if not index.isValid() or int(index.column()) != 0:
+                return
+            model = self.ops_table.model()
+            if not isinstance(model, OpsTableModel):
+                return
+            cur = model.data(index, Qt.CheckStateRole)
+            nxt = Qt.Unchecked if cur == Qt.Checked else Qt.Checked
+            model.setData(index, nxt, Qt.CheckStateRole)
+        except Exception:
+            pass
+
+    def _ops_selected_file_ids(self) -> List[int]:
+        model = self.ops_table.model()
+        if not isinstance(model, OpsTableModel):
+            return []
+        out: List[int] = []
+        for r in sorted(model.checked_rows):
+            try:
+                out.append(int(model.index(r, 1).data()))
+            except Exception:
+                continue
+        return out
+
+    def _ops_retry_selected(self) -> None:
+        ids = self._ops_selected_file_ids()
+        if not ids:
+            QMessageBox.information(self, "Provozní panel", "Nejdříve zaškrtněte soubory v prvním sloupci.")
+            return
+        for fid in ids:
+            try:
+                self._retry_extract(int(fid), use_openai=False)
+            except Exception:
+                pass
+
+    def _ops_delete_selected(self) -> None:
+        ids = self._ops_selected_file_ids()
+        if not ids:
+            QMessageBox.information(self, "Provozní panel", "Nejdříve zaškrtněte soubory v prvním sloupci.")
+            return
+        resp = QMessageBox.question(
+            self,
+            "Smazat soubory",
+            f"Opravdu smazat {len(ids)} vybraných souborů? Akce fyzicky odstraní soubory z disku.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if resp != QMessageBox.Yes:
+            return
+        deleted = 0
+        with self.sf() as session:
+            for fid in ids:
+                rec = session.get(DocumentFile, int(fid))
+                if not rec:
+                    continue
+                p = Path(rec.current_path or rec.original_name or "")
+                try:
+                    if p.exists():
+                        p.unlink()
+                        deleted += 1
+                except Exception:
+                    pass
+                session.delete(rec)
+            session.commit()
+        QMessageBox.information(self, "Provozní panel", f"Smazáno souborů: {deleted}.")
+        self.refresh_ops()
+
+    def _retry_all_unprocessed_files(self) -> None:
+        with self.sf() as session:
+            rows = session.execute(
+                select(DocumentFile.id).where(DocumentFile.status.in_(("QUARANTINE", "ERROR", "DUPLICATE")))
+            ).all()
+        ids = [int(r[0]) for r in rows]
+        if not ids:
+            QMessageBox.information(self, "Provozní panel", "Není co opakovat – nevytěžené soubory nebyly nalezeny.")
+            return
+        for fid in ids:
+            try:
+                self._retry_extract(fid, use_openai=False)
+            except Exception:
+                pass
+
     def refresh_suppliers(self):
         q = self.sup_filter.text()
         try:
@@ -4120,7 +4323,7 @@ class MainWindow(QMainWindow):
         """Seznam karanténních souborů (FS + DB), řádek = jeden soubor."""
         try:
             with self.pf() as ps:
-                recs = ps.query(IngestFile).order_by(IngestFile.created_at.desc()).all()
+                recs = ps.query(IngestFile).filter(IngestFile.status == "QUARANTINE").order_by(IngestFile.created_at.desc()).all()
 
             self._unproc_rows = []
             table_rows = []
@@ -4329,6 +4532,7 @@ class MainWindow(QMainWindow):
 
             rows.append(
                 [
+                    "",
                     int(getattr(f, "id", -1)),
                     light,
                     f.original_name or "",
@@ -4346,7 +4550,8 @@ class MainWindow(QMainWindow):
             meta_paths.append(path_txt)
 
         headers = [
-            "#",
+            "✓",
+            "ID souboru",
             "Semafor",
             "Soubor",
             "Poslední změna",
@@ -4363,11 +4568,12 @@ class MainWindow(QMainWindow):
             return
         self._ops_last_snapshot = snapshot
 
-        self.ops_table.setModel(TableModel(headers, rows))
+        checked = getattr(self, "_ops_checked_rows", set())
+        self.ops_table.setModel(OpsTableModel(headers, rows, checked_rows=checked))
         # traffic lights pro status a per-stage sloupce
-        self.ops_table.setItemDelegateForColumn(1, TrafficLightDelegate(self.ops_table))
-        self.ops_table.setItemDelegateForColumn(6, TrafficLightDelegate(self.ops_table))
-        base = 7
+        self.ops_table.setItemDelegateForColumn(2, TrafficLightDelegate(self.ops_table))
+        self.ops_table.setItemDelegateForColumn(7, TrafficLightDelegate(self.ops_table))
+        base = 8
         for i, _ in enumerate(OPS_STAGE_COLUMNS):
             self.ops_table.setItemDelegateForColumn(base + i, TrafficLightDelegate(self.ops_table))
         try:
@@ -4375,18 +4581,19 @@ class MainWindow(QMainWindow):
             hh.setSectionResizeMode(QHeaderView.Interactive)
             if not getattr(self, "_ops_columns_initialized", False):
                 defaults = {
-                    0: 70,   # ID
-                    1: 46,   # semafor
-                    2: 260,  # soubor
-                    3: 170,  # poslední změna
-                    4: 90,   # velikost
-                    5: 110,  # status
-                    6: 120,  # výsledek
-                    7: 80,   # offline
-                    8: 80,   # openai
-                    9: 110,  # zopakovat offline
-                    10: 120, # zopakovat openai
-                    11: 90,  # otevřít
+                    0: 36,   # checkbox
+                    1: 90,   # ID souboru
+                    2: 46,   # semafor
+                    3: 260,  # soubor
+                    4: 170,  # poslední změna
+                    5: 90,   # velikost
+                    6: 110,  # status
+                    7: 120,  # výsledek
+                    8: 80,   # offline
+                    9: 80,   # openai
+                    10: 110, # zopakovat offline
+                    11: 120, # zopakovat openai
+                    12: 90,  # otevřít
                 }
                 for col, width in defaults.items():
                     try:
@@ -4548,6 +4755,7 @@ class MainWindow(QMainWindow):
         paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
         out_base = Path(paths_cfg.get("output_dir", "") or "")
         qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
+        ddir = out_base / paths_cfg.get("duplicate_dir_name", "DUPLICITY")
 
         with self.sf() as session:
             sha = sha256_file(path)
@@ -4568,6 +4776,31 @@ class MainWindow(QMainWindow):
                     mime_type="application/pdf" if path.suffix.lower() == ".pdf" else "image",
                 )
             supplier = upsert_supplier(session, ico, name=supplier_name)
+
+            dup = session.execute(
+                text(
+                    "SELECT id FROM documents WHERE supplier_ico = :ico AND doc_number = :dn AND issue_date = :d LIMIT 1"
+                ),
+                {"ico": ico, "dn": doc_no, "d": issue_dt},
+            ).fetchone()
+            if dup:
+                moved = safe_move(path, ddir, path.name)
+                file_rec.current_path = str(moved)
+                file_rec.status = "DUPLICATE"
+                file_rec.last_error = "duplicitní doklad"
+                file_rec.processed_at = utc_now_naive()
+                session.add(file_rec)
+                session.commit()
+                QMessageBox.warning(
+                    self,
+                    "Ruční uložení",
+                    "Doklad je duplicitní (stejné IČO + číslo dokladu + datum). "
+                    "Nebyl uložen do produkční DB a byl přesunut do DUPLICIT.",
+                )
+                self.refresh_unprocessed()
+                self.refresh_ops()
+                return
+
             doc = add_document(
                 session,
                 file_id=int(file_rec.id),
