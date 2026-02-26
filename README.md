@@ -9,6 +9,7 @@ Desktopová aplikace pro evidenci a kategorizaci dokladů (faktury, účtenky, d
 - OCR varianta B: RapidOCR (offline) + PDF render přes PDFium (pypdfium2). Pokud PDF obsahuje textovou vrstvu, použije se primárně ta.
 - ARES: dotažení dodavatele podle IČO (při neúspěchu jde doklad do kontroly).
 - Režim „raději do karantény“: při nízké jistotě vytěžení se soubor přesune do OUTPUT/KARANTENA a objeví se v kartě NEROZPOZNANÉ pro ruční doplnění.
+- Forenzní bundle k analýze vytěžení: po zpracování vzniká JSON v `OUTPUT/FORENSIC`, který obsahuje důvody selhání/karantény, korelační ID, textové metriky a výtah textu pro následnou AI analýzu.
 - Fulltext (FTS5) pro hledání v dokladech i položkách.
 - Exporty CSV/XLSX ze seznamu dokladů.
 
@@ -62,7 +63,9 @@ SQLite je v `%LOCALAPPDATA%\\KajovoSpend\\kajovospend.sqlite` (pokud v configu n
 
 ## Logy
 
-`%LOCALAPPDATA%\\KajovoSpend\\logs\\kajovospend_gui.log`.
+- `%LOCALAPPDATA%\KajovoSpend\logs\kajovospend_gui.log` – textový log běhu GUI/služby.
+- `%LOCALAPPDATA%\KajovoSpend\logs\kajovospend_forensic.jsonl` – strukturovaný forenzní audit trail (JSONL).
+- `paths.output_dir/FORENSIC/*.forensic.json` – balíček pro analýzu konkrétního dokladu (vhodné poslat spolu s `OUTPUT/KARANTENA` nebo `OUTPUT`).
 
 
 ## Spuštění GUI

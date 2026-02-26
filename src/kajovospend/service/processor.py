@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 from kajovospend.utils.time import utc_now_naive
 import os
@@ -1223,6 +1224,110 @@ class Processor:
             out.append(r)
         return out
 
+    def _build_forensic_bundle_payload(
+        self,
+        *,
+        source_path: Path,
+        moved_to: Path,
+        sha256: str,
+        status: str,
+        text_method: Optional[str],
+        text_debug: Dict[str, Any],
+        file_record,
+        per_doc_chunks: List[Dict[str, Any]],
+        created_doc_ids: List[int],
+        correlation_id: str,
+    ) -> Dict[str, Any]:
+        docs: List[Dict[str, Any]] = []
+        for idx_doc, chunk in enumerate(per_doc_chunks or [], start=1):
+            extracted = chunk.get("extracted")
+            reasons = list(getattr(extracted, "review_reasons", None) or []) if extracted is not None else []
+            docs.append(
+                {
+                    "index": idx_doc,
+                    "page_from": int(chunk.get("page_from") or 1),
+                    "page_to": int(chunk.get("page_to") or 1),
+                    "ocr_conf": float(chunk.get("ocr_conf") or 0.0),
+                    "requires_review": bool(getattr(extracted, "requires_review", False)) if extracted is not None else None,
+                    "review_reasons": reasons,
+                    "supplier_ico": getattr(extracted, "supplier_ico", None) if extracted is not None else None,
+                    "doc_number": getattr(extracted, "doc_number", None) if extracted is not None else None,
+                    "issue_date": str(getattr(extracted, "issue_date", None)) if extracted is not None else None,
+                    "total_with_vat": getattr(extracted, "total_with_vat", None) if extracted is not None else None,
+                    "items_count": len(list(getattr(extracted, "items", None) or [])) if extracted is not None else 0,
+                    "text_len": len(str(chunk.get("full_text") or "")),
+                    "text_preview": str(chunk.get("full_text") or "")[:1200],
+                }
+            )
+
+        return {
+            "schema_version": 1,
+            "generated_at": utc_now_naive().isoformat(),
+            "correlation_id": correlation_id,
+            "status": status,
+            "source_path": str(source_path),
+            "moved_to": str(moved_to),
+            "sha256": sha256,
+            "file_id": int(getattr(file_record, "id", 0) or 0),
+            "file_last_error": getattr(file_record, "last_error", None),
+            "text_method": text_method,
+            "text_debug": text_debug or {},
+            "created_document_ids": [int(x) for x in (created_doc_ids or [])],
+            "documents": docs,
+            "analysis_prompt_hint": (
+                "Pro analýzu vezmi tento forensic JSON spolu s obsahem OUTPUT/KARANTENA nebo OUTPUT a "
+                "z logu kajovospend_forensic.jsonl dohledávej stejné correlation_id/sha256. "
+                "Cíl: určit proč extrakce selhala a navrhnout konkrétní změny parseru/OCR pipeline."
+            ),
+        }
+
+    def _write_forensic_bundle(
+        self,
+        *,
+        out_base: Path,
+        source_path: Path,
+        moved_to: Path,
+        sha256: str,
+        status: str,
+        text_method: Optional[str],
+        text_debug: Dict[str, Any],
+        file_record,
+        per_doc_chunks: List[Dict[str, Any]],
+        created_doc_ids: List[int],
+        correlation_id: str,
+    ) -> Path | None:
+        try:
+            forensic_dir = out_base / str(self.cfg["paths"].get("forensic_dir_name", "FORENSIC"))
+            forensic_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = f"{source_path.stem}__{sha256[:12]}__{str(status).lower()}.forensic.json"
+            payload = self._build_forensic_bundle_payload(
+                source_path=source_path,
+                moved_to=moved_to,
+                sha256=sha256,
+                status=status,
+                text_method=text_method,
+                text_debug=text_debug,
+                file_record=file_record,
+                per_doc_chunks=per_doc_chunks,
+                created_doc_ids=created_doc_ids,
+                correlation_id=correlation_id,
+            )
+            bundle_path = forensic_dir / safe_name
+            bundle_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            log_event(
+                self.log,
+                "forensic.bundle.write",
+                "Forenzní bundle uložen",
+                status=status,
+                file=str(source_path),
+                bundle_path=str(bundle_path),
+                sha256=sha256,
+            )
+            return bundle_path
+        except Exception as e:
+            self.log.warning(f"Forenzní bundle se nepodařilo uložit: {e}")
+            return None
+
     def process_path(self, session, path: Path, status_cb=None, *, force: bool = False, job_id: Optional[int] = None, id_in: Optional[int] = None) -> Dict[str, Any]:
         # returns dict with outcome
         correlation_id = new_correlation_id()
@@ -2069,6 +2174,19 @@ class Processor:
             sha256=sha,
             text_method=text_method,
         )
+        forensic_bundle_path = self._write_forensic_bundle(
+            out_base=out_base,
+            source_path=path,
+            moved_to=moved,
+            sha256=sha,
+            status=status,
+            text_method=text_method,
+            text_debug=text_debug,
+            file_record=file_record,
+            per_doc_chunks=per_doc_chunks,
+            created_doc_ids=created_doc_ids,
+            correlation_id=correlation_id,
+        )
         return {
             "status": status,
             "sha256": sha,
@@ -2077,5 +2195,6 @@ class Processor:
             "moved_to": str(moved),
             "text_method": text_method,
             "text_debug": text_debug,
+            "forensic_bundle": str(forensic_bundle_path) if forensic_bundle_path else None,
             "id_in": id_in,
         }
