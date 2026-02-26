@@ -100,6 +100,43 @@ class Processor:
             except Exception:
                 pass
 
+    def _purge_existing_outputs_for_file(self, session, file_id: int) -> None:
+        """Smaže předchozí výstupy pro soubor při force re-runu v bezpečném pořadí."""
+        session.execute(
+            text("DELETE FROM items WHERE document_id IN (SELECT id FROM documents WHERE file_id = :fid)"),
+            {"fid": int(file_id)},
+        )
+        try:
+            session.execute(
+                text("DELETE FROM documents_fts WHERE document_id IN (SELECT id FROM documents WHERE file_id = :fid)"),
+                {"fid": int(file_id)},
+            )
+        except Exception:
+            # FTS tabulka může v testovacím režimu chybět.
+            pass
+        session.execute(text("DELETE FROM document_page_audit WHERE file_id = :fid"), {"fid": int(file_id)})
+        session.execute(text("DELETE FROM documents WHERE file_id = :fid"), {"fid": int(file_id)})
+
+    @staticmethod
+    def _find_business_duplicate(
+        session,
+        *,
+        supplier_ico: str,
+        doc_number: str,
+        issue_date,
+        exclude_file_id: int | None = None,
+    ):
+        sql = (
+            "SELECT id FROM documents "
+            "WHERE supplier_ico = :ico AND doc_number = :dn AND issue_date = :d"
+        )
+        params: Dict[str, Any] = {"ico": supplier_ico, "dn": doc_number, "d": issue_date}
+        if exclude_file_id is not None:
+            sql += " AND file_id <> :exclude_file_id"
+            params["exclude_file_id"] = int(exclude_file_id)
+        sql += " LIMIT 1"
+        return session.execute(text(sql), params).fetchone()
+
 
 
     def _try_qr_spayd_from_image(self, img: Image.Image) -> dict[str, Any]:
@@ -1194,7 +1231,6 @@ class Processor:
         mtime = path.stat().st_mtime if path.exists() else None
         sha = sha256_file(path)
         self._update_processing_status(id_in, status="QUEUED", path_current=str(path), sha256=sha)
-        self._update_processing_status(id_in, status="QUEUED", path_current=str(path), sha256=sha)
 
         with forensic_scope(correlation_id=correlation_id, job_id=job_ref, file_sha256=sha, phase="ingest"):
             log_event(
@@ -1243,10 +1279,9 @@ class Processor:
             file_record = session.get(DocumentFile, int(existing[0]))
             if file_record is not None:
                 try:
-                    session.execute(text("DELETE FROM document_page_audit WHERE file_id = :fid"), {"fid": file_record.id})
-                    session.execute(text("DELETE FROM documents WHERE file_id = :fid"), {"fid": file_record.id})
-                except Exception:
-                    pass
+                    self._purge_existing_outputs_for_file(session, int(file_record.id))
+                except Exception as e:
+                    raise RuntimeError(f"Force re-run selhal při čištění předchozích dat: {e}") from e
                 file_record.status = "NEW"
                 file_record.last_error = None
                 file_record.processed_at = None
@@ -1782,14 +1817,13 @@ class Processor:
             # Business duplicita per-doc
             if extracted.supplier_ico and extracted.doc_number and extracted.issue_date:
                 try:
-                    dup = session.execute(
-                        text(
-                            "SELECT id FROM documents "
-                            "WHERE supplier_ico = :ico AND doc_number = :dn AND issue_date = :d "
-                            "LIMIT 1"
-                        ),
-                        {"ico": extracted.supplier_ico, "dn": extracted.doc_number, "d": extracted.issue_date},
-                    ).fetchone()
+                    dup = self._find_business_duplicate(
+                        session,
+                        supplier_ico=extracted.supplier_ico,
+                        doc_number=extracted.doc_number,
+                        issue_date=extracted.issue_date,
+                        exclude_file_id=int(file_record.id) if file_record is not None else None,
+                    )
                     if dup:
                         dup_dir = out_base / self.cfg["paths"].get("duplicate_dir_name", "DUPLICITY")
                         moved = safe_move(path, dup_dir, path.name)
