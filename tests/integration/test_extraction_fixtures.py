@@ -114,7 +114,17 @@ class TestExtractionFixturesHarness(unittest.TestCase):
             with patch("kajovospend.service.processor.fetch_by_ico") as fetch_ares:
                 from kajovospend.integrations.ares import AresRecord
 
-                fetch_ares.return_value = AresRecord(ico="12345678", name="ACME")
+                fetch_ares.return_value = AresRecord(
+                    ico="12345678",
+                    name="ACME s.r.o.",
+                    legal_form="společnost s ručením omezeným",
+                    is_vat_payer=True,
+                    address="U Testu 1, Praha 1, 11000",
+                    street="U Testu",
+                    street_number="1",
+                    city="Praha",
+                    zip_code="11000",
+                )
                 with sf() as session:
                     res = proc.process_path(session, pdf_path)
                     session.commit()

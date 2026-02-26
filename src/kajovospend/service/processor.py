@@ -16,7 +16,7 @@ from PIL import Image, ImageFilter, ImageOps
 from pypdf import PdfReader
 from sqlalchemy import text
 
-from kajovospend.db.models import ImportJob, DocumentFile
+from kajovospend.db.models import ImportJob, DocumentFile, Supplier
 from kajovospend.db.queries import (
     add_document,
     create_file_record,
@@ -100,38 +100,6 @@ class Processor:
             except Exception:
                 pass
 
-    def _update_processing_status(
-        self,
-        id_in: int | None,
-        *,
-        status: str | None = None,
-        path_current: str | None = None,
-        sha256: str | None = None,
-        last_error: str | None = None,
-    ) -> None:
-        """Best-effort aktualizace zpracovatelské DB (ingest_files)."""
-        if not id_in:
-            return
-        try:
-            with self.pf() as ps:
-                rec = ps.get(IngestFile, int(id_in))
-                if not rec:
-                    return
-                if status:
-                    rec.status = status
-                if path_current:
-                    rec.path_current = path_current
-                if sha256:
-                    rec.sha256 = sha256
-                if last_error:
-                    rec.last_error = last_error
-                ps.add(rec)
-                ps.commit()
-        except Exception:
-            try:
-                self.log.exception("Update ingest_files selhal", exc_info=True)
-            except Exception:
-                pass
 
 
     def _try_qr_spayd_from_image(self, img: Image.Image) -> dict[str, Any]:
@@ -179,6 +147,41 @@ class Processor:
                 extracted.confidence = min(1.0, float(extracted.confidence or 0.0) + 0.05)
         except Exception:
             return
+
+    @staticmethod
+    def _supplier_details_complete(supplier: Supplier | None) -> tuple[bool, list[str]]:
+        """Tvrdé pravidlo: bez kompletních detailů dodavatele nesmí doklad do produkční DB."""
+        if supplier is None:
+            return False, ["chybí dodavatel"]
+
+        missing: list[str] = []
+
+        def _is_missing(value: Any) -> bool:
+            if value is None:
+                return True
+            if isinstance(value, str) and (not value.strip()):
+                return True
+            return False
+
+        required_fields: list[tuple[str, Any]] = [
+            ("IČO", getattr(supplier, "ico", None)),
+            ("název", getattr(supplier, "name", None)),
+            ("adresa", getattr(supplier, "address", None)),
+            ("ulice", getattr(supplier, "street", None)),
+            ("číslo popisné", getattr(supplier, "street_number", None)),
+            ("město", getattr(supplier, "city", None)),
+            ("PSČ", getattr(supplier, "zip_code", None)),
+            ("právní forma", getattr(supplier, "legal_form", None)),
+            ("ARES synchronizace", getattr(supplier, "ares_last_sync", None)),
+        ]
+        for label, value in required_fields:
+            if _is_missing(value):
+                missing.append(label)
+
+        if getattr(supplier, "is_vat_payer", None) is None:
+            missing.append("status plátce DPH")
+
+        return len(missing) == 0, missing
     
     def _validate_extracted(self, extracted) -> None:
         """Dodatečné validace (např. IBAN checksum). Nic nehazí."""
@@ -1832,6 +1835,7 @@ class Processor:
                 continue
 
             supplier_id = None
+            supplier_rec: Supplier | None = None
             supplier_name_guess: str | None = None
             if extracted.supplier_ico:
                 # ARES voláme jen pro "skutečné" IČO (číslice). Pro pseudo-IČO nic přes síť neřešíme.
@@ -1861,31 +1865,14 @@ class Processor:
                             overwrite=True,
                         )
                         supplier_id = s.id
+                        supplier_rec = s
                         extracted.supplier_ico = ares.ico
                     except Exception as e:
                         reasons.append(f"ARES selhal: {e}")
-                        # ARES je pouze enrich krok; při výpadku sítě neblokujeme uložení dokladu.
-                        # Zachováme IČO z extrakce a vytvoříme/aktualizujeme lokálního dodavatele best-effort.
-                        try:
-                            s = upsert_supplier(
-                                session,
-                                str(extracted.supplier_ico),
-                                name=self._extract_supplier_name_guess(ocr_text),
-                                overwrite=False,
-                            )
-                            supplier_id = s.id
-                        except Exception:
-                            pass
                 else:
-                    # Pseudo-IČO: uložíme dodavatele lokálně jen se jménem (pokud ho umíme odhadnout).
+                    # Pseudo-IČO není produkčně přípustné pro přesun do finální DB.
                     supplier_name_guess = self._extract_supplier_name_guess(ocr_text)
-                    s = upsert_supplier(
-                        session,
-                        str(extracted.supplier_ico),
-                        name=supplier_name_guess,
-                        overwrite=False,
-                    )
-                    supplier_id = s.id
+                    reasons.append("dodavatel nemá validní IČO")
 
             if not supplier_id:
                 requires_review = True
@@ -1897,6 +1884,27 @@ class Processor:
                 except Exception:
                     pass
                 self._update_processing_status(id_in, status="QUARANTINE", last_error=file_record.last_error, path_current=file_record.current_path, sha256=sha)
+                continue
+
+            supplier_ok, missing_supplier_details = self._supplier_details_complete(supplier_rec)
+            if not supplier_ok:
+                requires_review = True
+                reasons.append(
+                    "dodavatel není kompletně vytěžen: " + ", ".join(missing_supplier_details)
+                )
+                any_requires_review = True
+                try:
+                    file_record.last_error = "; ".join(dict.fromkeys(reasons))
+                    session.add(file_record)
+                except Exception:
+                    pass
+                self._update_processing_status(
+                    id_in,
+                    status="QUARANTINE",
+                    last_error=file_record.last_error,
+                    path_current=file_record.current_path,
+                    sha256=sha,
+                )
                 continue
 
             last_error_msg = "; ".join(dict.fromkeys(reasons)) if reasons else "nekompletní vytěžení"
