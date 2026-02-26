@@ -3817,11 +3817,177 @@ class MainWindow(QMainWindow):
         if not ids:
             QMessageBox.information(self, "Provozní panel", "Nejdříve zaškrtněte soubory v prvním sloupci.")
             return
-        for fid in ids:
+        self._retry_extract_many(ids, use_openai=False)
+
+    def _process_retry_extract(
+        self,
+        session,
+        file_id: int,
+        use_openai: bool,
+        status_cb: Callable[[str], None] | None = None,
+    ) -> Dict[str, Any]:
+        f = session.get(DocumentFile, int(file_id))
+        if not f:
+            raise ValueError("Soubor nenalezen.")
+        p = Path(f.current_path or f.original_name or "")
+        if not p.exists():
+            raise FileNotFoundError(f"Soubor {p} neexistuje (možná byl smazán nebo přejmenován).")
+
+        cfg = copy.deepcopy(self.cfg if isinstance(self.cfg, dict) else {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        openai_cfg = cfg.get("openai", {})
+        if not isinstance(openai_cfg, dict):
+            openai_cfg = {}
+
+        if use_openai:
+            openai_cfg.update(
+                {
+                    "enabled": True,
+                    "auto_enable": True,
+                    "primary_enabled": True,
+                    "fallback_enabled": True,
+                    "only_openai": True,
+                }
+            )
+            key = self._resolve_api_key(update_field=False)
+            if not key:
+                raise ValueError("OpenAI API key není k dispozici.")
+        else:
+            openai_cfg.update(
+                {
+                    "enabled": False,
+                    "auto_enable": False,
+                    "primary_enabled": False,
+                    "fallback_enabled": False,
+                    "only_openai": False,
+                }
+            )
+        cfg["openai"] = openai_cfg
+
+        proc = Processor(cfg, self.paths, self.log)
+        res = proc.process_path(session, p, status_cb=status_cb, force=True, job_id=None)
+        session.commit()
+        return res
+
+    def _retry_extract_many(self, file_ids: List[int], use_openai: bool) -> None:
+        ids = [int(fid) for fid in file_ids]
+        if not ids:
+            return
+
+        total = len(ids)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Opakovat vytěžení")
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setMinimumWidth(520)
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel(f"Připravuji opakování ({total} souborů)…")
+        bar = QProgressBar()
+        bar.setRange(0, total)
+        bar.setValue(0)
+        log_box = QTextEdit()
+        log_box.setReadOnly(True)
+        log_box.setMinimumHeight(220)
+        btn_close = QPushButton("Zavřít")
+        btn_close.setEnabled(False)
+        btn_close.clicked.connect(dlg.close)
+        lay.addWidget(lbl)
+        lay.addWidget(bar)
+        lay.addWidget(log_box)
+        lay.addWidget(btn_close, alignment=Qt.AlignRight)
+        dlg.show()
+
+        def append_log(msg: str) -> None:
             try:
-                self._retry_extract(int(fid), use_openai=False)
+                txt = str(msg or "").strip()
+            except Exception:
+                txt = ""
+            if not txt:
+                return
+
+            def _upd() -> None:
+                if not Shiboken.isValid(dlg):
+                    return
+                log_box.append(txt)
+
+            try:
+                QTimer.singleShot(0, self, _upd)
             except Exception:
                 pass
+
+        def set_progress(done: int, message: str) -> None:
+            done_count = max(0, min(int(done), total))
+            text = str(message or "Pracuji…")
+
+            def _upd() -> None:
+                if not Shiboken.isValid(dlg):
+                    return
+                lbl.setText(text)
+                bar.setValue(done_count)
+
+            try:
+                QTimer.singleShot(0, self, _upd)
+            except Exception:
+                pass
+
+        def fn() -> Dict[str, Any]:
+            ok_count = 0
+            failed_ids: List[int] = []
+            for idx, fid in enumerate(ids, start=1):
+                set_progress(idx - 1, f"[{idx}/{total}] Zpracovávám soubor ID {fid}…")
+                try:
+                    with self.sf() as session:
+                        self._process_retry_extract(
+                            session=session,
+                            file_id=fid,
+                            use_openai=use_openai,
+                            status_cb=lambda msg, i=idx, t=total: append_log(f"[{i}/{t}] {msg}"),
+                        )
+                    ok_count += 1
+                    append_log(f"[{idx}/{total}] Hotovo (ID {fid}).")
+                except Exception as exc:
+                    failed_ids.append(fid)
+                    append_log(f"[{idx}/{total}] Chyba (ID {fid}): {exc}")
+            set_progress(total, "Dokončeno.")
+            return {
+                "total": total,
+                "ok": ok_count,
+                "failed": len(failed_ids),
+                "failed_ids": failed_ids,
+            }
+
+        def ok(res: Dict[str, Any]) -> None:
+            try:
+                if Shiboken.isValid(dlg):
+                    btn_close.setEnabled(True)
+                    QTimer.singleShot(400, dlg.close)
+            except Exception:
+                pass
+            total_count = int(res.get("total", total))
+            ok_count = int(res.get("ok", 0))
+            failed_count = int(res.get("failed", 0))
+            QMessageBox.information(
+                self,
+                "Opakovat vytěžení",
+                f"Dokončeno: {ok_count}/{total_count} souborů. Chyb: {failed_count}.",
+            )
+            try:
+                self.refresh_ops()
+            except Exception:
+                pass
+
+        def err(msg: str) -> None:
+            try:
+                if Shiboken.isValid(dlg):
+                    lbl.setText("Chyba")
+                    btn_close.setEnabled(True)
+                    log_box.append(str(msg))
+            except Exception:
+                pass
+            QMessageBox.warning(self, "Opakovat vytěžení", str(msg))
+
+        timeout_ms = max(120_000, 120_000 * total)
+        _SilentRunner.run(self, fn, ok, err, timeout_ms=timeout_ms)
 
     def _ops_delete_selected(self) -> None:
         ids = self._ops_selected_file_ids()
@@ -3864,11 +4030,7 @@ class MainWindow(QMainWindow):
         if not ids:
             QMessageBox.information(self, "Provozní panel", "Není co opakovat – nevytěžené soubory nebyly nalezeny.")
             return
-        for fid in ids:
-            try:
-                self._retry_extract(fid, use_openai=False)
-            except Exception:
-                pass
+        self._retry_extract_many(ids, use_openai=False)
 
     def refresh_suppliers(self):
         q = self.sup_filter.text()
