@@ -12,10 +12,14 @@ from kajovospend.db.processing_models import BaseProcessing
 
 def _processing_db_path(cfg) -> Path:
     try:
+        app_cfg = cfg.get("app", {}) if isinstance(cfg, dict) else {}
+        data_dir = app_cfg.get("data_dir")
         paths = cfg.get("paths", {}) if isinstance(cfg, dict) else {}
         raw = paths.get("processing_db")
         if raw:
             return Path(raw)
+        if data_dir:
+            return Path(data_dir) / "kajovospend-processing.sqlite"
     except Exception:
         pass
     return Path("processing.db")

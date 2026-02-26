@@ -5,6 +5,7 @@ app:
 paths:
   input_dir: C:/KajovoSpend/INPUT
   output_dir: C:/KajovoSpend/OUTPUT
+  processing_db: ''
   quarantine_dir_name: KARANTENA
   duplicate_dir_name: DUPLICITY
 service:
