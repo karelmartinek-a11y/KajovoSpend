@@ -15,6 +15,10 @@ OUTPUT/
 INPUT/
 service.pid
 var/
+dist/
+build/KajovoSpend/
+.pytest_cache/
+.tmp/
 
 # IDE
 .idea/

@@ -87,6 +87,13 @@ Alternativně lze spustit přímo skript:
 - `py run_gui.py`
 
 
+## Reset repozitáře (2026-02-27)
+
+- `main` je sjednocený se všemi `codex/*` a `copilot/*` větvemi; tuto revizi ber jako nový baseline.
+- Artefakty buildu/testů jsou ignorované (`dist/`, `build/KajovoSpend/`, `.pytest_cache/`, `.tmp/`) – necommituj je.
+- Stručné info k resetu: `docs/RESET_2026-02-27.md`.
+
+
 ## Build aplikace (PyInstaller)
 
 - Windows: `./Build/build_windows.ps1`
