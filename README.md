@@ -92,6 +92,7 @@ Alternativně lze spustit přímo skript:
 - `main` je sjednocený se všemi `codex/*` a `copilot/*` větvemi; tuto revizi ber jako nový baseline.
 - Artefakty buildu/testů jsou ignorované (`dist/`, `build/KajovoSpend/`, `.pytest_cache/`, `.tmp/`) – necommituj je.
 - Stručné info k resetu: `docs/RESET_2026-02-27.md`.
+- Proveden Forensic Reborne Audit (konsolidace, cleanup, testy). Aktuální baseline = `main` + tag `baseline-YYYYMMDD`.
 
 
 ## Build aplikace (PyInstaller)
