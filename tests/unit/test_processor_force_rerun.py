@@ -74,6 +74,7 @@ class TestProcessorForceRerun(unittest.TestCase):
                 )
                 self.assertIsNotNone(other_file)
 
+            engine.dispose()
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-# Virtualenvs
+﻿# Virtualenvs
 .venv/
 
 # Python artifacts
@@ -19,7 +19,13 @@ dist/
 build/KajovoSpend/
 .pytest_cache/
 .tmp/
+.pytest_tmp/
 
 # IDE
 .idea/
 .vscode/
+
+node_modules/
+*.egg-info/
+coverage/
+.coverage

@@ -24,7 +24,7 @@ from kajovospend.db.queries import (
     rebuild_fts_for_document,
     upsert_supplier,
 )
-from kajovospend.db.processing_session import create_processing_session_factory
+from kajovospend.db.processing_session import create_processing_session_factory, dispose_processing_session_factory
 from kajovospend.db.processing_models import IngestFile
 from kajovospend.extract.parser import extract_from_text, postprocess_items_for_db
 from kajovospend.extract.structured_pdf import extract_structured_from_pdf
@@ -67,6 +67,29 @@ class Processor:
         except Exception as e:
             self.log.warning(f"OCR init failed; will quarantine documents. Error: {e}")
             self.ocr_engine = None
+
+    def close(self) -> None:
+        """Uvolní zdroje, zejména processing SQLite engine (důležité na Windows)."""
+        try:
+            if hasattr(self.pf, "close_all"):
+                self.pf.close_all()
+        except Exception:
+            pass
+        try:
+            dispose_processing_session_factory(self.pf)
+        except Exception:
+            pass
+        try:
+            eng = getattr(self, "pf", None)
+            if eng and getattr(eng, "bind", None):
+                eng.bind.dispose()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "ocr_engine") and hasattr(self.ocr_engine, "close"):
+                self.ocr_engine.close()
+        except Exception:
+            pass
 
     def _update_processing_status(
         self,

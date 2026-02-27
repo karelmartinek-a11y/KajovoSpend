@@ -31,4 +31,21 @@ def create_processing_session_factory(cfg) -> Callable[[], sessionmaker]:
     url = f"sqlite:///{db_path}"
     engine = create_engine(url, future=True)
     BaseProcessing.metadata.create_all(engine)
-    return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    sf = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    # Ulož engine, aby jej bylo možné explicitně uvolnit (Windows locky).
+    sf._engine = engine  # type: ignore[attr-defined]
+    return sf
+
+
+def dispose_processing_session_factory(sf) -> None:
+    """Best-effort uvolnění SQLite engine pro processing DB (Windows lock prevention)."""
+    try:
+        try:
+            sf.close_all()
+        except Exception:
+            pass
+        bind = getattr(sf, "_engine", None) or getattr(sf, "bind", None)
+        if bind is not None:
+            bind.dispose()
+    except Exception:
+        pass

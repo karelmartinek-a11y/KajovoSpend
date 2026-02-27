@@ -143,6 +143,7 @@ class TestExtractionFixturesHarness(unittest.TestCase):
                     self.assertIsNotNone(doc.total_with_vat)
                     self.assertGreaterEqual(len(items), 1)
 
+            proc.close()
             engine.dispose()
 
             # Verify decision log exists
