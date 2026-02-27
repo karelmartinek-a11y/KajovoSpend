@@ -48,8 +48,6 @@ class TestDbNetGrossMigration(unittest.TestCase):
                 self.assertAlmostEqual(float(drow[1]), 21.0, places=2)
                 self.assertEqual(str(drow[2]), "invoice")
 
-
-
     def test_init_db_is_idempotent_when_run_twice(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "idempotent.db"
@@ -80,7 +78,12 @@ class TestDbNetGrossMigration(unittest.TestCase):
             sf = make_session_factory(engine)
 
             with sf() as session:
-                session.execute(text("INSERT INTO files(id, sha256, original_name, pages, current_path, status, created_at) VALUES (1, 's', 'x.pdf', 1, '/tmp/x.pdf', 'PROCESSED', CURRENT_TIMESTAMP)"))
+                session.execute(
+                    text(
+                        "INSERT INTO files(id, sha256, original_name, pages, current_path, status, created_at) "
+                        "VALUES (1, 's', 'x.pdf', 1, '/tmp/x.pdf', 'PROCESSED', CURRENT_TIMESTAMP)"
+                    )
+                )
                 session.flush()
 
                 doc = add_document(
