@@ -51,9 +51,11 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     _install_excepthook()
-    icon_path = root / "assets" / "app.ico"
-    if icon_path.exists():
-        app.setWindowIcon(QIcon(str(icon_path)))
+    icon_candidates = [root / "assets" / "app.icns", root / "assets" / "app.ico"]
+    for icon_path in icon_candidates:
+        if icon_path.exists():
+            app.setWindowIcon(QIcon(str(icon_path)))
+            break
 
     w = MainWindow(config_path=root / "config.yaml", assets_dir=root / "assets")
     w.showMaximized()

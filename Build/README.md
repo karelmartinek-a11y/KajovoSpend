@@ -33,7 +33,7 @@ bash ./Build/build_macos.sh
 
 Výstup: `dist/KajovoSpend.app`
 
-> Poznámka: `assets/app.ico` je používána i na macOS build kroku. Pokud chceš nativní `.icns`, přidej `assets/app.icns` a uprav parametr `--icon` ve skriptu.
+> Poznámka: macOS build automaticky preferuje `assets/app.icns` (pokud existuje), jinak použije `assets/app.ico` jako fallback.
 
 ## Ruční build (stejná logika)
 
@@ -43,7 +43,7 @@ pyinstaller \
   --clean \
   --name KajovoSpend \
   --windowed \
-  --icon assets/app.ico \
+  --icon assets/app.icns \
   --add-data "assets:assets" \
   --add-data "src:src" \
   run_gui.py
