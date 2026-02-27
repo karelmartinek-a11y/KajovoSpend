@@ -15,7 +15,7 @@ Desktopová aplikace pro evidenci a kategorizaci dokladů (faktury, účtenky, d
 
 ## Požadavky
 
-- Windows 10/11
+- Windows 10/11 nebo macOS
 - Python 3.11 - 3.13
 
 ## Instalace
@@ -24,6 +24,13 @@ Desktopová aplikace pro evidenci a kategorizaci dokladů (faktury, účtenky, d
 cd KajovoSpend
 python -m venv .venv
 .\.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Na macOS/Linux použij aktivaci:
+
+```bash
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -73,11 +80,19 @@ SQLite je v `%LOCALAPPDATA%\\KajovoSpend\\kajovospend.sqlite` (pokud v configu n
 Doporučené:
 
 - `py -m app_gui` (Windows)
+- `python -m app_gui` (macOS/Linux)
 
 Alternativně lze spustit přímo skript:
 
 - `py run_gui.py`
 
+
+## Build aplikace (PyInstaller)
+
+- Windows: `./Build/build_windows.ps1`
+- macOS: `bash ./Build/build_macos.sh`
+
+macOS build preferuje `assets/app.icns`; pokud soubor neexistuje, použije fallback `assets/app.ico`.
 
 ## Testování
 
