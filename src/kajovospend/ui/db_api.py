@@ -468,19 +468,22 @@ def count_items(session: Session, q: str = "") -> int:
                 WHERE items_fts2 MATCH :q
                   AND f.status != 'QUARANTINE'
                 """
-                return int(session.execute(text(sql), {"q": q}).scalar_one() or 0)
+                cnt = int(session.execute(text(sql), {"q": q}).scalar_one() or 0)
+                if cnt > 0:
+                    return cnt
             except Exception:
-                # Fallback: LIKE scan (still acceptable for ~10k-100k rows)
-                qq = f"%{q}%"
-                sql = """
-                SELECT COUNT(*) AS c
-                FROM items i
-                JOIN documents d ON d.id = i.document_id
-                JOIN files f ON f.id = d.file_id
-                WHERE f.status != 'QUARANTINE'
-                  AND (i.name LIKE :qq OR d.supplier_ico LIKE :qq OR d.doc_number LIKE :qq)
-                """
-                return int(session.execute(text(sql), {"qq": qq}).scalar_one() or 0)
+                pass
+            # Fallback: LIKE scan (still acceptable for ~10k-100k rows)
+            qq = f"%{q}%"
+            sql = """
+            SELECT COUNT(*) AS c
+            FROM items i
+            JOIN documents d ON d.id = i.document_id
+            JOIN files f ON f.id = d.file_id
+            WHERE f.status != 'QUARANTINE'
+              AND (i.name LIKE :qq OR d.supplier_ico LIKE :qq OR d.doc_number LIKE :qq)
+            """
+            return int(session.execute(text(sql), {"qq": qq}).scalar_one() or 0)
 
         sql = """
         SELECT COUNT(*) AS c
@@ -613,10 +616,13 @@ def list_items(
                 params_ids["match"] = match
                 rows = session.execute(text(sql_ids), params_ids).fetchall()
                 ids = [int(r.item_id) for r in rows]
-                if not ids:
-                    return []
-                params["ids"] = tuple(ids)
-                where_sql_ids = where_sql + " AND i.id IN :ids"
+                if ids:
+                    params["ids"] = tuple(ids)
+                    where_sql_ids = where_sql + " AND i.id IN :ids"
+                else:
+                    like = f"%{q}%"
+                    where_sql_ids = where_sql + " AND (i.name LIKE :like OR d.supplier_ico LIKE :like OR d.doc_number LIKE :like)"
+                    params["like"] = like
             except Exception:
                 # fallback LIKE
                 like = f"%{q}%"
@@ -628,7 +634,7 @@ def list_items(
 
         sql = f"""
         SELECT
-          i.id_item      AS id_item,
+          COALESCE(i.id_item, i.id) AS id_item,
           i.id_receipt   AS id_receipt,
           i.id_supplier  AS id_supplier,
           i.document_id  AS document_id,
@@ -642,6 +648,12 @@ def list_items(
           i.group_id     AS group_id,
           d.issue_date   AS issue_date,
           d.total_with_vat AS doc_total_with_vat,
+          d.total_without_vat AS doc_total_without_vat,
+          (
+            SELECT COUNT(*)
+            FROM items i2
+            WHERE i2.document_id = d.id
+          ) AS doc_items_count,
           d.doc_number   AS doc_number,
           d.supplier_ico AS supplier_ico,
           s.name         AS supplier_name,
