@@ -260,7 +260,7 @@ def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
 
 
 class DashboardTile(QWidget):
-    def __init__(self, title: str, *, icon: str, pixmap: QPixmap | None = None, compact: bool = False, parent=None):
+    def __init__(self, title: str, *, icon: str | None = None, pixmap: QPixmap | None = None, compact: bool = False, parent=None):
         super().__init__(parent)
         self.setObjectName("DashTile")
 
@@ -274,14 +274,14 @@ class DashboardTile(QWidget):
         tile_px = 48 if compact else 96
         self.icon = QLabel()
         self.icon.setFixedSize(tile_px, tile_px)
-        if pixmap is None:
-            pixmap = _make_icon_pixmap(icon, tile_px)
-        if not pixmap.isNull():
+        if pixmap is None or (hasattr(pixmap, "isNull") and pixmap.isNull()):
+            self.icon.hide()
+        else:
             pixmap = pixmap.scaled(tile_px, tile_px, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.icon.setPixmap(pixmap)
-        self.icon.setAlignment(Qt.AlignCenter)
-        self.icon.setObjectName("DashIcon")
-        lay.addWidget(self.icon, alignment=Qt.AlignCenter)
+            self.icon.setPixmap(pixmap)
+            self.icon.setAlignment(Qt.AlignCenter)
+            self.icon.setObjectName("DashIcon")
+            lay.addWidget(self.icon, alignment=Qt.AlignCenter)
 
         self.lbl_value = QLabel("-")
         f: QFont = self.lbl_value.font()
@@ -1425,7 +1425,7 @@ class MainWindow(QMainWindow):
         dash_vbox.addWidget(sect1)
 
         def add_tile1(key: str, title: str, icon: str, r: int, c: int, rs: int = 1, cs: int = 1):
-            t = DashboardTile(title, icon=icon, pixmap=self._tile_icon(icon), compact=True)
+            t = DashboardTile(title, icon=None, pixmap=None, compact=True)
             sect1_grid.addWidget(t, r, c, rs, cs)
             self._dash_tiles[key] = t
             return t
@@ -1475,7 +1475,7 @@ class MainWindow(QMainWindow):
         dash_vbox.addWidget(sect2)
 
         def add_tile2(key: str, title: str, icon: str, r: int, c: int, rs: int = 1, cs: int = 1):
-            t = DashboardTile(title, icon=icon, pixmap=self._tile_icon(icon))
+            t = DashboardTile(title, icon=None, pixmap=None)
             sect2_grid.addWidget(t, r, c, rs, cs)
             self._dash_tiles[key] = t
             return t
@@ -1564,6 +1564,7 @@ class MainWindow(QMainWindow):
         self.unproc_table.setAlternatingRowColors(True)
         self.unproc_table.setShowGrid(True)
         self.unproc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.unproc_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.unproc_table.verticalHeader().setVisible(False)
         self.unproc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.unproc_table.clicked.connect(self.on_unproc_selected)
@@ -1573,9 +1574,19 @@ class MainWindow(QMainWindow):
         rah = QHBoxLayout(row_actions)
         rah.setContentsMargins(0, 0, 0, 0)
         self.btn_unproc_refresh = QPushButton("Obnovit")
+        self.cb_unproc_q = QCheckBox("Karanténa")
+        self.cb_unproc_q.setChecked(True)
+        self.cb_unproc_d = QCheckBox("Duplicity")
+        self.cb_unproc_d.setChecked(True)
         self.btn_unproc_save = QPushButton("Uložit ručně")
+        self.btn_unproc_retry_ai = QPushButton("OpenAI znovu (vybraný)")
+        self.btn_unproc_retry_ai_all = QPushButton("OpenAI znovu (výběr)")
         rah.addWidget(self.btn_unproc_refresh)
+        rah.addWidget(self.cb_unproc_q)
+        rah.addWidget(self.cb_unproc_d)
         rah.addWidget(self.btn_unproc_save)
+        rah.addWidget(self.btn_unproc_retry_ai)
+        rah.addWidget(self.btn_unproc_retry_ai_all)
         rah.addStretch(1)
         lul.addWidget(row_actions)
 
@@ -1630,8 +1641,9 @@ class MainWindow(QMainWindow):
         ul.addWidget(self.unproc_split)
         self._current_unproc = None
         self._current_unproc_items_model: EditableItemsModel | None = None
+        self._unproc_selected_path: str | None = None
 
-        self.tabs.addTab(self.tab_unprocessed, "NEZPRACOVANÉ")
+        self.tabs.addTab(self.tab_unprocessed, "KARANTÉNA/DUPLICITY")
 
         # Nastavení
         # Nastavení
@@ -1896,10 +1908,7 @@ class MainWindow(QMainWindow):
         stl.addWidget(self.btn_restore_program)
         stl.addWidget(self.btn_reset_program)
         self.tabs.addTab(self.tab_settings, "NASTAVENÍ")
-
-        # Skupiny položek (správa)
-        self.tab_item_groups = QWidget()
-        gl = QVBoxLayout(self.tab_item_groups)
+        # Skupiny položek (správa) – přesunuto do Nastavení
         grp_top = QWidget()
         gtl = QHBoxLayout(grp_top)
         gtl.setContentsMargins(0, 0, 0, 0)
@@ -1921,9 +1930,11 @@ class MainWindow(QMainWindow):
         gfl.addRow(self.btn_group_delete)
         gtl.addWidget(grp_form, 1)
 
+        group_box = QWidget()
+        gl = QVBoxLayout(group_box)
+        gl.addWidget(QLabel("Skupiny položek"))
         gl.addWidget(grp_top, 1)
-        self.tab_item_groups.setLayout(gl)
-        self.tabs.addTab(self.tab_item_groups, "SKUPINY POLOŽEK")
+        stl.addWidget(group_box)
 
         # Dodavatelé
         self.tab_suppliers = QWidget()
@@ -2201,7 +2212,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
         dl2.addWidget(splitter, 1)
-        self.tabs.addTab(self.tab_docs, "Účtenky")
+        self.tabs.addTab(self.tab_docs, "ÚČTENKY")
 
         self.setCentralWidget(root)
 
@@ -2250,12 +2261,16 @@ class MainWindow(QMainWindow):
             pass
 
         self.btn_unproc_refresh.clicked.connect(self.refresh_unprocessed)
+        self.cb_unproc_q.toggled.connect(self.refresh_unprocessed)
+        self.cb_unproc_d.toggled.connect(self.refresh_unprocessed)
         self.btn_ops_retry_all.clicked.connect(self._retry_all_unprocessed_files)
         self.btn_ops_bulk_retry.clicked.connect(self._ops_retry_selected)
         self.btn_ops_bulk_delete.clicked.connect(self._ops_delete_selected)
         self.btn_unproc_save.clicked.connect(self.on_unproc_save_manual)
         self.btn_unproc_item_add.clicked.connect(self._unproc_item_add)
         self.btn_unproc_item_del.clicked.connect(self._unproc_item_del)
+        self.btn_unproc_retry_ai.clicked.connect(self._unproc_retry_selected_ai)
+        self.btn_unproc_retry_ai_all.clicked.connect(self._unproc_retry_selected_ai_all)
 
         # POLOŽKY (per-item search)
         self.btn_items_search.clicked.connect(self._items_new_search_v2)
@@ -4646,8 +4661,24 @@ class MainWindow(QMainWindow):
     def refresh_unprocessed(self):
         """Seznam karanténních souborů (FS + DB), řádek = jeden soubor."""
         try:
+            statuses = []
+            if self.cb_unproc_q.isChecked():
+                statuses.append("QUARANTINE")
+            if self.cb_unproc_d.isChecked():
+                statuses.append("DUPLICATE")
+            if not statuses:
+                self.unproc_table.setModel(TableModel(["ID_IN", "Stav", "Soubor", "Velikost", "Čas", "Zdroj", "path"], []))
+                return
+
+            keep_path = self._unproc_selected_path
+
             with self.pf() as ps:
-                recs = ps.query(IngestFile).filter(IngestFile.status.in_(["QUARANTINE", "DUPLICATE"])).order_by(IngestFile.created_at.desc()).all()
+                recs = (
+                    ps.query(IngestFile)
+                    .filter(IngestFile.status.in_(statuses))
+                    .order_by(IngestFile.created_at.desc())
+                    .all()
+                )
 
             self._unproc_rows = []
             table_rows = []
@@ -4675,14 +4706,14 @@ class MainWindow(QMainWindow):
                         file_id = int(fobj.id) if fobj else None
                 except Exception:
                     file_id = None
-                self._unproc_rows.append({"id_in": int(r.id_in), "path": path_cur, "file_id": file_id})
+                self._unproc_rows.append({"id_in": int(r.id_in), "path": path_cur, "file_id": file_id, "status": r.status})
 
             known_paths = {str((x.get("path") or "")).strip() for x in self._unproc_rows if x.get("path")}
             # doplň z produkční DB (soubor v karanténě/duplicita)
             try:
                 with self.sf() as session:
                     prods = session.execute(
-                        select(DocumentFile).where(DocumentFile.status.in_(["QUARANTINE", "DUPLICATE"]))
+                        select(DocumentFile).where(DocumentFile.status.in_(statuses))
                     ).scalars().all()
                 for fobj in prods:
                     pstr = str(fobj.current_path or fobj.original_path or "")
@@ -4705,7 +4736,7 @@ class MainWindow(QMainWindow):
                         "produkční DB",
                         pstr,
                     ])
-                    self._unproc_rows.append({"id_in": int(fobj.id), "path": pstr, "file_id": int(fobj.id)})
+                    self._unproc_rows.append({"id_in": int(fobj.id), "path": pstr, "file_id": int(fobj.id), "status": fobj.status or ""})
                     known_paths.add(pstr)
             except Exception:
                 pass
@@ -4716,6 +4747,8 @@ class MainWindow(QMainWindow):
             exts = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
             fs_id = -1
             for status, base in (("QUARANTINE", qdir), ("DUPLICATE", ddir)):
+                if status not in statuses:
+                    continue
                 if not base.exists():
                     continue
                 for p in base.rglob("*"):
@@ -4741,14 +4774,28 @@ class MainWindow(QMainWindow):
                         "souborový systém",
                         pstr,
                     ])
-                    self._unproc_rows.append({"id_in": fs_id, "path": pstr, "file_id": None})
+                    self._unproc_rows.append({"id_in": fs_id, "path": pstr, "file_id": None, "status": status})
                     fs_id -= 1
 
             headers = ["ID_IN", "Stav", "Soubor", "Velikost", "Čas", "Zdroj", "path"]
             self.unproc_table.setModel(TableModel(headers, table_rows))
             self.unproc_table.resizeColumnsToContents()
-            # auto-select first
-            if table_rows:
+            reselection_done = False
+            if keep_path:
+                m = self.unproc_table.model()
+                for ridx in range(m.rowCount()):
+                    try:
+                        pval = m.index(ridx, 6).data()
+                        if pval == keep_path:
+                            idx = m.index(ridx, 0)
+                            self.unproc_table.setCurrentIndex(idx)
+                            self.unproc_table.selectRow(ridx)
+                            self.on_unproc_selected(idx)
+                            reselection_done = True
+                            break
+                    except Exception:
+                        continue
+            if not reselection_done and table_rows:
                 idx = self.unproc_table.model().index(0, 0)
                 self.unproc_table.setCurrentIndex(idx)
                 self.unproc_table.selectRow(0)
@@ -5054,6 +5101,7 @@ class MainWindow(QMainWindow):
                 "path": path_val,
             }
             self._current_unproc = meta
+            self._unproc_selected_path = path_val
         except Exception:
             self._current_unproc = None
         # reset form
@@ -5094,6 +5142,49 @@ class MainWindow(QMainWindow):
         row = int(sel.selectedRows()[0].row())
         model.removeRows(row, 1)
         self._update_unproc_total_hint()
+
+    def _unproc_retry_selected_ai(self) -> None:
+        """Opakovat vytěžení vybraného záznamu (OpenAI)."""
+        try:
+            sm = self.unproc_table.selectionModel()
+            if not sm or not sm.hasSelection():
+                QMessageBox.information(self, "Opakovat vytěžení", "Vyberte jeden záznam v tabulce.")
+                return
+            row = int(sm.selectedRows()[0].row())
+        except Exception:
+            QMessageBox.information(self, "Opakovat vytěžení", "Vyberte jeden záznam v tabulce.")
+            return
+        file_id = None
+        try:
+            if 0 <= row < len(getattr(self, "_unproc_rows", [])):
+                file_id = self._unproc_rows[row].get("file_id")
+        except Exception:
+            file_id = None
+        if not file_id:
+            QMessageBox.warning(self, "Opakovat vytěžení", "Vybraný záznam nemá navázaný záznam v produkční DB (file_id).")
+            return
+        self._retry_extract(int(file_id), use_openai=True)
+
+    def _unproc_retry_selected_ai_all(self) -> None:
+        """Opakovat vytěžení všech vybraných (OpenAI)."""
+        sm = self.unproc_table.selectionModel()
+        if not sm or not sm.hasSelection():
+            QMessageBox.information(self, "Opakovat vytěžení", "Vyberte alespoň jeden záznam.")
+            return
+        ids: List[int] = []
+        for idx in sm.selectedRows():
+            try:
+                row = int(idx.row())
+                if 0 <= row < len(getattr(self, "_unproc_rows", [])):
+                    fid = self._unproc_rows[row].get("file_id")
+                    if fid:
+                        ids.append(int(fid))
+            except Exception:
+                continue
+        if not ids:
+            QMessageBox.warning(self, "Opakovat vytěžení", "Žádný vybraný záznam nemá navázaný file_id.")
+            return
+        self._retry_extract_many(ids, use_openai=True)
 
     def _update_unproc_total_hint(self):
         """Vizuální kontrola: součet položek vs. zadaný total."""
