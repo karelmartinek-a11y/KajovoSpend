@@ -264,6 +264,24 @@ def add_document(session: Session, file_id: int, supplier_id: int | None, suppli
         d.total_vat_amount = round(float(d.total_with_vat) - float(d.total_without_vat), 2)
 
     session.flush()
+
+    # Backfill produkčních identifikátorů (legacy sloupce mimo ORM mapování).
+    try:
+        session.execute(
+            text(
+                """
+                UPDATE items
+                SET
+                    id_item = COALESCE(id_item, id),
+                    id_receipt = COALESCE(id_receipt, (SELECT COALESCE(id_receipt, id) FROM documents WHERE id = :doc_id)),
+                    id_supplier = COALESCE(id_supplier, (SELECT supplier_id FROM documents WHERE id = :doc_id))
+                WHERE document_id = :doc_id
+                """
+            ),
+            {"doc_id": int(d.id)},
+        )
+    except Exception:
+        pass
     return d
 
 
