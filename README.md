@@ -34,6 +34,29 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Codex / CI shell bootstrap
+
+V automatizovaných prostředích (např. Codex) bývá výchozí Python 3.10, který není kompatibilní s tímto projektem.
+
+Doporučený postup je spustit připravený skript:
+
+```bash
+bash scripts/bootstrap_codex_env.sh
+source .venv312/bin/activate
+```
+
+Skript automaticky:
+- vybere dostupný Python `>=3.11` (preferuje 3.12.12 (kvůli wheel kompatibilitě), pak 3.13.8),
+- vytvoří virtuální prostředí,
+- doinstaluje závislosti z `requirements.txt` včetně modulu `build`,
+- nastaví/aktualizuje `git remote origin` na `https://github.com/karelmartinek-a11y/KajovoSpend.git`.
+
+Volitelně lze předat vlastní cestu pro venv:
+
+```bash
+bash scripts/bootstrap_codex_env.sh .venv
+```
+
 1) Vytvoř konfiguraci:
 
 ```powershell
