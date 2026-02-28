@@ -2521,7 +2521,7 @@ class MainWindow(QMainWindow):
                 else:
                     session.execute(text("INSERT INTO item_groups (name) VALUES (:n)"), {"n": group_name})
                     gid = int(session.execute(text("SELECT last_insert_rowid()")).scalar_one())
-                stmt = text("UPDATE items SET group_id = :gid WHERE COALESCE(id_item, id) IN (:ids)").bindparams(
+                stmt = text("UPDATE items SET group_id = :gid WHERE COALESCE(id_item, id) IN :ids").bindparams(
                     bindparam("ids", expanding=True), bindparam("gid")
                 )
                 session.execute(stmt, {"gid": gid, "ids": ids})
