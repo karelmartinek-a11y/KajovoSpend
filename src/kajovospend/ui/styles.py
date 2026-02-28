@@ -41,6 +41,13 @@ QWidget#DashTile {
 QLabel#CardTitle, QLabel#DashTitle { color: #111827; font-weight: 700; }
 QLabel#CardValue, QLabel#DashValue { color: #2F8FE5; font-weight: 900; font-size: 20px; }
 QLabel#DashHeadline { color: #111827; font-size: 14px; font-weight: 800; }
+QFrame#DashSeparator {
+  background: #111827;
+  border: none;
+  min-height: 3px;
+  max-height: 3px;
+  margin: 4px 0px;
+}
 QLabel { background: transparent; }
 
 /* Buttons */

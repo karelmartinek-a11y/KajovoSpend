@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QFormLayout, QSplitter, QTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QFileDialog,
     QMessageBox, QDateEdit, QDialog, QDialogButtonBox, QHeaderView, QAbstractItemView,
     QCheckBox, QProgressDialog, QApplication, QInputDialog, QScrollArea, QStyledItemDelegate, QSizePolicy,
-    QProgressBar,
+    QProgressBar, QFrame,
 )
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
@@ -233,6 +233,23 @@ def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
         for y in (12, 22, 32):
             p.drawLine(18, y, s - 12, y)
             p.drawPoint(10, y)
+    elif name == "percent":
+        p.setPen(pen(3, QColor("#2F8FE5")))
+        r = max(4, s // 8)
+        p.setBrush(QColor("#2F8FE5"))
+        p.setPen(pen(1, QColor("#2F8FE5")))
+        p.drawEllipse(8, 8, r * 2, r * 2)
+        p.drawEllipse(s - 8 - r * 2, s - 8 - r * 2, r * 2, r * 2)
+        p.setPen(pen(3, QColor("#2F8FE5")))
+        p.drawLine(s - 10, 10, 10, s - 10)
+    elif name == "avg":
+        p.setPen(pen(3, QColor("#F5B800")))
+        p.setBrush(Qt.NoBrush)
+        mid = s // 2
+        p.drawLine(10, mid, s - 10, mid)
+        p.drawLine(mid, 10, mid, s - 10)
+        p.drawLine(10, int(mid * 0.6), s - 10, int(mid * 0.6))
+        p.drawLine(10, int(mid * 1.4), s - 10, int(mid * 1.4))
     else:
         p.setPen(pen(2))
         p.setBrush(fill)
@@ -243,20 +260,19 @@ def _make_icon_pixmap(name: str, size: int = 44) -> QPixmap:
 
 
 class DashboardTile(QWidget):
-    def __init__(self, title: str, *, icon: str, pixmap: QPixmap | None = None, parent=None):
+    def __init__(self, title: str, *, icon: str, pixmap: QPixmap | None = None, compact: bool = False, parent=None):
         super().__init__(parent)
         self.setObjectName("DashTile")
 
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        self.setMinimumHeight(150)
+        self.setMinimumHeight(80 if compact else 150)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
+        lay.setSpacing(4 if compact else 6)
 
-        tile_px = 96
+        tile_px = 48 if compact else 96
         self.icon = QLabel()
-        # menší velikost dlaždic pro nižší minimální výšku okna
         self.icon.setFixedSize(tile_px, tile_px)
         if pixmap is None:
             pixmap = _make_icon_pixmap(icon, tile_px)
@@ -269,7 +285,7 @@ class DashboardTile(QWidget):
 
         self.lbl_value = QLabel("-")
         f: QFont = self.lbl_value.font()
-        f.setPointSize(36)
+        f.setPointSize(24 if compact else 36)
         f.setBold(True)
         self.lbl_value.setFont(f)
         self.lbl_value.setAlignment(Qt.AlignCenter)
@@ -277,6 +293,12 @@ class DashboardTile(QWidget):
         self.lbl_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.lbl_value.setSizePolicy(self.lbl_value.sizePolicy().horizontalPolicy(), QSizePolicy.Fixed)
         lay.addWidget(self.lbl_value)
+
+        lbl_title = QLabel(title)
+        lbl_title.setAlignment(Qt.AlignCenter)
+        lbl_title.setObjectName("DashTitle")
+        lbl_title.setWordWrap(True)
+        lay.addWidget(lbl_title)
 
     def set_value(self, text: str) -> None:
         self.lbl_value.setText(text)
@@ -1381,46 +1403,104 @@ class MainWindow(QMainWindow):
 
         rl.addWidget(top)
 
-        # Dashboard grid (fills most of the RUN tab)
+        # Dashboard – dvě sekce oddělené tlustou čarou
         dash_wrap = QWidget()
-        dash_grid = QGridLayout(dash_wrap)
-        dash_grid.setContentsMargins(0, 0, 0, 0)
-        dash_grid.setHorizontalSpacing(12)
-        dash_grid.setVerticalSpacing(8)
+        dash_vbox = QVBoxLayout(dash_wrap)
+        dash_vbox.setContentsMargins(0, 0, 0, 0)
+        dash_vbox.setSpacing(8)
 
         self._dash_tiles: dict[str, DashboardTile] = {}
         self._stat_labels = {}  # reused by _apply_dashboard (DB stats)
 
-        def add_tile(key: str, title: str, icon: str, r: int, c: int, rs: int = 1, cs: int = 1):
-            t = DashboardTile(title, icon=icon, pixmap=self._tile_icon(icon))
-            dash_grid.addWidget(t, r, c, rs, cs)
+        # ── Sekce 1: Provozní statistiky ──────────────────────────────
+        lbl_sect1 = QLabel("Provozní statistiky")
+        lbl_sect1.setObjectName("DashHeadline")
+        dash_vbox.addWidget(lbl_sect1)
+
+        sect1 = QWidget()
+        sect1_grid = QGridLayout(sect1)
+        sect1_grid.setContentsMargins(0, 0, 0, 0)
+        sect1_grid.setHorizontalSpacing(12)
+        sect1_grid.setVerticalSpacing(8)
+        dash_vbox.addWidget(sect1)
+
+        def add_tile1(key: str, title: str, icon: str, r: int, c: int, rs: int = 1, cs: int = 1):
+            t = DashboardTile(title, icon=icon, pixmap=self._tile_icon(icon), compact=True)
+            sect1_grid.addWidget(t, r, c, rs, cs)
             self._dash_tiles[key] = t
             return t
 
-        add_tile("in_waiting", "Čeká v IN", "inbox", 0, 0)
-        add_tile("quarantine_total", "Karanténa", "quarantine", 0, 1)
-        add_tile("quarantine_dup", "Duplicity", "duplicate", 0, 2)
+        # Řada 0: Počty souborů dle výsledku
+        add_tile1("in_waiting", "Čeká v IN", "inbox", 0, 0)
+        add_tile1("processed_total", "Zpracováno", "check", 0, 1)
+        add_tile1("quarantine_total", "Karanténa", "quarantine", 0, 2)
+        add_tile1("quarantine_dup", "Duplicity", "duplicate", 0, 3)
 
-        t_docs = add_tile("receipts", "Doklady OK", "check", 1, 0)
-        t_sups = add_tile("suppliers", "Dodavatelé", "factory", 1, 1)
-        t_items = add_tile("items", "Položky", "list", 1, 2)
+        # Řada 1: Procentuální úspěšnost ze všech zpracovaných souborů
+        t_pct_off = add_tile1("pct_offline", "% Offline extrakce", "percent", 1, 0)
+        t_pct_ai = add_tile1("pct_openai", "% OpenAI extrakce", "percent", 1, 1)
+        t_pct_q = add_tile1("pct_quarantine", "% Karanténa", "percent", 1, 2)
+        t_pct_d = add_tile1("pct_duplicate", "% Duplicita", "percent", 1, 3)
 
-        t_eta = add_tile("import_eta", "Odhad dokončení", "clock", 2, 0)
-        t_power = add_tile("import_power", "Stav služby", "status", 2, 1)
-        t_activity = add_tile("import_activity", "Co se děje teď", "status", 2, 2)
+        self._stat_labels["pct_offline"] = t_pct_off.lbl_value
+        self._stat_labels["pct_openai"] = t_pct_ai.lbl_value
+        self._stat_labels["pct_quarantine"] = t_pct_q.lbl_value
+        self._stat_labels["pct_duplicate"] = t_pct_d.lbl_value
 
-        t_sum = add_tile("sum_items_w_vat", "Hodnota s DPH", "db", 3, 0)
-        t_sum_wo = add_tile("sum_items_wo_vat", "Hodnota bez DPH", "db", 3, 1)
+        # Řada 2: Stav služby
+        t_power = add_tile1("import_power", "Stav služby", "status", 2, 0)
+        t_activity = add_tile1("import_activity", "Co se děje teď", "status", 2, 1)
+        t_eta = add_tile1("import_eta", "Odhad dokončení", "clock", 2, 2)
 
-        # Map tiles pro aktualizaci
-        self._stat_labels["receipts"] = t_docs.lbl_value
-        self._stat_labels["suppliers"] = t_sups.lbl_value
-        self._stat_labels["items"] = t_items.lbl_value
-        self._stat_labels["sum_items_w_vat"] = t_sum.lbl_value
-        self._stat_labels["sum_items_wo_vat"] = t_sum_wo.lbl_value
-        self._stat_labels["import_eta"] = t_eta.lbl_value
         self._stat_labels["import_power"] = t_power.lbl_value
         self._stat_labels["import_activity"] = t_activity.lbl_value
+        self._stat_labels["import_eta"] = t_eta.lbl_value
+
+        # ── Oddělovač (tlustá čára) ────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setObjectName("DashSeparator")
+        dash_vbox.addWidget(sep)
+
+        # ── Sekce 2: Databázová statistika ────────────────────────────
+        lbl_sect2 = QLabel("Databázová statistika")
+        lbl_sect2.setObjectName("DashHeadline")
+        dash_vbox.addWidget(lbl_sect2)
+
+        sect2 = QWidget()
+        sect2_grid = QGridLayout(sect2)
+        sect2_grid.setContentsMargins(0, 0, 0, 0)
+        sect2_grid.setHorizontalSpacing(12)
+        sect2_grid.setVerticalSpacing(8)
+        dash_vbox.addWidget(sect2)
+
+        def add_tile2(key: str, title: str, icon: str, r: int, c: int, rs: int = 1, cs: int = 1):
+            t = DashboardTile(title, icon=icon, pixmap=self._tile_icon(icon))
+            sect2_grid.addWidget(t, r, c, rs, cs)
+            self._dash_tiles[key] = t
+            return t
+
+        # Řada 0: Základní počty
+        t_items = add_tile2("items", "Položky celkem", "list", 0, 0)
+        t_docs = add_tile2("receipts", "Účtenky", "check", 0, 1)
+        t_sups = add_tile2("suppliers", "Dodavatelé", "factory", 0, 2)
+
+        self._stat_labels["items"] = t_items.lbl_value
+        self._stat_labels["receipts"] = t_docs.lbl_value
+        self._stat_labels["suppliers"] = t_sups.lbl_value
+
+        # Řada 1: Finanční statistiky
+        t_sum_wo = add_tile2("sum_items_wo_vat", "Celková suma bez DPH", "db", 1, 0)
+        t_avg_item = add_tile2("avg_item", "Prům. cena položky", "avg", 1, 1)
+        t_avg_ipp = add_tile2("avg_items_per_receipt", "Prům. položek / účtenka", "avg", 1, 2)
+
+        self._stat_labels["sum_items_wo_vat"] = t_sum_wo.lbl_value
+        self._stat_labels["avg_item"] = t_avg_item.lbl_value
+        self._stat_labels["avg_items_per_receipt"] = t_avg_ipp.lbl_value
+
+        # Řada 2: Průměrná hodnota účtenky bez DPH (span 3 sloupce)
+        t_avg_r = add_tile2("avg_receipt_wo_vat", "Prům. hodnota účtenky bez DPH", "avg", 2, 0, 1, 3)
+        self._stat_labels["avg_receipt_wo_vat"] = t_avg_r.lbl_value
 
         rl.addWidget(dash_wrap, 2)
 
@@ -5309,15 +5389,29 @@ class MainWindow(QMainWindow):
             try:
                 q_fs = int(c.get("quarantine_fs", c.get("quarantine", 0)) or 0)
                 d_fs = int(c.get("duplicates_fs", c.get("duplicates", 0)) or 0)
+                proc = int(c.get("processed", 0) or 0)
                 try:
                     self._dash_tiles["quarantine_total"].set_value(str(q_fs))
                     self._dash_tiles["quarantine_dup"].set_value(str(d_fs))
+                    self._dash_tiles["processed_total"].set_value(str(proc))
                 except Exception:
                     pass
 
                 in_wait = int(getattr(self, "_dash_in_waiting", 0) or c.get("in_waiting", 0) or 0)
                 try:
                     self._dash_tiles["in_waiting"].set_value(str(in_wait))
+                except Exception:
+                    pass
+
+                # Procentuální statistiky z celkového počtu souborů (PROCESSED + QUARANTINE + DUPLICATE)
+                total_files = proc + q_fs + d_fs
+                try:
+                    pct_q = 100.0 * q_fs / total_files if total_files > 0 else 0.0
+                    pct_d = 100.0 * d_fs / total_files if total_files > 0 else 0.0
+                    if "pct_quarantine" in self._stat_labels:
+                        self._stat_labels["pct_quarantine"].setText(f"{pct_q:.1f} %")
+                    if "pct_duplicate" in self._stat_labels:
+                        self._stat_labels["pct_duplicate"].setText(f"{pct_d:.1f} %")
                 except Exception:
                     pass
             except Exception:
@@ -5344,6 +5438,39 @@ class MainWindow(QMainWindow):
                 self._stat_labels["sum_items_wo_vat"].setText(fmt_money(rs.get("sum_items_wo_vat", 0.0) or 0.0))
             if "sum_items_w_vat" in self._stat_labels:
                 self._stat_labels["sum_items_w_vat"].setText(fmt_money(rs.get("sum_items_w_vat", 0.0) or 0.0))
+
+            # Průměrné statistiky DB
+            if "avg_item" in self._stat_labels:
+                self._stat_labels["avg_item"].setText(fmt_money(rs.get("avg_item", 0.0) or 0.0))
+            if "avg_items_per_receipt" in self._stat_labels:
+                self._stat_labels["avg_items_per_receipt"].setText(f"{float(rs.get('avg_items_per_receipt', 0.0) or 0.0):.1f}")
+            if "avg_receipt_wo_vat" in self._stat_labels:
+                self._stat_labels["avg_receipt_wo_vat"].setText(fmt_money(rs.get("avg_receipt_wo_vat", 0.0) or 0.0))
+
+            # procenta extrakčních metod (pct_offline/pct_api jsou % z PROCESSED docs;
+            # přepočítáváme na % ze všech souborů celkem = PROCESSED + QUARANTINE + DUPLICATE)
+            if c:
+                proc = int(c.get("processed", 0) or 0)
+                q_fs = int(c.get("quarantine_fs", c.get("quarantine", 0)) or 0)
+                d_fs = int(c.get("duplicates_fs", c.get("duplicates", 0)) or 0)
+                total_files = proc + q_fs + d_fs
+                receipts = int(rs.get("receipts", 0) or 0)
+                pct_off_raw = float(rs.get("pct_offline", 0.0) or 0.0)
+                pct_ai_raw = float(rs.get("pct_api", 0.0) or 0.0)
+                # scale: receipts = počet úspěšně zpracovaných dokladů, total_files zahrnuje i karanténu a duplicity
+                scale = (receipts / total_files) if total_files > 0 and receipts > 0 else 1.0
+                pct_off_files = pct_off_raw * scale
+                pct_ai_files = pct_ai_raw * scale
+                if "pct_offline" in self._stat_labels:
+                    self._stat_labels["pct_offline"].setText(f"{pct_off_files:.1f} %")
+                if "pct_openai" in self._stat_labels:
+                    self._stat_labels["pct_openai"].setText(f"{pct_ai_files:.1f} %")
+            else:
+                if "pct_offline" in self._stat_labels:
+                    self._stat_labels["pct_offline"].setText(f"{float(rs.get('pct_offline', 0.0) or 0.0):.1f} %")
+                if "pct_openai" in self._stat_labels:
+                    self._stat_labels["pct_openai"].setText(f"{float(rs.get('pct_api', 0.0) or 0.0):.1f} %")
+
             if st and isinstance(st, dict):
                 power_txt = "Zapnuto" if st.get("running") else "Vypnuto"
                 activity = st.get("current_phase") or ""

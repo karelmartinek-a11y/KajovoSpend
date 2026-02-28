@@ -57,6 +57,7 @@ def run_stats(session: Session) -> Dict[str, Any]:
             "sum_items_wo_vat": 0.0,
             "sum_items_w_vat": 0.0,
             "avg_receipt": 0.0,
+            "avg_receipt_wo_vat": 0.0,
             "avg_item": 0.0,
             "avg_items_per_receipt": 0.0,
             "min_items_per_receipt": 0,
@@ -168,6 +169,32 @@ def run_stats(session: Session) -> Dict[str, Any]:
             vals.append(per_doc_sums.get(int(did), 0.0))
     avg_receipt = float(sum(vals) / len(vals)) if vals else 0.0
 
+    # average receipt value without VAT: prefer Document.total_without_vat, fallback to computed wo_vat per doc
+    per_doc_sums_wo = {int(did): float(s or 0.0) for did, s in session.execute(
+        select(
+            LineItem.document_id,
+            func.sum(
+                case(
+                    (
+                        (LineItem.vat_rate.is_(None)) | (LineItem.vat_rate == 0),
+                        LineItem.line_total,
+                    ),
+                    else_=LineItem.line_total / (1.0 + (LineItem.vat_rate / 100.0)),
+                )
+            ),
+        )
+        .where(LineItem.document_id.in_(doc_ids))
+        .group_by(LineItem.document_id)
+    ).all()}
+    doc_totals_wo = session.execute(select(Document.id, Document.total_without_vat).where(Document.id.in_(doc_ids))).all()
+    vals_wo = []
+    for did, tv in doc_totals_wo:
+        if tv is not None and float(tv) > 0.0:
+            vals_wo.append(float(tv))
+        else:
+            vals_wo.append(per_doc_sums_wo.get(int(did), 0.0))
+    avg_receipt_wo_vat = float(sum(vals_wo) / len(vals_wo)) if vals_wo else 0.0
+
     # max item
     max_row = session.execute(
         select(LineItem.name, LineItem.line_total)
@@ -192,6 +219,7 @@ def run_stats(session: Session) -> Dict[str, Any]:
         "sum_items_wo_vat": sum_wo_vat,
         "sum_items_w_vat": sum_with_vat,
         "avg_receipt": avg_receipt,
+        "avg_receipt_wo_vat": avg_receipt_wo_vat,
         "avg_item": avg_item,
         "avg_items_per_receipt": avg_items_per_receipt,
         "min_items_per_receipt": min_items,

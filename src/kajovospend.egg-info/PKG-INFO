@@ -16,12 +16,13 @@ Desktopová aplikace pro evidenci a kategorizaci dokladů (faktury, účtenky, d
 - OCR varianta B: RapidOCR (offline) + PDF render přes PDFium (pypdfium2). Pokud PDF obsahuje textovou vrstvu, použije se primárně ta.
 - ARES: dotažení dodavatele podle IČO (při neúspěchu jde doklad do kontroly).
 - Režim „raději do karantény“: při nízké jistotě vytěžení se soubor přesune do OUTPUT/KARANTENA a objeví se v kartě NEROZPOZNANÉ pro ruční doplnění.
+- Forenzní bundle k analýze vytěžení: po zpracování vzniká JSON v `OUTPUT/FORENSIC`, který obsahuje důvody selhání/karantény, korelační ID, textové metriky a výtah textu pro následnou AI analýzu.
 - Fulltext (FTS5) pro hledání v dokladech i položkách.
 - Exporty CSV/XLSX ze seznamu dokladů.
 
 ## Požadavky
 
-- Windows 10/11
+- Windows 10/11 nebo macOS
 - Python 3.11 - 3.13
 
 ## Instalace
@@ -30,6 +31,13 @@ Desktopová aplikace pro evidenci a kategorizaci dokladů (faktury, účtenky, d
 cd KajovoSpend
 python -m venv .venv
 .\.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Na macOS/Linux použij aktivaci:
+
+```bash
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -69,7 +77,9 @@ SQLite je v `%LOCALAPPDATA%\\KajovoSpend\\kajovospend.sqlite` (pokud v configu n
 
 ## Logy
 
-`%LOCALAPPDATA%\\KajovoSpend\\logs\\kajovospend_gui.log`.
+- `%LOCALAPPDATA%\KajovoSpend\logs\kajovospend_gui.log` – textový log běhu GUI/služby.
+- `%LOCALAPPDATA%\KajovoSpend\logs\kajovospend_forensic.jsonl` – strukturovaný forenzní audit trail (JSONL).
+- `paths.output_dir/FORENSIC/*.forensic.json` – balíček pro analýzu konkrétního dokladu (vhodné poslat spolu s `OUTPUT/KARANTENA` nebo `OUTPUT`).
 
 
 ## Spuštění GUI
@@ -77,11 +87,27 @@ SQLite je v `%LOCALAPPDATA%\\KajovoSpend\\kajovospend.sqlite` (pokud v configu n
 Doporučené:
 
 - `py -m app_gui` (Windows)
+- `python -m app_gui` (macOS/Linux)
 
 Alternativně lze spustit přímo skript:
 
 - `py run_gui.py`
 
+
+## Reset repozitáře (2026-02-27)
+
+- `main` je sjednocený se všemi `codex/*` a `copilot/*` větvemi; tuto revizi ber jako nový baseline.
+- Artefakty buildu/testů jsou ignorované (`dist/`, `build/KajovoSpend/`, `.pytest_cache/`, `.tmp/`) – necommituj je.
+- Stručné info k resetu: `docs/RESET_2026-02-27.md`.
+- Proveden Forensic Reborne Audit (konsolidace, cleanup, testy). Aktuální baseline = `main` + tag `baseline-YYYYMMDD`.
+
+
+## Build aplikace (PyInstaller)
+
+- Windows: `./Build/build_windows.ps1`
+- macOS: `bash ./Build/build_macos.sh`
+
+macOS build preferuje `assets/app.icns`; pokud soubor neexistuje, použije fallback `assets/app.ico`.
 
 ## Testování
 
