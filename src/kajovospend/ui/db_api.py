@@ -453,22 +453,25 @@ def _ensure_items_fts2_populated(session: Session) -> None:
         ).scalar()
         if not exists:
             return
-        c = int(session.execute(text("SELECT COUNT(*) FROM items_fts2")).scalar_one() or 0)
-        if c > 0:
+        total_items = int(session.execute(text("SELECT COUNT(*) FROM items")).scalar_one() or 0)
+        total_fts = int(session.execute(text("SELECT COUNT(*) FROM items_fts2")).scalar_one() or 0)
+        if total_items == 0:
             return
-
-        # Backfill in one statement (fast enough for tens of thousands of rows).
-        session.execute(
-            text(
-                """
-                INSERT INTO items_fts2(item_id, document_id, item_name, supplier_ico, doc_number)
-                SELECT i.id, i.document_id, COALESCE(i.name,''), COALESCE(d.supplier_ico,''), COALESCE(d.doc_number,'')
-                FROM items i
-                JOIN documents d ON d.id = i.document_id
-                """
+        if total_fts < total_items:
+            # Backfill missing rows (idempotent).
+            session.execute(
+                text(
+                    """
+                    INSERT INTO items_fts2(item_id, document_id, item_name, supplier_ico, doc_number)
+                    SELECT i.id, i.document_id, COALESCE(i.name,''), COALESCE(d.supplier_ico,''), COALESCE(d.doc_number,'')
+                    FROM items i
+                    JOIN documents d ON d.id = i.document_id
+                    LEFT JOIN items_fts2 fts ON fts.item_id = i.id
+                    WHERE fts.item_id IS NULL
+                    """
+                )
             )
-        )
-        session.commit()
+            session.commit()
     except Exception:
         # If anything goes wrong, the UI will still work (fallback will be used).
         try:
@@ -509,7 +512,7 @@ def count_items(session: Session, q: str = "") -> int:
             JOIN documents d ON d.id = i.document_id
             JOIN files f ON f.id = d.file_id
             WHERE f.status != 'QUARANTINE'
-              AND (i.name LIKE :qq OR d.supplier_ico LIKE :qq OR d.doc_number LIKE :qq)
+              AND (LOWER(i.name) LIKE LOWER(:qq) OR LOWER(d.supplier_ico) LIKE LOWER(:qq) OR LOWER(d.doc_number) LIKE LOWER(:qq))
             """
             return int(session.execute(text(sql), {"qq": qq}).scalar_one() or 0)
 
@@ -649,12 +652,12 @@ def list_items(
                     where_sql_ids = where_sql + " AND i.id IN :ids"
                 else:
                     like = f"%{q}%"
-                    where_sql_ids = where_sql + " AND (i.name LIKE :like OR d.supplier_ico LIKE :like OR d.doc_number LIKE :like)"
+                    where_sql_ids = where_sql + " AND (LOWER(i.name) LIKE LOWER(:like) OR LOWER(d.supplier_ico) LIKE LOWER(:like) OR LOWER(d.doc_number) LIKE LOWER(:like))"
                     params["like"] = like
             except Exception:
                 # fallback LIKE
                 like = f"%{q}%"
-                where_sql_ids = where_sql + " AND (i.name LIKE :like OR d.supplier_ico LIKE :like OR d.doc_number LIKE :like)"
+                where_sql_ids = where_sql + " AND (LOWER(i.name) LIKE LOWER(:like) OR LOWER(d.supplier_ico) LIKE LOWER(:like) OR LOWER(d.doc_number) LIKE LOWER(:like))"
                 params["like"] = like
             where_sql_final = where_sql_ids
         else:

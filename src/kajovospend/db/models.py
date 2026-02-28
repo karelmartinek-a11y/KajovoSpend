@@ -125,6 +125,8 @@ class LineItem(Base):
     __tablename__ = "items"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Produkční identifikátor (zpětná kompatibilita s původní DB); může být shodný s id.
+    id_item: Mapped[int | None] = mapped_column(Integer, unique=True, index=True, nullable=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"), index=True)
     line_no: Mapped[int] = mapped_column(Integer)
 

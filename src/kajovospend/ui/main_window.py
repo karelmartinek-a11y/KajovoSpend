@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, bindparam
 from sqlalchemy.orm import selectinload
 
 from shiboken6 import Shiboken
@@ -2107,7 +2107,7 @@ class MainWindow(QMainWindow):
         self.items_doc_items_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.items_doc_items_table.verticalHeader().setVisible(False)
         self.items_doc_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.items_doc_items_table.setMaximumWidth(420)
+        self.items_doc_items_table.setMaximumWidth(360)
         ir.addWidget(self.items_doc_items_table, 1)
 
         self.items_preview = PdfPreviewView()
@@ -2167,6 +2167,11 @@ class MainWindow(QMainWindow):
         sr.addWidget(QLabel("Zdroj:")); sr.addWidget(self.doc_src_line, 1); sr.addWidget(self.btn_open_source)
         sr.addWidget(self.btn_zoom_in); sr.addWidget(self.btn_zoom_out); sr.addWidget(self.btn_zoom_reset)
         rl.addWidget(srcrow)
+
+        self.doc_supplier_info = QLabel("")
+        self.doc_supplier_info.setWordWrap(True)
+        self.doc_supplier_info.setObjectName("DocSupplierInfo")
+        rl.addWidget(self.doc_supplier_info)
 
         self.preview_view = PdfPreviewView()
         rl.addWidget(self.preview_view, 3)
@@ -2428,6 +2433,10 @@ class MainWindow(QMainWindow):
             ])
 
         self.items_table.setModel(TableModel(headers, trows))
+        try:
+            self.items_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        except Exception:
+            pass
         self.lbl_items_page.setText(f"{self._items_offset} / {self._items_total}")
         self.btn_items_more.setEnabled(self._items_offset < self._items_total)
 
@@ -2512,7 +2521,10 @@ class MainWindow(QMainWindow):
                 else:
                     session.execute(text("INSERT INTO item_groups (name) VALUES (:n)"), {"n": group_name})
                     gid = int(session.execute(text("SELECT last_insert_rowid()")).scalar_one())
-                session.execute(text("UPDATE items SET group_id = :gid WHERE COALESCE(id_item, id) IN :ids"), {"gid": gid, "ids": tuple(ids)})
+                stmt = text("UPDATE items SET group_id = :gid WHERE COALESCE(id_item, id) IN (:ids)").bindparams(
+                    bindparam("ids", expanding=True), bindparam("gid")
+                )
+                session.execute(stmt, {"gid": gid, "ids": ids})
                 session.commit()
             self._groups_refresh()
             self._load_items_page_v2(reset=True)
@@ -2946,6 +2958,20 @@ class MainWindow(QMainWindow):
         self._current_doc_file_id = int(f.id) if f else None
         self._current_doc_path = f.current_path if f else None
         self.doc_src_line.setText(self._current_doc_path or "")
+        supplier_name = ""
+        supplier_ico = ""
+        try:
+            supplier_name = (doc.supplier.name if doc.supplier else "") or (doc.supplier_ico or "")
+            supplier_ico = doc.supplier_ico or ""
+        except Exception:
+            pass
+        total_wo = doc.total_without_vat if getattr(doc, "total_without_vat", None) is not None else None
+        total_txt = f"{float(doc.total_without_vat or 0.0):,.2f}".replace(",", " ") if total_wo is not None else "-"
+        items_cnt = len(items)
+        self.doc_supplier_info.setText(
+            f"<b>Dodavatel:</b> {supplier_name or '-'} &nbsp;|&nbsp; <b>IČO:</b> {supplier_ico or '-'} "
+            f"&nbsp;|&nbsp; <b>Celkem bez DPH:</b> {total_txt} &nbsp;|&nbsp; <b>Položek:</b> {items_cnt}"
+        )
 
         rows = []
         for it in items:
@@ -3067,6 +3093,22 @@ class MainWindow(QMainWindow):
                 session.add(doc)
 
             session.flush()
+            try:
+                session.execute(
+                    text(
+                        """
+                        UPDATE items
+                        SET
+                            id_item = COALESCE(id_item, id),
+                            id_receipt = COALESCE(id_receipt, (SELECT COALESCE(id_receipt, id) FROM documents WHERE id = :doc_id)),
+                            id_supplier = COALESCE(id_supplier, (SELECT supplier_id FROM documents WHERE id = :doc_id))
+                        WHERE document_id = :doc_id
+                        """
+                    ),
+                    {"doc_id": int(doc_id)},
+                )
+            except Exception:
+                pass
             # rebuild FTS (text = položky)
             full_text = "\n".join([(r.get("name") or "").strip() for r in rows if (r.get("name") or "").strip()])
             rebuild_fts_for_document(session, doc_id, full_text=full_text)
@@ -4636,6 +4678,37 @@ class MainWindow(QMainWindow):
                 self._unproc_rows.append({"id_in": int(r.id_in), "path": path_cur, "file_id": file_id})
 
             known_paths = {str((x.get("path") or "")).strip() for x in self._unproc_rows if x.get("path")}
+            # doplň z produkční DB (soubor v karanténě/duplicita)
+            try:
+                with self.sf() as session:
+                    prods = session.execute(
+                        select(DocumentFile).where(DocumentFile.status.in_(["QUARANTINE", "DUPLICATE"]))
+                    ).scalars().all()
+                for fobj in prods:
+                    pstr = str(fobj.current_path or fobj.original_path or "")
+                    if not pstr or pstr in known_paths:
+                        continue
+                    size_txt = ""
+                    mtime_txt = ""
+                    try:
+                        st = Path(pstr).stat()
+                        size_txt = f"{st.st_size/1024.0:.0f} KB" if st.st_size < 1024 * 1024 else f"{st.st_size/1024/1024:.2f} MB"
+                        mtime_txt = dt.datetime.fromtimestamp(st.st_mtime).isoformat(sep=" ", timespec="seconds")
+                    except Exception:
+                        pass
+                    table_rows.append([
+                        int(fobj.id),
+                        fobj.status or "",
+                        Path(pstr).name,
+                        size_txt,
+                        mtime_txt,
+                        "produkční DB",
+                        pstr,
+                    ])
+                    self._unproc_rows.append({"id_in": int(fobj.id), "path": pstr, "file_id": int(fobj.id)})
+                    known_paths.add(pstr)
+            except Exception:
+                pass
             paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
             out_base = Path(paths_cfg.get("output_dir", "") or "")
             qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
