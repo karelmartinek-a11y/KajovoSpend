@@ -2020,12 +2020,22 @@ class MainWindow(QMainWindow):
         self.lbl_items_doc = QLabel("")
         ir.addWidget(self.lbl_items_doc)
 
+        self.items_doc_items_table = QTableView()
+        self.items_doc_items_table.setAlternatingRowColors(True)
+        self.items_doc_items_table.setShowGrid(True)
+        self.items_doc_items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.items_doc_items_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.items_doc_items_table.verticalHeader().setVisible(False)
+        self.items_doc_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.items_doc_items_table.setMaximumWidth(420)
+        ir.addWidget(self.items_doc_items_table, 1)
+
         self.items_preview = PdfPreviewView()
-        ir.addWidget(self.items_preview, 1)
+        ir.addWidget(self.items_preview, 2)
         items_split.addWidget(items_right)
 
-        items_split.setStretchFactor(0, 2)
-        items_split.setStretchFactor(1, 3)
+        items_split.setStretchFactor(0, 3)
+        items_split.setStretchFactor(1, 2)
 
         self.tabs.addTab(self.tab_items, "POLOŽKY")
 
@@ -2106,7 +2116,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
         dl2.addWidget(splitter, 1)
-        self.tabs.addTab(self.tab_docs, "Účty")
+        self.tabs.addTab(self.tab_docs, "Účtenky")
 
         self.setCentralWidget(root)
 
@@ -2422,7 +2432,7 @@ class MainWindow(QMainWindow):
                 else:
                     session.execute(text("INSERT INTO item_groups (name) VALUES (:n)"), {"n": group_name})
                     gid = int(session.execute(text("SELECT last_insert_rowid()")).scalar_one())
-                session.execute(text("UPDATE items SET group_id = :gid WHERE id_item IN :ids"), {"gid": gid, "ids": tuple(ids)})
+                session.execute(text("UPDATE items SET group_id = :gid WHERE COALESCE(id_item, id) IN :ids"), {"gid": gid, "ids": tuple(ids)})
                 session.commit()
             self._groups_refresh()
             self._load_items_page_v2(reset=True)
@@ -2440,6 +2450,7 @@ class MainWindow(QMainWindow):
                 self.items_preview.clear()
                 self.items_src.setText("")
                 self.lbl_items_doc.setText("")
+                self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
                 return
             # použij první pro detail, ale zachovej multiselect pro bulk akce
             row = int(idxs[0].row())
@@ -2464,9 +2475,36 @@ class MainWindow(QMainWindow):
             total_txt = f"{float(doc_total or 0.0):,.2f}".replace(",", " ")
         except Exception:
             total_txt = str(doc_total or "")
+        doc_total_wo_vat = meta.get("doc_total_without_vat")
+        try:
+            total_wo_vat_txt = f"{float(doc_total_wo_vat or 0.0):,.2f}".replace(",", " ")
+        except Exception:
+            total_wo_vat_txt = str(doc_total_wo_vat or "")
         self.lbl_items_doc.setText(
-            f"{issue_s} | {supplier} | IČO {ico} | Doklad {dn} | Celkem (s DPH) {total_txt}"
+            f"{issue_s} | {supplier} | IČO {ico} | Doklad {dn} | Celkem bez DPH {total_wo_vat_txt} | Počet položek {int(meta.get('doc_items_count') or 0)}"
         )
+
+        try:
+            doc_id = int(meta.get("document_id") or 0)
+        except Exception:
+            doc_id = 0
+        if doc_id:
+            with self.sf() as session:
+                doc_items = session.execute(
+                    select(LineItem).where(LineItem.document_id == doc_id).order_by(LineItem.line_no.asc())
+                ).scalars().all()
+            item_headers = ["Počet", "Název položky", "Cena bez DPH za kus"]
+            item_rows = []
+            for it in doc_items:
+                item_rows.append([
+                    float(it.quantity or 0.0),
+                    it.name or "",
+                    float(getattr(it, "unit_price_net", None) or getattr(it, "unit_price", None) or 0.0),
+                ])
+            self.items_doc_items_table.setModel(TableModel(item_headers, item_rows))
+            self.items_doc_items_table.resizeColumnsToContents()
+        else:
+            self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
 
         if path:
             QTimer.singleShot(0, lambda: self._load_preview(self.items_preview, path))
@@ -2767,6 +2805,8 @@ class MainWindow(QMainWindow):
                         "date": d.issue_date.isoformat() if d.issue_date else "",
                         "total": float(d.total_with_vat or 0.0) if d.total_with_vat is not None else 0.0,
                         "supplier": (sup_names.get(int(d.supplier_id)) if d.supplier_id else "") or (d.supplier_ico or "") or "",
+                        "supplier_ico": (d.supplier_ico or "") if getattr(d, "supplier_ico", None) is not None else "",
+                        "total_without_vat": float(d.total_without_vat or 0.0) if d.total_without_vat is not None else 0.0,
                         "doc_number": (d.doc_number or "") if getattr(d, "doc_number", None) is not None else "",
                         "items_count": counts.get(did, 0),
                         "status": f.status or "",
@@ -2774,8 +2814,8 @@ class MainWindow(QMainWindow):
                 )
 
         # render table
-        headers = ["Datum", "Číslo účtenky", "Celkem vč. DPH", "Dodavatel", "Počet položek", "Stav"]
-        trows = [[r["date"], r.get("doc_number", ""), r["total"], r["supplier"], r["items_count"], r["status"]] for r in self._docs_listing]
+        headers = ["Datum", "Číslo účtenky", "Celkem vč. DPH", "Dodavatel", "IČO dodavatele", "Celkem bez DPH", "Počet položek", "Stav"]
+        trows = [[r["date"], r.get("doc_number", ""), r["total"], r["supplier"], r.get("supplier_ico", ""), r.get("total_without_vat", 0.0), r["items_count"], r["status"]] for r in self._docs_listing]
         self.docs_table.setModel(TableModel(headers, trows))
         self._doc_offset = len(self._docs_listing)
         self.lbl_docs_page.setText(f"{self._doc_offset} / {self._doc_total}")
@@ -4485,7 +4525,7 @@ class MainWindow(QMainWindow):
         """Seznam karanténních souborů (FS + DB), řádek = jeden soubor."""
         try:
             with self.pf() as ps:
-                recs = ps.query(IngestFile).filter(IngestFile.status == "QUARANTINE").order_by(IngestFile.created_at.desc()).all()
+                recs = ps.query(IngestFile).filter(IngestFile.status.in_(["QUARANTINE", "DUPLICATE"])).order_by(IngestFile.created_at.desc()).all()
 
             self._unproc_rows = []
             table_rows = []
@@ -4501,10 +4541,55 @@ class MainWindow(QMainWindow):
                     Path(path_cur).name,
                     size_txt,
                     mtime_txt,
-                    "processing",
+                    "zpracování",
                     path_cur,
                 ])
-                self._unproc_rows.append({"id_in": int(r.id_in), "path": path_cur})
+                file_id = None
+                try:
+                    with self.sf() as session:
+                        fobj = session.execute(select(DocumentFile).where(DocumentFile.current_path == path_cur)).scalar_one_or_none()
+                        if not fobj and r.sha256:
+                            fobj = session.execute(select(DocumentFile).where(DocumentFile.sha256 == r.sha256)).scalar_one_or_none()
+                        file_id = int(fobj.id) if fobj else None
+                except Exception:
+                    file_id = None
+                self._unproc_rows.append({"id_in": int(r.id_in), "path": path_cur, "file_id": file_id})
+
+            known_paths = {str((x.get("path") or "")).strip() for x in self._unproc_rows if x.get("path")}
+            paths_cfg = self.cfg.get("paths", {}) if isinstance(self.cfg, dict) else {}
+            out_base = Path(paths_cfg.get("output_dir", "") or "")
+            qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
+            ddir = out_base / paths_cfg.get("duplicate_dir_name", "DUPLICITY")
+            exts = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+            fs_id = -1
+            for status, base in (("QUARANTINE", qdir), ("DUPLICATE", ddir)):
+                if not base.exists():
+                    continue
+                for p in base.rglob("*"):
+                    if (not p.is_file()) or (p.suffix.lower() not in exts):
+                        continue
+                    pstr = str(p)
+                    if pstr in known_paths:
+                        continue
+                    try:
+                        st = p.stat()
+                        size = st.st_size
+                        mtime_txt = dt.datetime.fromtimestamp(st.st_mtime).isoformat(sep=" ", timespec="seconds")
+                        size_txt = f"{size/1024.0:.0f} KB" if size < 1024 * 1024 else f"{size/1024/1024:.2f} MB"
+                    except Exception:
+                        size_txt = ""
+                        mtime_txt = ""
+                    table_rows.append([
+                        fs_id,
+                        status,
+                        p.name,
+                        size_txt,
+                        mtime_txt,
+                        "souborový systém",
+                        pstr,
+                    ])
+                    self._unproc_rows.append({"id_in": fs_id, "path": pstr, "file_id": None})
+                    fs_id -= 1
 
             headers = ["ID_IN", "Stav", "Soubor", "Velikost", "Čas", "Zdroj", "path"]
             self.unproc_table.setModel(TableModel(headers, table_rows))
@@ -4806,9 +4891,14 @@ class MainWindow(QMainWindow):
             if not model or not index.isValid():
                 return
             row = int(index.row())
+            file_id = None
+            path_val = model.rows[row][6] if hasattr(model, "rows") else None
+            if 0 <= row < len(getattr(self, "_unproc_rows", [])):
+                file_id = self._unproc_rows[row].get("file_id")
+                path_val = self._unproc_rows[row].get("path") or path_val
             meta = {
-                "file_id": None,
-                "path": model.rows[row][6] if hasattr(model, "rows") else None,
+                "file_id": file_id,
+                "path": path_val,
             }
             self._current_unproc = meta
         except Exception:
