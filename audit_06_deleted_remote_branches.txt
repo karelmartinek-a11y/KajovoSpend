@@ -1,0 +1,51 @@
+error: unable to delete 'origin': remote ref does not exist
+error: failed to push some refs to 'https://github.com/karelmartinek-a11y/KajovoSpend.git'
+origin
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/add-forensic-logging-to-program
+origin/codex/add-forensic-logging-to-program
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/add-forensic-logging-with-detailed-output
+origin/codex/add-forensic-logging-with-detailed-output
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/adjust-processing-to-run-sequentially
+origin/codex/adjust-processing-to-run-sequentially
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/analyze-and-prevent-duplicate-file-quarantine
+origin/codex/analyze-and-prevent-duplicate-file-quarantine
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/check-kajovospend-for-macos-compilation
+origin/codex/check-kajovospend-for-macos-compilation
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/conduct-broad-security-audit-and-improvements
+origin/codex/conduct-broad-security-audit-and-improvements
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/enable-full-functionality-for-kajovospend
+origin/codex/enable-full-functionality-for-kajovospend
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/fix-openai-json-schema-validation-errors
+origin/codex/fix-openai-json-schema-validation-errors
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/implement-forensic-analysis-with-database-separation
+origin/codex/implement-forensic-analysis-with-database-separation
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/implement-multiple-ui-improvements-and-fixes
+origin/codex/implement-multiple-ui-improvements-and-fixes
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/perform-comprehensive-security-audit
+origin/codex/perform-comprehensive-security-audit
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/perform-forensic-audit-of-kajovospend
+origin/codex/perform-forensic-audit-of-kajovospend
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/prepare-branch-and-inventory-for-offline-vat
+origin/codex/prepare-branch-and-inventory-for-offline-vat
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/prepare-branch-and-inventory-for-offline-vat-1uck06
+origin/codex/prepare-branch-and-inventory-for-offline-vat-1uck06
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         codex/verify-openai-extraction-function-implementation
+origin/codex/verify-openai-extraction-function-implementation
+To https://github.com/karelmartinek-a11y/KajovoSpend.git
+ - [deleted]         copilot/sub-pr-16
+origin/copilot/sub-pr-16

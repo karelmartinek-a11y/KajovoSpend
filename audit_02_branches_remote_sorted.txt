@@ -1,0 +1,19 @@
+﻿  origin/HEAD                                                       -> origin/main
+  origin/main                                                       f674ccc fix: uvolni db engine v migracnim testu (win lock)
+  origin/codex/check-kajovospend-for-macos-compilation              650f366 Merge pull request #17 from karelmartinek-a11y/copilot/sub-pr-16
+  origin/copilot/sub-pr-16                                          f794f8b Initial plan
+  origin/codex/add-forensic-logging-to-program                      7a7fa38 Přidej forenzní bundle pro analýzu nevytěžených dokladů
+  origin/codex/analyze-and-prevent-duplicate-file-quarantine        6e43af1 Oprav forenzni opakovane vytezeni bez falesne duplicity
+  origin/codex/adjust-processing-to-run-sequentially                faf8f9b Zpracuj opakované vytěžení sekvenčně
+  origin/codex/implement-multiple-ui-improvements-and-fixes         59589c5 Uprav forenzní workflow a navigaci v GUI
+  origin/codex/implement-forensic-analysis-with-database-separation 2b48c08 Oprav integrační fixture pro tvrdou validaci dodavatele
+  origin/codex/perform-forensic-audit-of-kajovospend                25215e3 Dopln forenzni audit a oprav robustnost migraci a OpenAI
+  origin/codex/fix-openai-json-schema-validation-errors             6f1ecc4 Zpevni OpenAI json_schema invarianty a fallback logiku
+  origin/codex/add-forensic-logging-with-detailed-output            db8d9a1 Rozšiř forenzní logging napříč aplikací
+  origin/codex/verify-openai-extraction-function-implementation     0f28af9 Sjednotit OpenAI vytěžení se schema výstupem
+  origin/codex/conduct-comprehensive-python-security-audit          2c56e32 docs: Doplň audit a triage pro ARES timeout/cache
+  origin/codex/conduct-broad-security-audit-and-improvements        ead8aa4 fix: oprav rozpad testu po zmene postprocess a schema files
+  origin/codex/enable-full-functionality-for-kajovospend            704ef29 Oprav stránkování obrázků a výchozí OpenAI model
+  origin/codex/prepare-branch-and-inventory-for-offline-vat-1uck06  6fd0fb4 Doplň metadata balíčku o testování a dokumentaci
+  origin/codex/prepare-branch-and-inventory-for-offline-vat         de0df42 db: add net/gross totals and VAT fields
+  origin/codex/perform-comprehensive-security-audit                 4f2f469 fix: stabilizuj integracni test ares a zpracovani
