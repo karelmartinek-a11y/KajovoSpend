@@ -310,6 +310,28 @@ class TableModel(QAbstractTableModel):
         self.headers = headers
         self.rows = rows
 
+    def sort(self, column: int, order: Qt.SortOrder = Qt.AscendingOrder):
+        """Simple in-memory sort to support clickable headers."""
+        if not (0 <= column < len(self.headers)):
+            return
+
+        def _key(r):
+            try:
+                v = r[column]
+                if v is None or v == "":
+                    return (1, "")
+                # try numeric
+                if isinstance(v, (int, float)):
+                    return (0, float(v))
+                sv = str(v)
+                return (0, sv.lower())
+            except Exception:
+                return (1, "")
+
+        self.layoutAboutToBeChanged.emit()
+        self.rows = sorted(self.rows, key=_key, reverse=(order == Qt.DescendingOrder))
+        self.layoutChanged.emit()
+
     def flags(self, index: QModelIndex):
         if not index.isValid():
             return Qt.NoItemFlags
@@ -1544,6 +1566,7 @@ class MainWindow(QMainWindow):
         self.ops_table.setAlternatingRowColors(True)
         self.ops_table.setShowGrid(True)
         self.ops_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.ops_table.setSortingEnabled(True)
         self.ops_table.verticalHeader().setVisible(False)
         self.ops_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._ops_columns_initialized = False
@@ -1565,6 +1588,7 @@ class MainWindow(QMainWindow):
         self.unproc_table.setShowGrid(True)
         self.unproc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.unproc_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.unproc_table.setSortingEnabled(True)
         self.unproc_table.verticalHeader().setVisible(False)
         self.unproc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.unproc_table.clicked.connect(self.on_unproc_selected)
@@ -1573,6 +1597,8 @@ class MainWindow(QMainWindow):
         row_actions = QWidget()
         rah = QHBoxLayout(row_actions)
         rah.setContentsMargins(0, 0, 0, 0)
+        self.unproc_filter = QLineEdit()
+        self.unproc_filter.setPlaceholderText("Fulltext název souboru…")
         self.btn_unproc_refresh = QPushButton("Obnovit")
         self.cb_unproc_q = QCheckBox("Karanténa")
         self.cb_unproc_q.setChecked(True)
@@ -1581,6 +1607,7 @@ class MainWindow(QMainWindow):
         self.btn_unproc_save = QPushButton("Uložit ručně")
         self.btn_unproc_retry_ai = QPushButton("OpenAI znovu (vybraný)")
         self.btn_unproc_retry_ai_all = QPushButton("OpenAI znovu (výběr)")
+        rah.addWidget(self.unproc_filter, 1)
         rah.addWidget(self.btn_unproc_refresh)
         rah.addWidget(self.cb_unproc_q)
         rah.addWidget(self.cb_unproc_d)
@@ -1963,6 +1990,7 @@ class MainWindow(QMainWindow):
         self.sup_table.setShowGrid(True)
         self.sup_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.sup_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.sup_table.setSortingEnabled(True)
         self.sup_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         ll.addWidget(self.sup_table, 1)
 
@@ -2090,6 +2118,7 @@ class MainWindow(QMainWindow):
         self.items_table.setShowGrid(True)
         self.items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.items_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.items_table.setSortingEnabled(True)
         self.items_table.verticalHeader().setVisible(False)
         self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         il.addWidget(self.items_table, 1)
@@ -2165,6 +2194,7 @@ class MainWindow(QMainWindow):
         self.docs_table.setShowGrid(True)
         self.docs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.docs_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.docs_table.setSortingEnabled(True)
         self.docs_table.verticalHeader().setVisible(False)
         self.docs_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         ll.addWidget(self.docs_table, 1)
@@ -2263,6 +2293,7 @@ class MainWindow(QMainWindow):
         self.btn_unproc_refresh.clicked.connect(self.refresh_unprocessed)
         self.cb_unproc_q.toggled.connect(self.refresh_unprocessed)
         self.cb_unproc_d.toggled.connect(self.refresh_unprocessed)
+        self.unproc_filter.returnPressed.connect(self.refresh_unprocessed)
         self.btn_ops_retry_all.clicked.connect(self._retry_all_unprocessed_files)
         self.btn_ops_bulk_retry.clicked.connect(self._ops_retry_selected)
         self.btn_ops_bulk_delete.clicked.connect(self._ops_delete_selected)
@@ -4680,19 +4711,23 @@ class MainWindow(QMainWindow):
                     .all()
                 )
 
-            self._unproc_rows = []
-            table_rows = []
-            for r in recs:
-                size = r.size
-                size_txt = "" if size is None else (f"{size/1024.0:.0f} KB" if size < 1024 * 1024 else f"{size/1024/1024:.2f} MB")
-                mtime = r.mtime
-                mtime_txt = mtime.isoformat(sep=" ", timespec="seconds") if mtime else ""
-                path_cur = r.path_current or r.path_original or ""
-                table_rows.append([
-                    int(r.id_in),
-                    str(r.status or ""),
-                    Path(path_cur).name,
-                    size_txt,
+        self._unproc_rows = []
+        table_rows = []
+        for r in recs:
+            size = r.size
+            size_txt = "" if size is None else (f"{size/1024.0:.0f} KB" if size < 1024 * 1024 else f"{size/1024/1024:.2f} MB")
+            mtime = r.mtime
+            mtime_txt = mtime.isoformat(sep=" ", timespec="seconds") if mtime else ""
+            path_cur = r.path_current or r.path_original or ""
+            if (self.unproc_filter.text() or "").strip():
+                q = self.unproc_filter.text().strip().lower()
+                if q not in Path(path_cur).name.lower():
+                    continue
+            table_rows.append([
+                int(r.id_in),
+                str(r.status or ""),
+                Path(path_cur).name,
+                size_txt,
                     mtime_txt,
                     "zpracování",
                     path_cur,
@@ -4757,6 +4792,10 @@ class MainWindow(QMainWindow):
                     pstr = str(p)
                     if pstr in known_paths:
                         continue
+                    if (self.unproc_filter.text() or "").strip():
+                        q = self.unproc_filter.text().strip().lower()
+                        if q not in p.name.lower():
+                            continue
                     try:
                         st = p.stat()
                         size = st.st_size
@@ -5104,6 +5143,7 @@ class MainWindow(QMainWindow):
             self._unproc_selected_path = path_val
         except Exception:
             self._current_unproc = None
+            self._unproc_selected_path = None
         # reset form
         self._reset_unproc_form()
         path = None

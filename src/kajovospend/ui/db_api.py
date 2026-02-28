@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import select, text, func, case
+from sqlalchemy import select, text, func, case, bindparam
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -663,7 +663,7 @@ def list_items(
         else:
             where_sql_final = where_sql
 
-        sql = f"""
+        sql_base = f"""
         SELECT
           COALESCE(i.id_item, i.id) AS id_item,
           i.id_receipt   AS id_receipt,
@@ -697,7 +697,10 @@ def list_items(
         ORDER BY d.issue_date DESC NULLS LAST, d.id DESC, i.line_no ASC
         {lim_sql}
         """
-        return [dict(r) for r in session.execute(text(sql), params).mappings().all()]
+        stmt = text(sql_base)
+        if "ids" in params:
+            stmt = stmt.bindparams(bindparam("ids", expanding=True))
+        return [dict(r) for r in session.execute(stmt, params).mappings().all()]
     except OperationalError:
         return []
 
