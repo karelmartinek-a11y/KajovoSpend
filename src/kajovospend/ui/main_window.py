@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageFilter, ImageOps
 
-from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl, QPointF, QRectF, QSize
+from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QObject, Signal, Slot, QThread, QUrl, QPointF, QRectF, QSize, QItemSelectionModel
 from PySide6.QtGui import QIcon, QPixmap, QImage, QDesktopServices, QPainter, QPen, QColor, QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QTabWidget, QTableView,
@@ -2303,7 +2303,6 @@ class MainWindow(QMainWindow):
         self.btn_api_load.clicked.connect(self._on_api_load)
         self.btn_api_test.clicked.connect(self._on_api_test)
         self.btn_api_models.clicked.connect(self._on_api_models)
-        self.btn_new_db.clicked.connect(lambda: init_new_db(self))
 
         self.btn_sup_refresh.clicked.connect(self.refresh_suppliers)
         self._sup_filter_timer.timeout.connect(self.refresh_suppliers)
@@ -3351,6 +3350,14 @@ class MainWindow(QMainWindow):
         if notes:
             msg += "\n\nÚpravy:\n- " + "\n- ".join(notes)
         QMessageBox.information(self, "Nastavení", msg)
+
+    def _on_new_db(self) -> None:
+        """Vytvoří novou DB dle výběru a uloží nastavení."""
+        init_new_db(self)
+        try:
+            save_yaml(self.config_path, self.cfg)
+        except Exception:
+            pass
 
     # --- Backup / restore / reset ---
 
@@ -4963,7 +4970,7 @@ class MainWindow(QMainWindow):
                         pval = m.index(ridx, 6).data()
                         if pval in keep_paths:
                             idx = m.index(ridx, 0)
-                            sm.select(idx, sm.Select | sm.Rows)
+                            sm.select(idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
                             reselection_done = True
                     except Exception:
                         continue
@@ -4972,7 +4979,7 @@ class MainWindow(QMainWindow):
                 self.unproc_table.setCurrentIndex(idx)
                 sm = self.unproc_table.selectionModel()
                 if sm:
-                    sm.select(idx, sm.ClearAndSelect | sm.Rows)
+                    sm.select(idx, QItemSelectionModel.Clear | QItemSelectionModel.Select | QItemSelectionModel.Rows)
                 self.on_unproc_selected(idx)
         except Exception as e:
             try:
