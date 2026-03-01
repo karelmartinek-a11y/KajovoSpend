@@ -4734,23 +4734,23 @@ class MainWindow(QMainWindow):
                     .all()
                 )
 
-        self._unproc_rows = []
-        table_rows = []
-        for r in recs:
-            size = r.size
-            size_txt = "" if size is None else (f"{size/1024.0:.0f} KB" if size < 1024 * 1024 else f"{size/1024/1024:.2f} MB")
-            mtime = r.mtime
-            mtime_txt = mtime.isoformat(sep=" ", timespec="seconds") if mtime else ""
-            path_cur = r.path_current or r.path_original or ""
-            if (self.unproc_filter.text() or "").strip():
-                q = self.unproc_filter.text().strip().lower()
-                if q not in Path(path_cur).name.lower():
-                    continue
-            table_rows.append([
-                int(r.id_in),
-                str(r.status or ""),
-                Path(path_cur).name,
-                size_txt,
+            self._unproc_rows = []
+            table_rows = []
+            for r in recs:
+                size = r.size
+                size_txt = "" if size is None else (f"{size/1024.0:.0f} KB" if size < 1024 * 1024 else f"{size/1024/1024:.2f} MB")
+                mtime = r.mtime
+                mtime_txt = mtime.isoformat(sep=" ", timespec="seconds") if mtime else ""
+                path_cur = r.path_current or r.path_original or ""
+                if (self.unproc_filter.text() or "").strip():
+                    q = self.unproc_filter.text().strip().lower()
+                    if q not in Path(path_cur).name.lower():
+                        continue
+                table_rows.append([
+                    int(r.id_in),
+                    str(r.status or ""),
+                    Path(path_cur).name,
+                    size_txt,
                     mtime_txt,
                     "zpracování",
                     path_cur,
