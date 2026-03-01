@@ -1696,6 +1696,8 @@ class MainWindow(QMainWindow):
         self.btn_pick_input = QPushButton("Vybrat")
         self.ed_output_dir = QLineEdit(self.cfg["paths"].get("output_dir", ""))
         self.btn_pick_output = QPushButton("Vybrat")
+        self.ed_db_dir = QLineEdit(str(self.paths.data_dir))
+        self.btn_pick_db_dir = QPushButton("Vybrat")
 
         row_in = QWidget(); r3 = QHBoxLayout(row_in); r3.setContentsMargins(0,0,0,0)
         r3.addWidget(self.ed_input_dir, 1); r3.addWidget(self.btn_pick_input)
@@ -1704,6 +1706,10 @@ class MainWindow(QMainWindow):
         row_out = QWidget(); r4 = QHBoxLayout(row_out); r4.setContentsMargins(0,0,0,0)
         r4.addWidget(self.ed_output_dir, 1); r4.addWidget(self.btn_pick_output)
         form.addRow("Output adresář", row_out)
+
+        row_db = QWidget(); r5 = QHBoxLayout(row_db); r5.setContentsMargins(0,0,0,0)
+        r5.addWidget(self.ed_db_dir, 1); r5.addWidget(self.btn_pick_db_dir)
+        form.addRow("Adresář databáze", row_db)
 
         # OpenAI nastaveni
         openai_cfg = self.cfg.get("openai", {}) if isinstance(self.cfg, dict) else {}
@@ -2279,6 +2285,7 @@ class MainWindow(QMainWindow):
 
         self.btn_pick_input.clicked.connect(lambda: self._pick_dir(self.ed_input_dir))
         self.btn_pick_output.clicked.connect(lambda: self._pick_dir(self.ed_output_dir))
+        self.btn_pick_db_dir.clicked.connect(lambda: self._pick_dir(self.ed_db_dir))
         self.btn_save_settings.clicked.connect(self.on_save_settings)
         self.btn_backup_program.clicked.connect(self._on_backup_program)
         self.btn_restore_program.clicked.connect(self._on_restore_program)
@@ -2876,7 +2883,7 @@ class MainWindow(QMainWindow):
             pass
         self._docs_new_search_v2()
         try:
-            self.refresh_unprocessed(force=False)
+            self.refresh_unprocessed(force=True)
         except Exception:
             pass
         try:
@@ -3285,6 +3292,12 @@ class MainWindow(QMainWindow):
         notes = self._normalize_openai_settings()
         deep_set(self.cfg, ["paths", "input_dir"], self.ed_input_dir.text().strip())
         deep_set(self.cfg, ["paths", "output_dir"], self.ed_output_dir.text().strip())
+        db_dir_txt = self.ed_db_dir.text().strip()
+        if not db_dir_txt:
+            QMessageBox.warning(self, "Nastavení", "Vyberte prosím adresář pro databázi.")
+            return
+        deep_set(self.cfg, ["app", "data_dir"], db_dir_txt)
+        deep_set(self.cfg, ["app", "db_path"], str(Path(db_dir_txt) / "kajovospend.sqlite"))
         deep_set(self.cfg, ["openai", "api_key"], "")  # API klíč se nikdy neukládá do YAML; použijte ENV KAJOVOSPEND_OPENAI_API_KEY
         deep_set(self.cfg, ["openai", "enabled"], True)
         deep_set(self.cfg, ["openai", "auto_enable"], False)
