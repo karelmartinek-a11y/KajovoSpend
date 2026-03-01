@@ -5652,12 +5652,17 @@ class MainWindow(QMainWindow):
 
         if c:
             try:
-                q_fs = int(c.get("quarantine_fs", c.get("quarantine", 0)) or 0)
-                d_fs = int(c.get("duplicates_fs", c.get("duplicates", 0)) or 0)
+                q_fs = int(c.get("quarantine_fs", 0) or 0)
+                d_fs = int(c.get("duplicates_fs", 0) or 0)
+                q_db = int(c.get("quarantine", 0) or 0)
+                d_db = int(c.get("duplicates", 0) or 0)
+                # používej nejvyšší z dostupných (FS/ingest/DB)
+                q_total = max(q_fs, q_db)
+                d_total = max(d_fs, d_db)
                 proc = int(c.get("processed", 0) or 0)
                 try:
-                    self._dash_tiles["quarantine_total"].set_value(str(q_fs))
-                    self._dash_tiles["quarantine_dup"].set_value(str(d_fs))
+                    self._dash_tiles["quarantine_total"].set_value(str(q_total))
+                    self._dash_tiles["quarantine_dup"].set_value(str(d_total))
                     self._dash_tiles["processed_total"].set_value(str(proc))
                 except Exception:
                     pass
@@ -5669,10 +5674,10 @@ class MainWindow(QMainWindow):
                     pass
 
                 # Procentuální statistiky z celkového počtu souborů (PROCESSED + QUARANTINE + DUPLICATE)
-                total_files = proc + q_fs + d_fs
+                total_files = proc + q_total + d_total
                 try:
-                    pct_q = 100.0 * q_fs / total_files if total_files > 0 else 0.0
-                    pct_d = 100.0 * d_fs / total_files if total_files > 0 else 0.0
+                    pct_q = 100.0 * q_total / total_files if total_files > 0 else 0.0
+                    pct_d = 100.0 * d_total / total_files if total_files > 0 else 0.0
                     if "pct_quarantine" in self._stat_labels:
                         self._stat_labels["pct_quarantine"].setText(f"{pct_q:.1f} %")
                     if "pct_duplicate" in self._stat_labels:
