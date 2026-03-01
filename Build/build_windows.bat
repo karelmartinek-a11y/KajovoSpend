@@ -18,14 +18,11 @@ if not exist %ICON% (
 )
 
 REM Splash: použijeme stejné logo, PyInstaller zobrazí při startu
-set SPLASH=assets\\app.ico
-
-REM Spuštění PyInstalleru
+REM Spuštění PyInstalleru (bez splash screenu – okno se otevře hned)
 pyinstaller ^
   --noconfirm ^
   --windowed ^
   --icon=%ICON% ^
-  --splash=%SPLASH% ^
   --name=KajovoSpend ^
   run_gui.py
 

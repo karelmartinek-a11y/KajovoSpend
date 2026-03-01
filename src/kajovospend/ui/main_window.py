@@ -937,7 +937,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("KájovoSpend")
         ico = self.assets_dir / "app.ico"
         if ico.exists():
-            self.setWindowIcon(QIcon(str(ico)))
+            icon_obj = QIcon(str(ico))
+            self.setWindowIcon(icon_obj)
+            app = QApplication.instance()
+            if app is not None:
+                app.setWindowIcon(icon_obj)
 
         # Omez minimální velikost okna, aby se vešlo i na menší displeje a netlačilo geometry warnings.
         self.setMinimumSize(QSize(720, 540))
