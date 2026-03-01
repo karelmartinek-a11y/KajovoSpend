@@ -37,6 +37,7 @@ def init_new_db(window) -> None:
 
     # update config + state
     window.ed_db_dir.setText(str(path.parent))
+    window.cfg.setdefault("app", {})
     window.cfg["app"]["data_dir"] = str(path.parent)
     window.cfg["app"]["db_path"] = str(path)
     try:
