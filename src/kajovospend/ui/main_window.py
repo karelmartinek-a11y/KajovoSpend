@@ -1597,6 +1597,8 @@ class MainWindow(QMainWindow):
         self.unproc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.unproc_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.unproc_table.setSortingEnabled(True)
+        # keep selection on mouse move
+        self.unproc_table.setMouseTracking(True)
         self.unproc_table.verticalHeader().setVisible(False)
         self.unproc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.unproc_table.clicked.connect(self.on_unproc_selected)
@@ -1607,6 +1609,7 @@ class MainWindow(QMainWindow):
         rah.setContentsMargins(0, 0, 0, 0)
         self.unproc_filter = QLineEdit()
         self.unproc_filter.setPlaceholderText("Fulltext název souboru…")
+        self.unproc_counts = QLabel("Karanténa: 0 | Duplicity: 0")
         self.btn_unproc_refresh = QPushButton("Obnovit")
         self.cb_unproc_q = QCheckBox("Karanténa")
         self.cb_unproc_q.setChecked(True)
@@ -1616,6 +1619,7 @@ class MainWindow(QMainWindow):
         self.btn_unproc_retry_ai = QPushButton("OpenAI znovu (vybraný)")
         self.btn_unproc_retry_ai_all = QPushButton("OpenAI znovu (výběr)")
         rah.addWidget(self.unproc_filter, 1)
+        rah.addWidget(self.unproc_counts)
         rah.addWidget(self.btn_unproc_refresh)
         rah.addWidget(self.cb_unproc_q)
         rah.addWidget(self.cb_unproc_d)
@@ -4880,6 +4884,12 @@ class MainWindow(QMainWindow):
             headers = ["ID_IN", "Stav", "Soubor", "Velikost", "Čas", "Zdroj", "path"]
             self.unproc_table.setModel(TableModel(headers, table_rows))
             self.unproc_table.resizeColumnsToContents()
+            try:
+                total_q = sum(1 for r in self._unproc_rows if (r.get("status") or "").upper() == "QUARANTINE")
+                total_d = sum(1 for r in self._unproc_rows if (r.get("status") or "").upper() == "DUPLICATE")
+                self.unproc_counts.setText(f"Karanténa: {total_q} | Duplicity: {total_d}")
+            except Exception:
+                pass
             reselection_done = False
             if keep_path:
                 m = self.unproc_table.model()
@@ -5191,6 +5201,10 @@ class MainWindow(QMainWindow):
             if not model or not index.isValid():
                 return
             row = int(index.row())
+            # merge selection (keep multi-select)
+            sel_model = self.unproc_table.selectionModel()
+            if sel_model and not sel_model.isSelected(index):
+                sel_model.select(index, sel_model.Select | sel_model.Rows)
             file_id = None
             path_val = model.rows[row][6] if hasattr(model, "rows") else None
             if 0 <= row < len(getattr(self, "_unproc_rows", [])):
