@@ -56,6 +56,7 @@ from kajovospend.utils.env import load_user_env_var, set_user_env_var, sanitize_
 
 from .styles import QSS
 from . import db_api
+from .main_window_newdb import init_new_db
 
 
 class PdfPreviewView(QGraphicsView):
@@ -1702,6 +1703,7 @@ class MainWindow(QMainWindow):
         self.btn_pick_output = QPushButton("Vybrat")
         self.ed_db_dir = QLineEdit(str(self.paths.data_dir))
         self.btn_pick_db_dir = QPushButton("Vybrat")
+        self.btn_new_db = QPushButton("Inicializovat novou DB")
 
         row_in = QWidget(); r3 = QHBoxLayout(row_in); r3.setContentsMargins(0,0,0,0)
         r3.addWidget(self.ed_input_dir, 1); r3.addWidget(self.btn_pick_input)
@@ -1712,7 +1714,7 @@ class MainWindow(QMainWindow):
         form.addRow("Output adresář", row_out)
 
         row_db = QWidget(); r5 = QHBoxLayout(row_db); r5.setContentsMargins(0,0,0,0)
-        r5.addWidget(self.ed_db_dir, 1); r5.addWidget(self.btn_pick_db_dir)
+        r5.addWidget(self.ed_db_dir, 1); r5.addWidget(self.btn_pick_db_dir); r5.addWidget(self.btn_new_db)
         form.addRow("Adresář databáze", row_db)
 
         # OpenAI nastaveni
@@ -2290,6 +2292,7 @@ class MainWindow(QMainWindow):
         self.btn_pick_input.clicked.connect(lambda: self._pick_dir(self.ed_input_dir))
         self.btn_pick_output.clicked.connect(lambda: self._pick_dir(self.ed_output_dir))
         self.btn_pick_db_dir.clicked.connect(lambda: self._pick_dir(self.ed_db_dir))
+        self.btn_new_db.clicked.connect(self._on_new_db)
         self.btn_save_settings.clicked.connect(self.on_save_settings)
         self.btn_backup_program.clicked.connect(self._on_backup_program)
         self.btn_restore_program.clicked.connect(self._on_restore_program)
@@ -2300,6 +2303,7 @@ class MainWindow(QMainWindow):
         self.btn_api_load.clicked.connect(self._on_api_load)
         self.btn_api_test.clicked.connect(self._on_api_test)
         self.btn_api_models.clicked.connect(self._on_api_models)
+        self.btn_new_db.clicked.connect(lambda: init_new_db(self))
 
         self.btn_sup_refresh.clicked.connect(self.refresh_suppliers)
         self._sup_filter_timer.timeout.connect(self.refresh_suppliers)
@@ -3325,6 +3329,18 @@ class MainWindow(QMainWindow):
         # synteticke polozky: zapnute vsude, ale ne v rezimu only_openai
         deep_set(self.cfg, ["openai", "allow_synthetic_items"], (not only))
         save_yaml(self.config_path, self.cfg)
+        # refresh paths and engine if db moved
+        old_db = self.paths.db_path
+        self.paths = resolve_app_paths(
+            self.cfg["app"].get("data_dir"),
+            self.cfg["app"].get("db_path"),
+            self.cfg["app"].get("log_dir"),
+            self.cfg.get("ocr", {}).get("models_dir"),
+        )
+        if self.paths.db_path != old_db:
+            self.engine = make_engine(str(self.paths.db_path))
+            init_db(self.engine)
+            self.sf = make_session_factory(self.engine)
         # Upozorni, pokud je zapnut jen OpenAI, ale není klíč ani v poli ani v ENV.
         if self.cb_openai_only.isChecked():
             api_inline = self.ed_api_key.text().strip()
