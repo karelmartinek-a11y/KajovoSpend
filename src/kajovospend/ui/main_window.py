@@ -309,6 +309,8 @@ class TableModel(QAbstractTableModel):
         super().__init__()
         self.headers = headers
         self.rows = rows
+        self._sort_col: int | None = None
+        self._sort_order: Qt.SortOrder = Qt.AscendingOrder
 
     def sort(self, column: int, order: Qt.SortOrder = Qt.AscendingOrder):
         """Simple in-memory sort to support clickable headers."""
@@ -330,6 +332,8 @@ class TableModel(QAbstractTableModel):
 
         self.layoutAboutToBeChanged.emit()
         self.rows = sorted(self.rows, key=_key, reverse=(order == Qt.DescendingOrder))
+        self._sort_col = column
+        self._sort_order = order
         self.layoutChanged.emit()
 
     def flags(self, index: QModelIndex):
@@ -365,7 +369,11 @@ class TableModel(QAbstractTableModel):
             return None
         if orientation == Qt.Horizontal:
             if 0 <= section < len(self.headers):
-                return self.headers[section]
+                name = self.headers[section]
+                if self._sort_col == section:
+                    arrow = "↑" if self._sort_order == Qt.AscendingOrder else "↓"
+                    return f"{name} {arrow}"
+                return name
         return str(section + 1)
 
 
@@ -2938,6 +2946,7 @@ class MainWindow(QMainWindow):
                 self._docs_listing.append(
                     {
                         "doc_id": did,
+                        "doc_supplier_id": int(d.supplier_id) if d.supplier_id else "",
                         "file_id": int(f.id),
                         "path": f.current_path,
                         "date": d.issue_date.isoformat() if d.issue_date else "",
@@ -2952,8 +2961,22 @@ class MainWindow(QMainWindow):
                 )
 
         # render table
-        headers = ["Datum", "Číslo účtenky", "Celkem vč. DPH", "Dodavatel", "IČO dodavatele", "Celkem bez DPH", "Počet položek", "Stav"]
-        trows = [[r["date"], r.get("doc_number", ""), r["total"], r["supplier"], r.get("supplier_ico", ""), r.get("total_without_vat", 0.0), r["items_count"], r["status"]] for r in self._docs_listing]
+        headers = ["ID ÚČTENKY", "Datum", "Číslo účtenky", "Celkem vč. DPH", "Dodavatel", "ID DODAVATELE", "IČO dodavatele", "Celkem bez DPH", "Počet položek", "Stav"]
+        trows = [
+            [
+                r["doc_id"],
+                r["date"],
+                r.get("doc_number", ""),
+                r["total"],
+                r["supplier"],
+                r.get("doc_supplier_id", ""),
+                r.get("supplier_ico", ""),
+                r.get("total_without_vat", 0.0),
+                r["items_count"],
+                r["status"],
+            ]
+            for r in self._docs_listing
+        ]
         self.docs_table.setModel(TableModel(headers, trows))
         self._doc_offset = len(self._docs_listing)
         self.lbl_docs_page.setText(f"{self._doc_offset} / {self._doc_total}")
@@ -4754,6 +4777,10 @@ class MainWindow(QMainWindow):
                     pstr = str(fobj.current_path or fobj.original_path or "")
                     if not pstr or pstr in known_paths:
                         continue
+                    if (self.unproc_filter.text() or "").strip():
+                        qf = self.unproc_filter.text().strip().lower()
+                        if qf not in Path(pstr).name.lower():
+                            continue
                     size_txt = ""
                     mtime_txt = ""
                     try:
@@ -5726,6 +5753,15 @@ class MainWindow(QMainWindow):
                 except Exception:
                     quarantine_fs = quarantine_fs or 0
                     duplicates_fs = duplicates_fs or 0
+                # Processing DB (ingest) pro přesnější čísla karantény/duplikátů
+                try:
+                    with self.pf() as ps:
+                        q_ing = ps.query(IngestFile).filter(IngestFile.status == "QUARANTINE").count()
+                        d_ing = ps.query(IngestFile).filter(IngestFile.status == "DUPLICATE").count()
+                    quarantine_fs += int(q_ing or 0)
+                    duplicates_fs += int(d_ing or 0)
+                except Exception:
+                    pass
 
                 with self.sf() as session:
                     c = db_api.counts(session)
