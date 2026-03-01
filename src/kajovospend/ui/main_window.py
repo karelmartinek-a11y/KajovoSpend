@@ -6,6 +6,7 @@ import datetime as dt
 
 from kajovospend.utils.time import utc_now_naive
 import os
+import time
 import threading
 from io import BytesIO
 from pathlib import Path
@@ -891,6 +892,7 @@ class MainWindow(QMainWindow):
         self._docs_sel_connected = False
         self._unrec_sel_model = None
         self._unrec_sel_connected = False
+        self._unproc_last_selection_ts: float | None = None
 
         # paging for per-item search tab
         self._items_page_size = int(self.cfg.get("performance", {}).get("items_page_size", 1000) or 1000)
@@ -2377,11 +2379,15 @@ class MainWindow(QMainWindow):
             self._refresh_dashboard_async()
         except Exception:
             pass
-        for fn in (self.refresh_run_state, self.refresh_ops, self.refresh_unprocessed):
+        for fn in (self.refresh_run_state, self.refresh_ops):
             try:
                 fn()
             except Exception:
                 pass
+        try:
+            self.refresh_unprocessed(force=False)
+        except Exception:
+            pass
 
     def _pick_dir(self, line_edit: QLineEdit):
         d = QFileDialog.getExistingDirectory(self, "Vyber adresář", line_edit.text() or str(Path.home()))
@@ -2870,7 +2876,7 @@ class MainWindow(QMainWindow):
             pass
         self._docs_new_search_v2()
         try:
-            self.refresh_unprocessed()
+            self.refresh_unprocessed(force=False)
         except Exception:
             pass
         try:
@@ -4750,9 +4756,18 @@ class MainWindow(QMainWindow):
             if px and not px.isNull():
                 self.preview_view.set_pixmap(px)
 
-    def refresh_unprocessed(self):
+    def refresh_unprocessed(self, force: bool = True):
         """Seznam karanténních souborů (FS + DB), řádek = jeden soubor."""
         try:
+            # pokud uživatel právě pracuje s výběrem, nerefreshuj (leda force)
+            if not force:
+                sm = self.unproc_table.selectionModel()
+                has_sel = bool(sm and sm.hasSelection())
+                if has_sel:
+                    now = time.time()
+                    if self._unproc_last_selection_ts and (now - self._unproc_last_selection_ts) < 8.0:
+                        return
+
             statuses = []
             if self.cb_unproc_q.isChecked():
                 statuses.append("QUARANTINE")
@@ -5232,9 +5247,11 @@ class MainWindow(QMainWindow):
             }
             self._current_unproc = meta
             self._unproc_selected_path = path_val
+            self._unproc_last_selection_ts = time.time()
         except Exception:
             self._current_unproc = None
             self._unproc_selected_path = None
+            self._unproc_last_selection_ts = None
         # reset form
         self._reset_unproc_form()
         path = None
