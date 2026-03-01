@@ -2079,13 +2079,16 @@ class MainWindow(QMainWindow):
         items_filters = QWidget()
         fl = QHBoxLayout(items_filters)
         fl.setContentsMargins(0, 0, 0, 0)
+        self.items_group_enable = QCheckBox("Skupina")
         self.items_group_filter = QComboBox()
         self.items_group_filter.addItem("Skupina: všechny", None)
         self.items_group_filter.addItem("Skupina: bez skupiny", "NONE")
+        self.items_vat_enable = QCheckBox("DPH")
         self.items_vat_filter = QComboBox()
         self.items_vat_filter.addItem("DPH: všechny", None)
         for rate in [0, 10, 12, 15, 21]:
             self.items_vat_filter.addItem(f"DPH {rate} %", float(rate))
+        self.items_price_enable = QCheckBox("Cena/ks")
         self.items_price_op = QComboBox()
         self.items_price_op.addItems(["=", ">", "<", "between"])
         self.items_price_val = QDoubleSpinBox(); self.items_price_val.setMaximum(1e9); self.items_price_val.setDecimals(4)
@@ -2093,15 +2096,23 @@ class MainWindow(QMainWindow):
         self.items_price_max = QDoubleSpinBox(); self.items_price_max.setMaximum(1e9); self.items_price_max.setDecimals(4)
         self.items_price_min.setEnabled(False); self.items_price_max.setEnabled(False)
         self.items_price_op.currentTextChanged.connect(self._on_price_op_changed)
+        self.items_price_enable.toggled.connect(self._on_price_enable_changed)
+        self.items_group_enable.toggled.connect(lambda v: self.items_group_filter.setEnabled(v))
+        self.items_vat_enable.toggled.connect(lambda v: self.items_vat_filter.setEnabled(v))
+        self.items_group_filter.setEnabled(False)
+        self.items_vat_filter.setEnabled(False)
         self.items_ids_receipt = QLineEdit(); self.items_ids_receipt.setPlaceholderText("ID účtenek (čárkami)")
         self.items_ids_supplier = QLineEdit(); self.items_ids_supplier.setPlaceholderText("ID dodavatelů (čárkami)")
         self.btn_items_select_all = QPushButton("Označit vše (výsledek)")
         self.btn_items_assign_group = QPushButton("Přiřadit skupinu")
         self.items_group_assign = QLineEdit(); self.items_group_assign.setPlaceholderText("Název nové/existující skupiny")
 
+        fl.addWidget(self.items_group_enable)
         fl.addWidget(self.items_group_filter)
+        fl.addWidget(self.items_vat_enable)
         fl.addWidget(self.items_vat_filter)
         fl.addWidget(QLabel("Cena/ks"))
+        fl.addWidget(self.items_price_enable)
         fl.addWidget(self.items_price_op)
         fl.addWidget(self.items_price_val)
         fl.addWidget(QLabel("od"))
@@ -2114,6 +2125,7 @@ class MainWindow(QMainWindow):
         fl.addWidget(self.items_group_assign, 1)
         fl.addWidget(self.btn_items_assign_group)
         items_layout.addWidget(items_filters)
+        self._on_price_enable_changed(False)
 
         items_split = QSplitter()
         items_split.setOrientation(Qt.Horizontal)
@@ -2388,14 +2400,14 @@ class MainWindow(QMainWindow):
         self._items_offset = 0
         self._items_rows = []
         self._items_current_path = None
-        self._load_items_page_v2(reset=True)
+        self._load_items_page_v2(reset=True, show_busy=True)
 
     def _items_load_more_v2(self) -> None:
         if self._items_offset >= (self._items_total or 0):
             return
         self._load_items_page_v2(reset=False)
 
-    def _load_items_page_v2(self, *, reset: bool) -> None:
+    def _load_items_page_v2(self, *, reset: bool, show_busy: bool = False) -> None:
         q = (self.items_filter.text() or "").strip()
         limit = int(self._items_page_size)
         offset = int(self._items_offset or 0)
@@ -2403,6 +2415,9 @@ class MainWindow(QMainWindow):
         ids_receipt = self._parse_int_list(self.items_ids_receipt.text())
         ids_supplier = self._parse_int_list(self.items_ids_supplier.text())
         price_op = self.items_price_op.currentText()
+        price_enabled = self.items_price_enable.isChecked()
+        group_enabled = self.items_group_enable.isChecked()
+        vat_enabled = self.items_vat_enable.isChecked()
         if price_op == "between":
             price_min = float(self.items_price_min.value())
             price_max = float(self.items_price_max.value())
@@ -2416,29 +2431,41 @@ class MainWindow(QMainWindow):
         group_none = group_choice == "NONE"
         vat_choice = self.items_vat_filter.currentData()
 
-        with self.sf() as session:
-            total = db_api.count_items(session, q=q)
-            rows = db_api.list_items(
-                session,
-                q=q,
-                limit=limit,
-                offset=offset,
-                group_id=group_id,
-                group_none=group_none,
-                vat_rate=vat_choice,
-                ids_receipt=ids_receipt,
-                ids_supplier=ids_supplier,
-                price_op=price_op,
-                price_val=price_val,
-                price_min=price_min,
-                price_max=price_max,
-            )
+        def _query():
+            with self.sf() as session:
+                total = db_api.count_items(session, q=q)
+                rows = db_api.list_items(
+                    session,
+                    q=q,
+                    limit=limit,
+                    offset=offset,
+                    group_id=group_id if group_enabled else None,
+                    group_none=group_none if group_enabled else False,
+                    vat_rate=vat_choice if vat_enabled else None,
+                    ids_receipt=ids_receipt if ids_receipt else None,
+                    ids_supplier=ids_supplier if ids_supplier else None,
+                    price_op=price_op if price_enabled else None,
+                    price_val=price_val if price_enabled else None,
+                    price_min=price_min if price_enabled else None,
+                    price_max=price_max if price_enabled else None,
+                )
+            return total, rows
 
-        if reset:
-            self._items_rows = []
-        self._items_rows.extend(rows)
-        self._items_total = int(total or 0)
-        self._items_offset = len(self._items_rows)
+        def _apply(res):
+            total, rows = res
+            if reset:
+                self._items_rows = []
+            self._items_rows.extend(rows)
+            self._items_total = int(total or 0)
+            self._items_offset = len(self._items_rows)
+            self._render_items_table(reset)
+
+        if show_busy:
+            self._run_with_busy("Hledám položky", "Vyhledávání…", _query, _apply)
+            return
+        _apply(_query())
+
+    def _render_items_table(self, reset: bool) -> None:
 
         headers = [
             "ID položky",
@@ -2536,6 +2563,13 @@ class MainWindow(QMainWindow):
         self.items_price_min.setEnabled(is_between)
         self.items_price_max.setEnabled(is_between)
         self.items_price_val.setEnabled(not is_between)
+
+    def _on_price_enable_changed(self, enabled: bool) -> None:
+        self.items_price_op.setEnabled(enabled)
+        self.items_price_val.setEnabled(enabled and self.items_price_op.currentText().lower() != "between")
+        between = self.items_price_op.currentText().lower() == "between"
+        self.items_price_min.setEnabled(enabled and between)
+        self.items_price_max.setEnabled(enabled and between)
 
     def _items_select_all_filtered(self) -> None:
         try:
