@@ -4762,6 +4762,21 @@ class MainWindow(QMainWindow):
                 self.unproc_table.setModel(TableModel(["ID_IN", "Stav", "Soubor", "Velikost", "Čas", "Zdroj", "path"], []))
                 return
 
+            # zapamatuj aktuální multi-výběr (cesty)
+            keep_paths: set[str] = set()
+            try:
+                sm = self.unproc_table.selectionModel()
+                m = self.unproc_table.model()
+                if sm and m:
+                    for idx in sm.selectedRows():
+                        try:
+                            pval = m.index(int(idx.row()), 6).data()
+                            if pval:
+                                keep_paths.add(str(pval))
+                        except Exception:
+                            continue
+            except Exception:
+                keep_paths = set()
             keep_path = self._unproc_selected_path
 
             with self.pf() as ps:
@@ -4890,25 +4905,26 @@ class MainWindow(QMainWindow):
                 self.unproc_counts.setText(f"Karanténa: {total_q} | Duplicity: {total_d}")
             except Exception:
                 pass
+            # obnov výběr (více řádků)
+            m = self.unproc_table.model()
+            sm = self.unproc_table.selectionModel()
             reselection_done = False
-            if keep_path:
-                m = self.unproc_table.model()
+            if m and sm and keep_paths:
                 for ridx in range(m.rowCount()):
                     try:
                         pval = m.index(ridx, 6).data()
-                        if pval == keep_path:
+                        if pval in keep_paths:
                             idx = m.index(ridx, 0)
-                            self.unproc_table.setCurrentIndex(idx)
-                            self.unproc_table.selectRow(ridx)
-                            self.on_unproc_selected(idx)
+                            sm.select(idx, sm.Select | sm.Rows)
                             reselection_done = True
-                            break
                     except Exception:
                         continue
-            if not reselection_done and table_rows:
-                idx = self.unproc_table.model().index(0, 0)
+            if not reselection_done and m and table_rows:
+                idx = m.index(0, 0)
                 self.unproc_table.setCurrentIndex(idx)
-                self.unproc_table.selectRow(0)
+                sm = self.unproc_table.selectionModel()
+                if sm:
+                    sm.select(idx, sm.ClearAndSelect | sm.Rows)
                 self.on_unproc_selected(idx)
         except Exception as e:
             try:
