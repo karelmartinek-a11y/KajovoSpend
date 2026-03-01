@@ -5799,6 +5799,18 @@ class MainWindow(QMainWindow):
 
                 with self.sf() as session:
                     c = db_api.counts(session)
+                    # DB počty karanténa/duplikáty (produkční files)
+                    try:
+                        q_db = session.execute(
+                            select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "QUARANTINE")
+                        ).scalar_one()
+                        d_db = session.execute(
+                            select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "DUPLICATE")
+                        ).scalar_one()
+                        quarantine_fs += int(q_db or 0)
+                        duplicates_fs += int(d_db or 0)
+                    except Exception:
+                        pass
                     # doplň FS počty pro dashboard
                     if isinstance(c, dict):
                         c["in_waiting"] = in_waiting
