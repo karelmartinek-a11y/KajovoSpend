@@ -17,7 +17,6 @@ if not exist %ICON% (
   echo [WARN] Ikona %ICON% nenalezena, PyInstaller použije default.
 )
 
-REM Splash: použijeme stejné logo, PyInstaller zobrazí při startu
 REM Spuštění PyInstalleru (bez splash screenu – okno se otevře hned)
 pyinstaller ^
   --noconfirm ^
@@ -31,6 +30,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo Hotovo. Výstup v dist\\KajovoSpend\\KajovoSpend.exe
+REM Přesuň finální exe a ukliď
+if exist KajovoSpend.exe del /f /q KajovoSpend.exe
+if exist dist\\KajovoSpend\\KajovoSpend.exe copy /y dist\\KajovoSpend\\KajovoSpend.exe KajovoSpend.exe >nul
+if exist build rd /s /q build
+if exist dist rd /s /q dist
+
+echo Hotovo. Výstup: %ROOT%\\KajovoSpend.exe
 popd
 endlocal
