@@ -1,6 +1,6 @@
 app:
-  data_dir: ''
-  db_path: ''
+  data_dir: C:\Users\provo\OneDrive - Aqua Sport Club s.r.o\KajovoSpendDB
+  db_path: C:\Users\provo\OneDrive - Aqua Sport Club s.r.o\KajovoSpendDB\kajovospend.sqlite
   log_dir: ''
 paths:
   input_dir: C:/KajovoSpend/INPUT

@@ -44,6 +44,7 @@ except Exception:  # pragma: no cover
 
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 from kajovospend.ocr.rapidocr_engine import RapidOcrEngine
+from kajovospend.ocr.handwriting_tesseract import TesseractHandwritingEngine
 from kajovospend.utils.env import sanitize_openai_api_key
 from kajovospend.utils.hashing import sha256_file
 from kajovospend.utils.text_quality import compute_text_quality, summarize_text_quality, text_quality_score
@@ -61,12 +62,38 @@ class Processor:
         self.paths = paths
         self.log = logger
         self.pf = create_processing_session_factory(cfg)
-        # OCR engine is optional; if unavailable we quarantine rather than crash service.
+
+        # OCR engine is optional; if unavailable we keep going and try secondary OCR backends.
+        self.ocr_engine = None
+        self.ocr_engine_secondary = None
+
         try:
             self.ocr_engine = RapidOcrEngine(paths.models_dir)
         except Exception as e:
-            self.log.warning(f"OCR init failed; will quarantine documents. Error: {e}")
+            try:
+                self.log.warning("OCR init failed (RapidOCR); will try fallback. Error: %s", e)
+            except Exception:
+                pass
             self.ocr_engine = None
+
+        # Fallback OCR (pytesseract) – better than hard quarantine when RapidOCR is missing
+        # (e.g. PyInstaller data files).
+        try:
+            lang = str((self.cfg.get("ocr") or {}).get("tesseract_lang") or "ces+eng")
+            eng2 = TesseractHandwritingEngine(lang=lang)
+            if eng2.is_available():
+                self.ocr_engine_secondary = eng2
+                try:
+                    self.log.info("OCR fallback: pytesseract available (lang=%s)", eng2.lang)
+                except Exception:
+                    pass
+        except Exception as e:
+            self.ocr_engine_secondary = None
+            try:
+                self.log.info("OCR fallback unavailable: %s", e)
+            except Exception:
+                pass
+
 
     def close(self) -> None:
         """Uvolní zdroje, zejména processing SQLite engine (důležité na Windows)."""
@@ -289,6 +316,20 @@ class Processor:
                 conf = 0.95
             return float(conf)
 
+
+        # Vyber OCR backend: RapidOCR (primární) nebo pytesseract (fallback).
+        ocr_engine = self.ocr_engine
+        ocr_backend = "rapidocr" if ocr_engine is not None else None
+        try:
+            if ocr_engine is None and self.ocr_engine_secondary is not None and getattr(self.ocr_engine_secondary, "is_available", lambda: False)():
+                ocr_engine = self.ocr_engine_secondary
+                ocr_backend = "tesseract"
+        except Exception:
+            pass
+        if ocr_backend:
+            text_debug["ocr_backend"] = ocr_backend
+
+
         if status_cb:
             status_cb("PDF: čtu text (hybrid embedded/OCR)…")
 
@@ -338,7 +379,7 @@ class Processor:
             except Exception:
                 pass
 
-        if n_pages <= 0 and self.ocr_engine is None:
+        if n_pages <= 0 and ocr_engine is None:
             text_debug["reason"] = "no_embedded_no_ocr"
             text_debug["method"] = "none"
             return [], [], 0, "none", text_debug
@@ -366,7 +407,7 @@ class Processor:
                 f"threshold={quality_threshold:.2f} min_len={min_len}"
             )
 
-        if self.ocr_engine is None:
+        if ocr_engine is None:
             if embedded_texts:
                 text_debug["method"] = "embedded"
                 for i in range(n_pages):
@@ -409,7 +450,7 @@ class Processor:
             for idx_page, img in enumerate(images, start=1):
                 if status_cb:
                     status_cb(f"OCR: strana {idx_page}/{len(images)}…")
-                t, c = self.ocr_engine.image_to_text(img)
+                t, c = ocr_engine.image_to_text(img)
                 texts2.append(t or "")
                 confs2.append(float(c or 0.0))
                 s, met = text_quality_score(t or "")
@@ -494,7 +535,7 @@ class Processor:
                 page_idx = s0 + off
                 if status_cb:
                     status_cb(f"OCR: strana {page_idx+1}/{n_pages}…")
-                ocr_text, ocr_conf = self.ocr_engine.image_to_text(img)
+                ocr_text, ocr_conf = ocr_engine.image_to_text(img)
                 ocr_text = ocr_text or ""
                 ocr_conf_f = float(ocr_conf or 0.0)
 
@@ -870,225 +911,35 @@ class Processor:
             out.append(("\n\n".join(texts), avg_conf, {"dpi": int(dpi), "rotations": list(rotations), "include_reconstructed": bool(include_reconstructed)}))
         return out
 
-    def _ocr_image_candidates(
-        self,
-        image: Image.Image,
-        *,
-        rotations: List[int],
-        include_reconstructed: bool,
-        max_candidates: int,
-    ) -> List[Tuple[str, float, Dict[str, Any]]]:
-        if self.ocr_engine is None or (not getattr(self.ocr_engine, "is_available", lambda: False)()):
-            return []
-        cands = self.ocr_engine.image_to_text_candidates(
-            image,
-            rotations=tuple(int(r) for r in rotations),
-            include_reconstructed=bool(include_reconstructed),
-            max_candidates=int(max_candidates),
-        )
-        return [(t, float(c or 0.0), dict(m)) for t, c, m in cands]
-
-    def _offline_ensemble_best(
-        self,
-        *,
-        path: Path,
-        page_from: int,
-        page_to: int,
-        baseline_text: str,
-        baseline_extracted,
-        status_cb=None,
-    ) -> Tuple[Optional[str], Optional[Any], Dict[str, Any]]:
-        """Zkusí víc offline metod a vrátí nejlepší (text, extracted, debug)."""
-        ocr_cfg = (self.cfg.get("ocr") or {}) if isinstance(self.cfg, dict) else {}
-        ens = (ocr_cfg.get("ensemble") or {}) if isinstance(ocr_cfg, dict) else {}
-        enabled = bool(ens.get("enabled", True))
-        if not enabled or self.ocr_engine is None or (not getattr(self.ocr_engine, "is_available", lambda: False)()):
-            return None, None, {}
-
-        dpis = ens.get("dpis", [200, 300, 450, 600])
-        if not isinstance(dpis, list) or not dpis:
-            dpis = [200, 300, 450]
-        dpis = [int(x) for x in dpis if isinstance(x, (int, float, str)) and str(x).isdigit()]
-        if not dpis:
-            dpis = [200, 300, 450]
-
-        rotations = ens.get("rotations", [0, 90, 180, 270])
-        if not isinstance(rotations, list) or not rotations:
-            rotations = [0, 90, 180, 270]
-        rotations = [int(r) for r in rotations if isinstance(r, (int, float, str))]
-        include_reconstructed = bool(ens.get("include_reconstructed", True))
-
-        # candidate pool: baseline + OCR variants
-        best_text = baseline_text
-        best_ex = baseline_extracted
-        best_score = self._score_extracted_candidate(best_ex)
-        debug: Dict[str, Any] = {"baseline_score": list(best_score)}
-
-        candidates: List[Tuple[str, float, Dict[str, Any]]] = []
-        if path.suffix.lower() == ".pdf":
-            candidates.extend(
-                self._ocr_pdf_range_candidates(
-                    path,
-                    page_from,
-                    page_to,
-                    dpis=list(dpis),
-                    rotations=list(rotations),
-                    include_reconstructed=include_reconstructed,
-                    status_cb=status_cb,
-                )
-            )
-        else:
-            try:
-                with Image.open(path) as im:
-                    im = im.convert("RGB")
-                    candidates.extend(
-                        self._ocr_image_candidates(
-                            im,
-                            rotations=list(rotations),
-                            include_reconstructed=include_reconstructed,
-                            max_candidates=int(ens.get("max_candidates", 8)),
-                        )
-                    )
-            except Exception:
-                candidates = []
-
-        debug["candidates"] = []
-        for cand_text, cand_conf, meta in candidates:
-            try:
-                ex2 = extract_from_text(cand_text)
-            except Exception:
-                continue
-            sc = self._score_extracted_candidate(ex2)
-            debug["candidates"].append({"score": list(sc), "meta": meta, "conf": float(cand_conf), "len": len(cand_text or "")})
-            if sc > best_score:
-                best_score = sc
-                best_text = cand_text
-                best_ex = ex2
-
-        if best_ex is not baseline_extracted:
-            debug["selected_score"] = list(best_score)
-        return best_text, best_ex, debug
-
-    def _enhance_for_openai(self, image: Image.Image) -> Image.Image:
-        """Lehke zvyseni kontrastu a ostrosti pro lepsi citelnost."""
-        img = image.convert("RGB")
-        img = ImageOps.autocontrast(img)
-        img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
-        return img
-
-    def _prepare_openai_images(
-        self,
-        path: Path,
-        *,
-        page_from: int,
-        page_to: int,
-    ) -> Tuple[List[Tuple[str, bytes]], Optional[Tuple[str, bytes]]]:
-        """Pripravi obrazove vstupy pro OpenAI (origin + volitelne zlepsene varianty) a volitelne PDF."""
-        cfg = self.cfg.get("openai") if isinstance(self.cfg, dict) else {}
-        if not isinstance(cfg, dict):
-            cfg = {}
-        dpi = int(cfg.get("image_dpi", 300) or 300)
-        max_pages = int(cfg.get("image_max_pages", 3) or 3)
-        enhance = bool(cfg.get("image_enhance", True))
-        variants = int(cfg.get("image_variants", 2) or 2)
-        if variants < 1:
-            variants = 1
-
-        images_payload: List[Tuple[str, bytes]] = []
-        pdf_payload: Optional[Tuple[str, bytes]] = None
-        try:
-            if path.suffix.lower() == ".pdf":
-                try:
-                    pdf_payload = ("application/pdf", path.read_bytes())
-                except Exception:
-                    pdf_payload = None
-                pages_cnt = max(1, int(page_to - page_from + 1))
-                imgs = render_pdf_to_images(
-                    path,
-                    dpi=dpi,
-                    max_pages=min(max_pages, pages_cnt),
-                    start_page=max(0, page_from - 1),
-                )
-            else:
-                with Image.open(path) as im:
-                    imgs = [im.convert("RGB")]
-        except Exception:
-            return images_payload, pdf_payload
-
-        for im in imgs[:max_pages]:
-            try:
-                bio = BytesIO()
-                im.convert("RGB").save(bio, format="PNG")
-                images_payload.append(("image/png", bio.getvalue()))
-                if enhance and variants > 1:
-                    enh = self._enhance_for_openai(im)
-                    bio2 = BytesIO()
-                    enh.save(bio2, format="PNG")
-                    images_payload.append(("image/png", bio2.getvalue()))
-            except Exception:
-                continue
-        return images_payload, pdf_payload
-
-    def _merge_openai_result(self, extracted, obj: Dict[str, Any], *, prefer_items: bool = True) -> bool:
-        """Slouci vysledek z OpenAI do Extracted (konzervativne)."""
-        if not isinstance(obj, dict):
-            return False
-        changed = False
-
-        def _is_pseudo_ico(v: Any) -> bool:
-            vv = str(v or "")
-            return vv.startswith("PSEUDO") or vv.startswith("pseudo") or vv.startswith("OMV_") or vv.startswith("NEZNAMY")
-
-        items = obj.get("items")
-        if isinstance(items, list) and len(items) > 0:
-            cur_items = list(extracted.items or [])
-            if prefer_items or (len(cur_items) == 0) or (len(items) > len(cur_items)):
-                extracted.items = [it for it in items if isinstance(it, dict)]
-                changed = True
-
-        if obj.get("supplier_ico") and (not extracted.supplier_ico or _is_pseudo_ico(extracted.supplier_ico)):
-            extracted.supplier_ico = str(obj.get("supplier_ico"))
-            changed = True
-        if obj.get("doc_number") and (not extracted.doc_number):
-            extracted.doc_number = str(obj.get("doc_number"))
-            changed = True
-        if obj.get("bank_account") and (not extracted.bank_account):
-            extracted.bank_account = str(obj.get("bank_account"))
-            changed = True
-        if obj.get("currency"):
-            extracted.currency = str(obj.get("currency"))
-            changed = True
-
-        if (extracted.issue_date is None) and obj.get("issue_date"):
-            try:
-                extracted.issue_date = dtparser.parse(str(obj.get("issue_date"))).date()
-                changed = True
-            except Exception:
-                pass
-        if (extracted.total_with_vat is None) and (obj.get("total_with_vat") is not None):
-            try:
-                extracted.total_with_vat = float(obj.get("total_with_vat"))
-                changed = True
-            except Exception:
-                pass
-
-        if changed:
-            extracted.confidence = float(max(extracted.confidence or 0.0, 0.90))
-        return changed
-        return None, None, debug
     def _ocr_image(self, path: Path, status_cb=None) -> Tuple[str, float, int]:
-        if self.ocr_engine is None:
-            return "", 0.0, 1
-        if status_cb:
-            status_cb("OCR: zpracovávám obrázek…")
-        with Image.open(path) as img:
-            t, c = self.ocr_engine.image_to_text(img)
-        try:
-            q = summarize_text_quality([compute_text_quality(t or "")])
-            self.log.info("Image text source: ocr conf=%.3f quality=%s", float(c or 0.0), q)
-        except Exception:
-            pass
-        return t, c, 1
+        """OCR pro obrázek; RapidOCR primárně, pytesseract jako fallback."""
+        # Primary RapidOCR
+        if self.ocr_engine is not None and getattr(self.ocr_engine, "is_available", lambda: True)():
+            if status_cb:
+                status_cb("OCR: zpracovávám obrázek…")
+            with Image.open(path) as img:
+                t, c = self.ocr_engine.image_to_text(img)
+            try:
+                q = summarize_text_quality([compute_text_quality(t or "")])
+                self.log.info("Image text source: rapidocr conf=%.3f quality=%s", float(c or 0.0), q)
+            except Exception:
+                pass
+            return t, float(c or 0.0), 1
+
+        # Secondary fallback (pytesseract)
+        if self.ocr_engine_secondary is not None and getattr(self.ocr_engine_secondary, "is_available", lambda: False)():
+            if status_cb:
+                status_cb("OCR (fallback): zpracovávám obrázek…")
+            with Image.open(path) as img:
+                t, c = self.ocr_engine_secondary.image_to_text(img)
+            try:
+                q = summarize_text_quality([compute_text_quality(t or "")])
+                self.log.info("Image text source: tesseract conf=%.3f quality=%s", float(c or 0.0), q)
+            except Exception:
+                pass
+            return t, float(c or 0.0), 1
+
+        return "", 0.0, 1
 
     def _guess_supplier_ico_from_text(self, text: str) -> Optional[str]:
         """
@@ -1439,80 +1290,103 @@ class Processor:
                 pages_count = len(PdfReader(BytesIO(path.read_bytes())).pages)
             except Exception:
                 pages_count = 1
-
         if openai_only:
+            # I v režimu "jen OpenAI" se pokus získat aspoň embedded text (nebo fallback OCR),
+            # aby šla správně klasifikovat účtenka/faktura a aby měl OpenAI lepší kontext.
             pages = pages_count
+            full_text = ""
+            ocr_conf = 1.0
+            page_from = 1
+            page_to = int(pages_count)
+
+            if path.suffix.lower() == ".pdf":
+                try:
+                    page_texts, page_confs, _, tm, dbg = self._ocr_pdf_pages(path, status_cb=status_cb)
+                    full_text = "\n\n".join([t for t in (page_texts or []) if (t or "").strip()])
+                    if page_confs:
+                        ocr_conf = float(sum(page_confs) / max(1, len(page_confs)))
+                    text_debug = {"openai_only": True, "bootstrap_text_method": tm, **(dbg or {})}
+                    text_method = "openai_only+" + str(tm or "none")
+                except Exception as e:
+                    text_debug = {"openai_only": True, "bootstrap_error": str(e)}
+                    text_method = "openai_only"
+            else:
+                try:
+                    full_text, ocr_conf, _ = self._ocr_image(path, status_cb=status_cb)
+                except Exception:
+                    full_text, ocr_conf = "", 0.0
+                text_debug = {"openai_only": True, "bootstrap_text_method": "image_ocr_or_fallback"}
+                text_method = "openai_only+image"
+
+            ex0 = extract_from_text(full_text or "")
             per_doc_chunks = [{
-                "page_from": 1,
-                "page_to": int(pages_count),
-                "extracted": extract_from_text(""),
-                "full_text": "",
-                "ocr_conf": 1.0,
+                "page_from": page_from,
+                "page_to": page_to,
+                "extracted": ex0,
+                "full_text": full_text or "",
+                "ocr_conf": float(ocr_conf or 0.0),
                 "key": None,
             }]
-            text_method = "openai_only"
-            text_debug = {"openai_only": True}
         else:
-            # Structured-first: pokus o vytěžení z PDF attachmentů (ISDOC / Factur-X / ZUGFeRD / apod.).
-            # Pokud existuje strojově čitelné XML v PDF, je to řádově spolehlivější než OCR.
-            structured_cfg = (self.cfg.get("ocr", {}) or {}).get("structured_first", {}) if isinstance(self.cfg, dict) else {}
-            structured_enabled = bool(structured_cfg.get("enabled", True))
-            structured_pdf_enabled = bool(structured_cfg.get("enable_pdf_attachments", True))
-            if structured_enabled and structured_pdf_enabled and path.suffix.lower() == ".pdf":
-                try:
-                    ex_struct, meta = extract_structured_from_pdf(path)
-                    if ex_struct and (ex_struct.items or ex_struct.total_with_vat or ex_struct.doc_number):
+                    # Structured-first: pokus o vytěžení z PDF attachmentů (ISDOC / Factur-X / ZUGFeRD / apod.).
+                    # Pokud existuje strojově čitelné XML v PDF, je to řádově spolehlivější než OCR.
+                    structured_cfg = (self.cfg.get("ocr", {}) or {}).get("structured_first", {}) if isinstance(self.cfg, dict) else {}
+                    structured_enabled = bool(structured_cfg.get("enabled", True))
+                    structured_pdf_enabled = bool(structured_cfg.get("enable_pdf_attachments", True))
+                    if structured_enabled and structured_pdf_enabled and path.suffix.lower() == ".pdf":
                         try:
-                            pages_count = len(PdfReader(BytesIO(path.read_bytes())).pages)
+                            ex_struct, meta = extract_structured_from_pdf(path)
+                            if ex_struct and (ex_struct.items or ex_struct.total_with_vat or ex_struct.doc_number):
+                                try:
+                                    pages_count = len(PdfReader(BytesIO(path.read_bytes())).pages)
+                                except Exception:
+                                    pages_count = 1
+                                # vytvoř jeden chunk přes celý dokument
+                                per_doc_chunks = [{
+                                    "page_from": 1,
+                                    "page_to": int(pages_count),
+                                    "text": "",
+                                    "conf": float(ex_struct.confidence or 0.99),
+                                    "extracted": ex_struct,
+                                }]
+                                text_method = "structured_pdf_attachment"
+                                text_debug = {"structured_first": meta}
                         except Exception:
-                            pages_count = 1
-                        # vytvoř jeden chunk přes celý dokument
+                            # když structured-first selže, pokračuj standardní OCR cestou
+                            pass
+
+                    if path.suffix.lower() == ".pdf" and not per_doc_chunks:
+                        page_texts, page_confs, pages, text_method, text_debug = self._ocr_pdf_pages(path, status_cb=status_cb)
+                        if not page_texts:
+                            # no text => hard quarantine later
+                            page_texts = []
+                            page_confs = []
+                            pages = 0
+                        # per-page audit returned by _ocr_pdf_pages
+                        for rec in (text_debug.get("page_audit") or []):
+                            page_audit_map[int(rec.get("page_no") or 0)] = dict(rec)
+                        per_page: List[Tuple[int, Any, str, float]] = []
+                        for i, t in enumerate(page_texts, start=1):
+                            ex = extract_from_text(t or "")
+                            per_page.append((i, ex, t or "", float(page_confs[i - 1] if i - 1 < len(page_confs) else 0.0)))
+                        # Merge multi-page invoices deterministically by key
+                        per_doc_chunks = self._merge_extracted_by_key(per_page)
+                    elif not per_doc_chunks:
+                        ocr_text, ocr_conf, pages = self._ocr_image(path, status_cb=status_cb)
+                        text_method = "image_ocr"
+                        try:
+                            text_debug = {"ocr": summarize_text_quality([compute_text_quality(ocr_text or "")]), "ocr_conf": float(ocr_conf or 0.0)}
+                        except Exception:
+                            text_debug = {"ocr_conf": float(ocr_conf or 0.0)}
+                        ex = extract_from_text(ocr_text or "")
                         per_doc_chunks = [{
                             "page_from": 1,
-                            "page_to": int(pages_count),
-                            "text": "",
-                            "conf": float(ex_struct.confidence or 0.99),
-                            "extracted": ex_struct,
+                            "page_to": int(pages or 1),
+                            "extracted": ex,
+                            "full_text": ocr_text or "",
+                            "ocr_conf": float(ocr_conf or 0.0),
+                            "key": None,
                         }]
-                        text_method = "structured_pdf_attachment"
-                        text_debug = {"structured_first": meta}
-                except Exception:
-                    # když structured-first selže, pokračuj standardní OCR cestou
-                    pass
-
-            if path.suffix.lower() == ".pdf" and not per_doc_chunks:
-                page_texts, page_confs, pages, text_method, text_debug = self._ocr_pdf_pages(path, status_cb=status_cb)
-                if not page_texts:
-                    # no text => hard quarantine later
-                    page_texts = []
-                    page_confs = []
-                    pages = 0
-                # per-page audit returned by _ocr_pdf_pages
-                for rec in (text_debug.get("page_audit") or []):
-                    page_audit_map[int(rec.get("page_no") or 0)] = dict(rec)
-                per_page: List[Tuple[int, Any, str, float]] = []
-                for i, t in enumerate(page_texts, start=1):
-                    ex = extract_from_text(t or "")
-                    per_page.append((i, ex, t or "", float(page_confs[i - 1] if i - 1 < len(page_confs) else 0.0)))
-                # Merge multi-page invoices deterministically by key
-                per_doc_chunks = self._merge_extracted_by_key(per_page)
-            elif not per_doc_chunks:
-                ocr_text, ocr_conf, pages = self._ocr_image(path, status_cb=status_cb)
-                text_method = "image_ocr"
-                try:
-                    text_debug = {"ocr": summarize_text_quality([compute_text_quality(ocr_text or "")]), "ocr_conf": float(ocr_conf or 0.0)}
-                except Exception:
-                    text_debug = {"ocr_conf": float(ocr_conf or 0.0)}
-                ex = extract_from_text(ocr_text or "")
-                per_doc_chunks = [{
-                    "page_from": 1,
-                    "page_to": int(pages or 1),
-                    "extracted": ex,
-                    "full_text": ocr_text or "",
-                    "ocr_conf": float(ocr_conf or 0.0),
-                    "key": None,
-                }]
-
         out_base = Path(self.cfg["paths"]["output_dir"])
         quarantine_dir = out_base / self.cfg["paths"].get("quarantine_dir_name", "KARANTENA")
 
