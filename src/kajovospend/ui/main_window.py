@@ -23,9 +23,11 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QTabWidget, QTableView,
     QLineEdit, QFormLayout, QSplitter, QTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QFileDialog,
     QMessageBox, QDateEdit, QDialog, QDialogButtonBox, QHeaderView, QAbstractItemView,
-    QCheckBox, QProgressDialog, QApplication, QInputDialog, QScrollArea, QStyledItemDelegate, QSizePolicy,
+    QCheckBox, QApplication, QInputDialog, QScrollArea, QStyledItemDelegate, QSizePolicy,
     QProgressBar, QFrame,
 )
+
+from kajovospend.ui.progress import ProgressController, MiniProgressWidget
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
 from sqlalchemy import select, text, bindparam
@@ -612,17 +614,43 @@ class _ImportWorker(QObject):
             quarantine_dir = out_base / self.cfg["paths"].get("quarantine_dir_name", "KARANTENA")
 
             files: list[Path] = []
-            for p in input_dir.rglob("*"):
-                if not p.is_file():
-                    continue
-                if p.suffix.lower() in exts:
-                    files.append(p)
-                else:
-                    try:
-                        moved = safe_move(p, quarantine_dir, p.name)
-                        self.processor.log.warning("Nepodporovaný soubor %s přesunut do karantény jako %s", p, moved)
-                    except Exception as exc:
-                        self.processor.log.exception("Nelze přesunout nepodporovaný soubor %s: %s", p, exc)
+            scanned = 0
+            # Robustní skenování INPUT (bez zamrznutí UI) + možnost zastavení.
+            # Používáme os.walk, protože Path.rglob na Windows může být velmi pomalý
+            # na velkých stromových strukturách a nedává průběžný feedback.
+            for dirpath, dirnames, filenames in os.walk(str(input_dir), topdown=True, followlinks=False):
+                if self.stop_cb():
+                    self.done.emit({"imported": 0, "message": "Zastaveno uživatelem."})
+                    return
+                # Omezit extrémní procházení systémových adresářů přes junctiony (Windows)
+                # – os.walk followlinks=False, ale junctiony se mohou jevit jako normální dirs.
+                # Preventivně filtrujeme typické problematické složky.
+                dn = str(dirpath).lower()
+                for bad in ("system volume information", "$recycle.bin"):
+                    if bad in dn:
+                        dirnames[:] = []
+                        filenames[:] = []
+                        break
+
+                for fn in filenames:
+                    if self.stop_cb():
+                        self.done.emit({"imported": 0, "message": "Zastaveno uživatelem."})
+                        return
+                    p = Path(dirpath) / fn
+                    scanned += 1
+                    suf = p.suffix.lower()
+                    if suf in exts:
+                        files.append(p)
+                    else:
+                        try:
+                            moved = safe_move(p, quarantine_dir, p.name)
+                            self.processor.log.warning("Nepodporovaný soubor %s přesunut do karantény jako %s", p, moved)
+                        except Exception as exc:
+                            self.processor.log.exception("Nelze přesunout nepodporovaný soubor %s: %s", p, exc)
+
+                    # Průběžný status – aby bylo vidět, že import "žije" i při prázdném nebo velkém stromu.
+                    if scanned % 200 == 0:
+                        self.progress.emit(f"Načítám INPUT… prohledáno {scanned} souborů, nalezeno {len(files)} dokladů")
 
             files.sort(key=lambda p: (p.stat().st_mtime, p.name, str(p)))
 
@@ -651,6 +679,11 @@ class _ImportWorker(QObject):
                         session.add(job)
                         session.commit()
                         imported += 1
+                        try:
+                            st = str(res.get("status") or "")
+                        except Exception:
+                            st = ""
+                        self.progress.emit(f"__BATCH_RESULT__|{st}|{p.name}")
                 except Exception as e:
                     try:
                         with self.sf() as session:
@@ -666,6 +699,7 @@ class _ImportWorker(QObject):
                     except Exception:
                         pass
                     self.progress.emit(f"Chyba: {p.name}: {e}")
+                    self.progress.emit(f"__BATCH_RESULT__|ERROR|{p.name}")
 
             if self.stop_cb():
                 self.done.emit({"imported": imported, "total": total, "message": "Zastaveno uživatelem."})
@@ -864,7 +898,6 @@ class MainWindow(QMainWindow):
         self.cfg = self._load_or_create_config()
         # keep threads/workers alive
         self._threads: List[QThread] = []
-        self._dialogs: List[QProgressDialog] = []
         self._workers: List[_Worker] = []
         self._timers: List[QTimer] = []
         self._sup_sel_connected = False
@@ -962,6 +995,8 @@ class MainWindow(QMainWindow):
 
         # build UI and timers
         self._build_ui()
+        # Progress UI controller (single-instance, minimizable)
+        self.progress = ProgressController(self, self.mini_progress, self.lbl_openai_andon)
         self._wire_timers()
         self.refresh_all_v2()
 
@@ -1022,17 +1057,12 @@ class MainWindow(QMainWindow):
 
     def _run_with_busy(self, title: str, message: str, fn, on_done, on_error=None, timeout_ms: int | None = None):
         """
-        Run fn() in background thread with a modal indeterminate progress dialog.
+        Run fn() in background thread with a single-instance, non-modal progress dialog.
         """
-        dlg = QProgressDialog(message, "", 0, 0, self)
-        dlg.setWindowTitle(title)
-        dlg.setCancelButton(None)
-        dlg.setMinimumDuration(0)
-        dlg.setWindowModality(Qt.ApplicationModal)
-        dlg.setAutoClose(True)
-        dlg.setAutoReset(True)
-        dlg.show()
-        self._dialogs.append(dlg)
+        if not getattr(self, "progress", None) or not self.progress.can_start():
+            QMessageBox.warning(self, "Probíhá akce", "Nelze spustit novou akci, protože už běží jiná.")
+            return
+        self.progress.start(title=title, step=message, total=None)
 
         th = QThread(self)
         wk = _Worker(fn)
@@ -1072,20 +1102,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
-                dlg.close()
-            except Exception:
-                pass
-            try:
                 th.quit()
                 th.wait(2000)
             except Exception:
                 pass
             try:
                 self._threads.remove(th)
-            except Exception:
-                pass
-            try:
-                self._dialogs.remove(dlg)
             except Exception:
                 pass
             try:
@@ -1102,6 +1124,10 @@ class MainWindow(QMainWindow):
             def _impl():
                 if not _finish_once():
                     return
+                try:
+                    self.progress.finish("Dokončeno.")
+                except Exception:
+                    pass
                 _cleanup()
                 try:
                     on_done(res)
@@ -1113,6 +1139,10 @@ class MainWindow(QMainWindow):
             def _impl():
                 if not _finish_once():
                     return
+                try:
+                    self.progress.finish("Chyba.")
+                except Exception:
+                    pass
                 _cleanup()
                 if on_error:
                     try:
@@ -1397,6 +1427,16 @@ class MainWindow(QMainWindow):
         lhl.addWidget(title)
         hl.addWidget(left)
         hl.addStretch(1)
+
+        # minimized progress + OpenAI andon
+        self.mini_progress = MiniProgressWidget()
+        self.lbl_openai_andon = QLabel("OpenAI API")
+        self.lbl_openai_andon.setObjectName("OpenAIAndon")
+        self.lbl_openai_andon.setProperty("on", False)
+        self.lbl_openai_andon.setToolTip("Rozsvítí se při komunikaci s OpenAI")
+
+        hl.addWidget(self.mini_progress)
+        hl.addWidget(self.lbl_openai_andon)
 
         self.btn_exit = QPushButton("EXIT")
         self.btn_exit.setObjectName("ExitButton")
@@ -3280,18 +3320,16 @@ class MainWindow(QMainWindow):
         proto zůstává v UI vlákně. Použijeme modal „busy“ progress, aby uživatel
         dostal jasnou odezvu.
         """
-        dlg = QProgressDialog("Exportuji…", None, 0, 0, self)
-        dlg.setWindowTitle("Export")
-        dlg.setWindowModality(Qt.ApplicationModal)
-        dlg.setCancelButton(None)
-        dlg.setMinimumDuration(0)
-        dlg.show()
+        if not getattr(self, "progress", None) or not self.progress.can_start():
+            QMessageBox.warning(self, "Probíhá akce", "Nelze spustit export, protože už běží jiná akce.")
+            return
+        self.progress.start(title="Export", step="Exportuji…", total=None)
         QApplication.processEvents()
         try:
             self._export(fmt)
         finally:
             try:
-                dlg.close()
+                self.progress.finish("Export dokončen.")
             except Exception:
                 pass
 
@@ -3786,21 +3824,26 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "OpenAI", "Nejdriv vypln API key.")
             return
-        dlg = QProgressDialog("Overuji API key...", "", 0, 0, self)
-        dlg.setWindowTitle("OpenAI")
-        dlg.setCancelButton(None)
-        dlg.setMinimumDuration(0)
-        dlg.setWindowModality(Qt.ApplicationModal)
-        dlg.show()
+        if not getattr(self, "progress", None) or not self.progress.can_start():
+            QMessageBox.warning(self, "Probíhá akce", "Nelze spustit ověření API key, protože už běží jiná akce.")
+            return
+        self.progress.start(title="OpenAI", step="Online: ověřuji API key…", total=None)
+        self.progress.set_openai_phase("OpenAI API: odesílám požadavek")
         QApplication.processEvents()
         try:
             ids = list_models(api_key)
             ok = bool(ids)
         except Exception as e:
-            dlg.close()
+            try:
+                self.progress.finish("Chyba.")
+            except Exception:
+                pass
             QMessageBox.critical(self, "OpenAI", f"API key neprosel: {e}")
             return
-        dlg.close()
+        try:
+            self.progress.finish("Hotovo.")
+        except Exception:
+            pass
         if not ok:
             QMessageBox.warning(self, "OpenAI", "API key je platny, ale seznam modelu je prazdny.")
             return
@@ -3814,19 +3857,25 @@ class MainWindow(QMainWindow):
         if not api_key:
             QMessageBox.warning(self, "Modely OpenAI", "Nejdriv vypln API key.")
             return
-        dlg = QProgressDialog("Nacitam modely...", "", 0, 0, self)
-        dlg.setWindowTitle("OpenAI")
-        dlg.setCancelButton(None)
-        dlg.setMinimumDuration(0)
-        dlg.setWindowModality(Qt.ApplicationModal)
-        dlg.show()
+        if not getattr(self, "progress", None) or not self.progress.can_start():
+            QMessageBox.warning(self, "Probíhá akce", "Nelze načíst modely, protože už běží jiná akce.")
+            return
+        self.progress.start(title="OpenAI", step="Online: načítám modely…", total=None)
+        self.progress.set_openai_phase("OpenAI API: odesílám požadavek")
         QApplication.processEvents()
         try:
             ids = list_models(api_key)
         except Exception as e:
-            dlg.close()
+            try:
+                self.progress.finish("Chyba.")
+            except Exception:
+                pass
             QMessageBox.critical(self, "Modely OpenAI", f"Nelze nacist modely: {e}")
             return
+        try:
+            self.progress.finish("Hotovo.")
+        except Exception:
+            pass
         dlg.close()
         if not ids:
             QMessageBox.information(self, "Modely OpenAI", "Zadne modely nenalezeny.")
@@ -3845,6 +3894,39 @@ class MainWindow(QMainWindow):
         self._import_status = msg
         try:
             self.lbl_run_status.setText(msg)
+        except Exception:
+            pass
+
+        # Forward into single progress dialog (IMPORT + processing).
+        try:
+            if not getattr(self, "progress", None) or not self.progress.active:
+                return
+            text = str(msg or "").strip()
+            if text.startswith("__BATCH_RESULT__|"):
+                parts = text.split("|", 2)
+                status = parts[1] if len(parts) > 1 else ""
+                self.progress.mark_batch_done(status)
+                return
+            # Zpracovávám i/total: file
+            if text.startswith("Zpracovávám") and "/" in text:
+                import re
+
+                m = re.search(r"Zpracovávám\s+(\d+)\s*/\s*(\d+)", text)
+                if m:
+                    i = int(m.group(1))
+                    total = int(m.group(2))
+                    try:
+                        if self.progress.batch.total <= 0:
+                            self.progress.batch.total = int(total)
+                    except Exception:
+                        pass
+                    # switch to determinate if needed
+                    self.progress.update(step=text, total=total, value=max(0, i - 1))
+                    return
+            if "OpenAI" in text or "openai" in text.lower():
+                # keep the andon alive on any OpenAI-related status messages
+                self.progress.set_openai_phase(text)
+            self.progress.update(step=text)
         except Exception:
             pass
 
@@ -3867,6 +3949,12 @@ class MainWindow(QMainWindow):
             self.refresh_all_v2()
         except Exception:
             pass
+
+        try:
+            if getattr(self, "progress", None) and self.progress.active:
+                self.progress.finish(self._import_status)
+        except Exception:
+            pass
         try:
             self.refresh_ops()
             self.refresh_unprocessed()
@@ -3885,9 +3973,17 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         QMessageBox.critical(self, "IMPORTUJ", msg)
+        try:
+            if getattr(self, "progress", None) and self.progress.active:
+                self.progress.finish(f"Chyba: {msg}")
+        except Exception:
+            pass
 
     def on_import_clicked(self) -> None:
         if self._import_running:
+            return
+        if not getattr(self, "progress", None) or not self.progress.can_start():
+            QMessageBox.warning(self, "Probíhá akce", "Nelze spustit IMPORT, protože už běží jiná akce.")
             return
         # zajisti dostupnost API key pro import i bez otevreni karty Nastaveni
         try:
@@ -3903,6 +3999,21 @@ class MainWindow(QMainWindow):
         if output_dir_val:
             deep_set(self.cfg, ["paths", "output_dir"], output_dir_val)
 
+        # Quick guard: if the INPUT tree has no files at all, skip launching
+        # the import thread/progress dialog and let the user know.
+        try:
+            has_any_file = False
+            for _dirpath, _dirnames, filenames in os.walk(input_dir_val):
+                if filenames:
+                    has_any_file = True
+                    break
+            if not has_any_file:
+                QMessageBox.information(self, "IMPORTUJ", "V INPUT nejsou žádné soubory k importu.")
+                return
+        except Exception:
+            # If the check fails for any reason, continue with normal import flow.
+            pass
+
         self._import_running = True
         self._import_stop_event.clear()
         self._import_status = "Načítám INPUT…"
@@ -3912,6 +4023,9 @@ class MainWindow(QMainWindow):
             self.lbl_run_status.setText(self._import_status)
         except Exception:
             pass
+
+        # One progress dialog for the whole import run.
+        self.progress.start(title="IMPORT", step=self._import_status, total=None, batch_total=0, cancel_cb=self._import_stop_event.set)
 
         th = QThread(self)
         wk = _ImportWorker(self.cfg, self.sf, self.processor, self._import_stop_event.is_set)
@@ -3945,6 +4059,14 @@ class MainWindow(QMainWindow):
                 self._workers.remove(wk)
             except Exception:
                 pass
+            # Failsafe: if the worker finishes but the UI didn't get a done/error
+            # signal for any reason, ensure the progress dialog is closed.
+            try:
+                if getattr(self, "progress", None) and self.progress.active:
+                    final_msg = self._import_status or "Hotovo."
+                    self.progress.finish(final_msg)
+            except Exception:
+                pass
 
         wk.done.connect(lambda _res: _cleanup_thread())
         wk.error.connect(lambda _msg: _cleanup_thread())
@@ -3971,38 +4093,23 @@ class MainWindow(QMainWindow):
     def _retry_extract(self, file_id: int, use_openai: bool) -> None:
         """Opakované vytěžení konkrétního souboru (offline nebo OpenAI) s průběhem."""
 
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Opakovat vytěžení")
-        dlg.setWindowModality(Qt.ApplicationModal)
-        dlg.setMinimumWidth(440)
-        lay = QVBoxLayout(dlg)
-        lbl = QLabel("Připravuji opakování…")
-        bar = QProgressBar()
-        bar.setRange(0, 0)  # indeterminate teploměr
-        log_box = QTextEdit()
-        log_box.setReadOnly(True)
-        log_box.setMinimumHeight(160)
-        btn_close = QPushButton("Zavřít")
-        btn_close.setEnabled(False)
-        btn_close.clicked.connect(dlg.close)
-        lay.addWidget(lbl)
-        lay.addWidget(bar)
-        lay.addWidget(log_box)
-        lay.addWidget(btn_close, alignment=Qt.AlignRight)
-        dlg.show()
+        if not getattr(self, "progress", None) or not self.progress.can_start():
+            QMessageBox.warning(self, "Probíhá akce", "Nelze spustit opakované vytěžení, protože už běží jiná akce.")
+            return
+        mode = "Online" if use_openai else "Offline"
+        self.progress.start(title="Opakovat vytěžení", step=f"{mode}: připravuji…", total=None)
 
         def status_cb(msg: str) -> None:
-            # voláno z worker vlákna -> přeposlat do UI
             try:
                 txt = str(msg or "").strip()
             except Exception:
                 txt = ""
             def _upd():
-                if not Shiboken.isValid(dlg):
+                if not getattr(self, "progress", None) or not self.progress.active:
                     return
-                lbl.setText(txt or "Pracuji…")
-                if txt:
-                    log_box.append(txt)
+                if "OpenAI" in txt or "openai" in txt.lower():
+                    self.progress.set_openai_phase(txt)
+                self.progress.update(step=txt or "Pracuji…")
             try:
                 QTimer.singleShot(0, self, _upd)
             except Exception:
@@ -4056,12 +4163,10 @@ class MainWindow(QMainWindow):
 
         def ok(res):
             try:
-                if Shiboken.isValid(dlg):
-                    lbl.setText("Hotovo.")
-                    bar.setRange(0, 1)
-                    bar.setValue(1)
-                    btn_close.setEnabled(True)
-                    QTimer.singleShot(500, dlg.close)
+                if getattr(self, "progress", None) and self.progress.active:
+                    st = str(res.get("status") or "Hotovo")
+                    moved_to = str(res.get("moved_to") or "")
+                    self.progress.finish(f"Výsledek: {st} {moved_to}".strip())
             except Exception:
                 pass
             try:
@@ -4076,12 +4181,8 @@ class MainWindow(QMainWindow):
 
         def err(msg: str):
             try:
-                if Shiboken.isValid(dlg):
-                    lbl.setText("Chyba")
-                    bar.setRange(0, 1)
-                    bar.setValue(0)
-                    log_box.append(str(msg))
-                    btn_close.setEnabled(True)
+                if getattr(self, "progress", None) and self.progress.active:
+                    self.progress.finish(f"Chyba: {msg}")
             except Exception:
                 pass
             QMessageBox.warning(self, "Opakovat vytěžení", str(msg))
@@ -4190,56 +4291,22 @@ class MainWindow(QMainWindow):
         if not ids:
             return
 
+        if not getattr(self, "progress", None) or not self.progress.can_start():
+            QMessageBox.warning(self, "Probíhá akce", "Nelze spustit opakované vytěžení, protože už běží jiná akce.")
+            return
+
         total = len(ids)
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Opakovat vytěžení")
-        dlg.setWindowModality(Qt.ApplicationModal)
-        dlg.setMinimumWidth(520)
-        lay = QVBoxLayout(dlg)
-        lbl = QLabel(f"Připravuji opakování ({total} souborů)…")
-        bar = QProgressBar()
-        bar.setRange(0, total)
-        bar.setValue(0)
-        log_box = QTextEdit()
-        log_box.setReadOnly(True)
-        log_box.setMinimumHeight(220)
-        btn_close = QPushButton("Zavřít")
-        btn_close.setEnabled(False)
-        btn_close.clicked.connect(dlg.close)
-        lay.addWidget(lbl)
-        lay.addWidget(bar)
-        lay.addWidget(log_box)
-        lay.addWidget(btn_close, alignment=Qt.AlignRight)
-        dlg.show()
-
-        def append_log(msg: str) -> None:
-            try:
-                txt = str(msg or "").strip()
-            except Exception:
-                txt = ""
-            if not txt:
-                return
-
-            def _upd() -> None:
-                if not Shiboken.isValid(dlg):
-                    return
-                log_box.append(txt)
-
-            try:
-                QTimer.singleShot(0, self, _upd)
-            except Exception:
-                pass
+        mode = "Online" if use_openai else "Offline"
+        self.progress.start(title="Opakovat vytěžení", step=f"{mode}: připravuji ({total} souborů)…", total=total, batch_total=total)
 
         def set_progress(done: int, message: str) -> None:
             done_count = max(0, min(int(done), total))
             text = str(message or "Pracuji…")
-
             def _upd() -> None:
-                if not Shiboken.isValid(dlg):
-                    return
-                lbl.setText(text)
-                bar.setValue(done_count)
-
+                if getattr(self, "progress", None) and self.progress.active:
+                    if "OpenAI" in text or "openai" in text.lower():
+                        self.progress.set_openai_phase(text)
+                    self.progress.update(step=text, value=done_count)
             try:
                 QTimer.singleShot(0, self, _upd)
             except Exception:
@@ -4252,17 +4319,26 @@ class MainWindow(QMainWindow):
                 set_progress(idx - 1, f"[{idx}/{total}] Zpracovávám soubor ID {fid}…")
                 try:
                     with self.sf() as session:
-                        self._process_retry_extract(
+                        res = self._process_retry_extract(
                             session=session,
                             file_id=fid,
                             use_openai=use_openai,
-                            status_cb=lambda msg, i=idx, t=total: append_log(f"[{i}/{t}] {msg}"),
+                            status_cb=lambda msg, i=idx, t=total: set_progress(idx - 1, f"[{i}/{t}] {msg}"),
                         )
+                    try:
+                        st = str(res.get("status") or "")
+                    except Exception:
+                        st = ""
+                    def _mark(st_in: str):
+                        if getattr(self, "progress", None) and self.progress.active:
+                            self.progress.mark_batch_done(st_in)
+                    QTimer.singleShot(0, self, lambda st_in=st: _mark(st_in))
                     ok_count += 1
-                    append_log(f"[{idx}/{total}] Hotovo (ID {fid}).")
+                    set_progress(idx, f"[{idx}/{total}] Hotovo (ID {fid}).")
                 except Exception as exc:
                     failed_ids.append(fid)
-                    append_log(f"[{idx}/{total}] Chyba (ID {fid}): {exc}")
+                    QTimer.singleShot(0, self, lambda: (self.progress.mark_batch_done("ERROR") if getattr(self, "progress", None) and self.progress.active else None))
+                    set_progress(idx, f"[{idx}/{total}] Chyba (ID {fid}): {exc}")
             set_progress(total, "Dokončeno.")
             return {
                 "total": total,
@@ -4273,9 +4349,8 @@ class MainWindow(QMainWindow):
 
         def ok(res: Dict[str, Any]) -> None:
             try:
-                if Shiboken.isValid(dlg):
-                    btn_close.setEnabled(True)
-                    QTimer.singleShot(400, dlg.close)
+                if getattr(self, "progress", None) and self.progress.active:
+                    self.progress.finish("Dokončeno.")
             except Exception:
                 pass
             total_count = int(res.get("total", total))
@@ -4293,10 +4368,8 @@ class MainWindow(QMainWindow):
 
         def err(msg: str) -> None:
             try:
-                if Shiboken.isValid(dlg):
-                    lbl.setText("Chyba")
-                    btn_close.setEnabled(True)
-                    log_box.append(str(msg))
+                if getattr(self, "progress", None) and self.progress.active:
+                    self.progress.finish(f"Chyba: {msg}")
             except Exception:
                 pass
             QMessageBox.warning(self, "Opakovat vytěžení", str(msg))
