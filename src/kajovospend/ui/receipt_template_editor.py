@@ -457,6 +457,55 @@ class ReceiptTemplateEditorDialog(QDialog):
         self._build_ui()
         self._load_template()
 
+    def _normalize_relpath(self, relpath: Path) -> str:
+        # Keep DB path portable across platforms.
+        return relpath.as_posix()
+
+    def _sanitize_sample_folder(self, folder: Optional[Path]) -> Optional[Path]:
+        if not folder:
+            return None
+        try:
+            if folder.is_absolute():
+                return None
+            parts = [part for part in folder.parts if part not in ("", ".", "..")]
+            if not parts:
+                return None
+            return Path(*parts)
+        except Exception:
+            return None
+
+    def _resolve_existing_sample_path(self, sample_rel: Optional[str], sample_name: Optional[str]) -> Optional[Path]:
+        candidates: List[Path] = []
+        if sample_rel:
+            raw = Path(sample_rel)
+            if raw.is_absolute():
+                candidates.append(raw)
+            else:
+                candidates.append(self.paths.data_dir / raw)
+            # Defensive fallback for mixed separators saved on a different OS.
+            norm = sample_rel.replace("\\", "/")
+            candidates.append(self.paths.data_dir / Path(norm))
+
+        seen: set[str] = set()
+        for cand in candidates:
+            key = str(cand)
+            if key in seen:
+                continue
+            seen.add(key)
+            if cand.exists() and cand.suffix.lower() == ".pdf":
+                return cand
+
+        if sample_name:
+            try:
+                templates_root = self.paths.data_dir / "templates"
+                if templates_root.exists():
+                    for found in templates_root.rglob(sample_name):
+                        if found.is_file() and found.suffix.lower() == ".pdf":
+                            return found
+            except Exception:
+                log.exception("Nepodarilo se dohledat vzorovy PDF soubor")
+        return None
+
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
 
@@ -597,14 +646,12 @@ class ReceiptTemplateEditorDialog(QDialog):
                 pass
 
         sample_rel = self._template.get("sample_file_relpath")
-        if sample_rel:
+        sample_name = self._template.get("sample_file_name")
+        resolved_sample = self._resolve_existing_sample_path(sample_rel, sample_name)
+        if resolved_sample:
+            self._sample_pdf_path = resolved_sample
             try:
-                rel_path = Path(sample_rel)
-                if rel_path.parent:
-                    self._sample_folder_relpath = rel_path.parent
-                full = self.paths.data_dir / rel_path
-                if full.exists() and full.suffix.lower() == ".pdf":
-                    self._sample_pdf_path = full
+                self._sample_folder_relpath = resolved_sample.relative_to(self.paths.data_dir).parent
             except Exception:
                 self._sample_folder_relpath = None
 
@@ -903,7 +950,7 @@ class ReceiptTemplateEditorDialog(QDialog):
 
     def _prepare_sample_info(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         if self._sample_pdf_path and self._sample_pdf_path.exists():
-            folder = self._sample_folder_relpath or Path("templates") / uuid.uuid4().hex
+            folder = self._sanitize_sample_folder(self._sample_folder_relpath) or Path("templates") / uuid.uuid4().hex
             dest_dir = self.paths.data_dir / folder
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest_path = dest_dir / self._sample_pdf_path.name
@@ -912,7 +959,7 @@ class ReceiptTemplateEditorDialog(QDialog):
             if src_resolved != dst_resolved:
                 shutil.copy2(self._sample_pdf_path, dest_path)
             self._sample_folder_relpath = folder
-            relpath = str(dest_path.relative_to(self.paths.data_dir))
+            relpath = self._normalize_relpath(dest_path.relative_to(self.paths.data_dir))
             self._existing_sample_relpath = relpath
             self._existing_sample_name = self._sample_pdf_path.name
             self._existing_sample_sha = sha256_file(dest_path)
