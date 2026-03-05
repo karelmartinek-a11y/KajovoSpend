@@ -2,21 +2,62 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import traceback
 from pathlib import Path
-
-from PySide6.QtWidgets import QApplication, QMessageBox
-from PySide6.QtGui import QIcon
-
-from kajovospend.utils.env import load_user_env_var, sanitize_openai_api_key
 
 ROOT_DIR = Path(__file__).resolve().parent
 SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
-    # Prefer lokální zdrojáky před případnou instalací balíčku jinde v systému.
+    # Prefer local sources before any installed package elsewhere in system.
     sys.path.insert(0, str(SRC_DIR))
 
+
+def _prepare_qtwebengine_dirs() -> None:
+    """
+    Force QtWebEngine to use writable per-user paths.
+    Prevents Chromium cache errors on Windows when default cache location
+    is locked or not writable.
+    """
+    local_app_data = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    candidates = []
+    if local_app_data:
+        candidates.append(Path(local_app_data) / "KajovoSpend" / "qtwebengine")
+    candidates.append(ROOT_DIR / ".qtwebengine")
+    candidates.append(Path(tempfile.gettempdir()) / "KajovoSpend" / "qtwebengine")
+
+    cache_dir = None
+    user_data_dir = None
+    for base in candidates:
+        try:
+            maybe_cache = base / "cache"
+            maybe_user_data = base / "user_data"
+            maybe_cache.mkdir(parents=True, exist_ok=True)
+            maybe_user_data.mkdir(parents=True, exist_ok=True)
+            cache_dir = maybe_cache
+            user_data_dir = maybe_user_data
+            break
+        except OSError:
+            continue
+
+    if cache_dir is None or user_data_dir is None:
+        return
+
+    # Must be set before QApplication/QtWebEngine is initialized.
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").strip()
+    if "--disk-cache-dir=" not in flags:
+        flags = f"{flags} --disk-cache-dir={cache_dir}".strip()
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = flags
+    os.environ["QTWEBENGINE_USER_DATA_DIR"] = str(user_data_dir)
+
+
+_prepare_qtwebengine_dirs()
+
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication, QMessageBox
+
 from kajovospend.ui.main_window import MainWindow
+from kajovospend.utils.env import load_user_env_var, sanitize_openai_api_key
 
 
 def _install_excepthook() -> None:

@@ -44,6 +44,7 @@ class BatchSummary:
 class ProgressDialog(QDialog):
     minimized = Signal()
     restored = Signal()
+    canceled = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -54,6 +55,9 @@ class ProgressDialog(QDialog):
 
         self._t0 = time.monotonic()
         self._last_heartbeat = 0
+        # By default, user cannot close the dialog with X; we treat it as a cancel request.
+        # When the operation finishes, ProgressController enables closing.
+        self._allow_close = False
 
         self.lbl_title = QLabel("Pracuji…")
         self.lbl_title.setObjectName("ProgressTitle")
@@ -77,6 +81,9 @@ class ProgressDialog(QDialog):
         self.btn_min = QPushButton("Minimalizovat")
         self.btn_min.clicked.connect(self._on_minimize)
 
+        self.btn_cancel = QPushButton("Zastavit")
+        self.btn_cancel.clicked.connect(self._on_cancel)
+
         top = QHBoxLayout()
         top.addWidget(self.lbl_title, 1)
         top.addWidget(self.lbl_heartbeat)
@@ -85,6 +92,7 @@ class ProgressDialog(QDialog):
         mid.addWidget(self.lbl_time)
         mid.addStretch(1)
         mid.addWidget(self.btn_min)
+        mid.addWidget(self.btn_cancel)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 12, 12, 12)
@@ -149,6 +157,24 @@ class ProgressDialog(QDialog):
         self._last_heartbeat += 1
         self.lbl_heartbeat.setText("●" if (self._last_heartbeat % 2 == 0) else "○")
 
+    def _on_cancel(self) -> None:
+        # Request cancel; actual cancellation is handled by ProgressController.
+        self.canceled.emit()
+
+    def closeEvent(self, event):  # noqa: N802
+        # Treat window close as cancel request while running.
+        # When controller marks the operation as finished, allow normal close.
+        if self._allow_close:
+            event.accept()
+            return
+        try:
+            self.canceled.emit()
+        finally:
+            event.ignore()
+
+    def allow_close(self) -> None:
+        self._allow_close = True
+
     def _on_minimize(self) -> None:
         self.hide()
         self.minimized.emit()
@@ -200,6 +226,7 @@ class ProgressController:
         self.batch = BatchSummary()
         self._openai_on = False
         self._openai_off_timer: Optional[QTimer] = None
+        self._cancel_cb = None
 
         self.mini.clicked.connect(self.restore)
 
@@ -213,11 +240,13 @@ class ProgressController:
         step: str,
         total: Optional[int] = None,
         batch_total: Optional[int] = None,
+        cancel_cb=None,
     ) -> bool:
         if self.active:
             return False
         self.active = True
         self.batch = BatchSummary(total=int(batch_total or 0), done=0)
+        self._cancel_cb = cancel_cb
         self.dlg = ProgressDialog(self.parent_window)
         self.dlg.set_title(title)
         self.dlg.set_step(step)
@@ -231,6 +260,7 @@ class ProgressController:
 
         self.dlg.minimized.connect(self._on_minimized)
         self.dlg.restored.connect(self._on_restored)
+        self.dlg.canceled.connect(self.cancel)
         self.dlg.show()
         self._update_mini()
         return True
@@ -269,6 +299,20 @@ class ProgressController:
             self.batch.error += 1
         self.update(step=None)
 
+    def cancel(self) -> None:
+        # Called from UI (cancel button or window close).
+        try:
+            if callable(self._cancel_cb):
+                self._cancel_cb()
+        except Exception:
+            pass
+        # Keep progress visible but indicate stop requested.
+        try:
+            if self.active and self.dlg:
+                self.update(step="Zastavuji…")
+        except Exception:
+            pass
+
     def finish(self, final_step: str) -> None:
         if not self.active:
             return
@@ -281,13 +325,19 @@ class ProgressController:
                         self.dlg.set_value(self.dlg.bar.maximum())
                 except Exception:
                     pass
-                QTimer.singleShot(600, self.dlg.close)
+                # Allow closing now; otherwise closeEvent would emit cancel and ignore.
+                try:
+                    self.dlg.allow_close()
+                except Exception:
+                    pass
+                QTimer.singleShot(300, self.dlg.close)
         except Exception:
             pass
         self.active = False
         self._set_openai_andon(False)
         self.mini.hide()
         self.dlg = None
+        self._cancel_cb = None
 
     def minimize(self) -> None:
         if self.dlg:
@@ -297,6 +347,9 @@ class ProgressController:
     def restore(self) -> None:
         if self.dlg:
             self.dlg.restore()
+        # Do not reset cancel callback here; cancellation should keep working
+        # after minimize/restore.
+
 
     def _on_minimized(self) -> None:
         self._update_mini(force_show=True)

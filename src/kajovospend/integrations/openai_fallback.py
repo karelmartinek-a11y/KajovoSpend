@@ -406,73 +406,6 @@ def _extract_output_text(data: Dict[str, Any]) -> str:
     return text
 
 
-
-
-def _extract_json_object(text: str) -> Tuple[Optional[Dict[str, Any]], str, Optional[str]]:
-    """Robustní extrakce JSON objektu z textu (model někdy vrátí obal, code fence, apod.)."""
-    raw = text or ""
-    # 1) přímý parse
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj, "direct", None
-    except Exception:
-        pass
-
-    # 2) ```json ... ```
-    m = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw, re.IGNORECASE)
-    if m:
-        frag = m.group(1)
-        try:
-            obj = json.loads(frag)
-            if isinstance(obj, dict):
-                return obj, "code_fence", None
-        except Exception as e:
-            return None, "code_fence", str(e)
-
-    # 3) najdi největší vyvážený objekt pomocí stacku
-    best = None
-    best_len = 0
-    best_err = None
-    s = raw
-    stack = 0
-    start = None
-    for i, ch in enumerate(s):
-        if ch == "{":
-            if stack == 0:
-                start = i
-            stack += 1
-        elif ch == "}":
-            if stack > 0:
-                stack -= 1
-                if stack == 0 and start is not None:
-                    frag = s[start:i+1]
-                    if len(frag) > best_len:
-                        try:
-                            obj = json.loads(frag)
-                            if isinstance(obj, dict):
-                                best = obj
-                                best_len = len(frag)
-                                best_err = None
-                        except Exception as e:
-                            best_err = str(e)
-                    start = None
-    if best is not None:
-        return best, "balanced_braces", None
-
-    # 4) fallback: first/last brace
-    a = raw.find("{")
-    b = raw.rfind("}")
-    if a != -1 and b != -1 and b > a:
-        frag = raw[a:b+1]
-        try:
-            obj = json.loads(frag)
-            if isinstance(obj, dict):
-                return obj, "first_last_brace", None
-        except Exception as e:
-            return None, "first_last_brace", str(e)
-
-    return None, "none", best_err
 def ensure_schema_defaults(obj: Dict[str, Any]) -> Dict[str, Any]:
     """
     Doplňuje chybějící klíče dle _JSON_SCHEMA na výchozí hodnoty (null/{} / [] podle typu).
@@ -761,6 +694,7 @@ def _run_responses_flow(
     pdf: Optional[Tuple[str, bytes]],
     timeout: int,
     mode: str,
+    status_cb=None,
 ) -> Tuple[Optional[Dict[str, Any]], str, str]:
     log = logging.getLogger(__name__)
     if cfg.use_json_schema:
@@ -788,9 +722,19 @@ def _run_responses_flow(
     }
 
     attempt = 1
+    if status_cb:
+        try:
+            status_cb("OpenAI API: odesílám požadavek")
+        except Exception:
+            pass
     resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt = _openai_post_with_retry(
         payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, attempt_start=attempt
     )
+    if status_cb:
+        try:
+            status_cb("OpenAI API: přijata odpověď")
+        except Exception:
+            pass
     if resp.status_code >= 400 and cfg.use_json_schema:
         err_body = {}
         try:
@@ -836,27 +780,44 @@ def _run_responses_flow(
                 payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, attempt_start=attempt
             )
     resp.raise_for_status()
+
+    if status_cb:
+        try:
+            status_cb("OpenAI API: zpracovávám odpověď")
+        except Exception:
+            pass
     data = resp.json()
     text = _extract_output_text(data)
     if not text:
         text = str(data)
+    len_raw = len(text or "")
 
+    start = text.find("{")
+    end = text.rfind("}")
     obj = None
     parse_status = "fail"
     parse_error = None
-    obj, strategy, parse_error = _extract_json_object(text or "")
-    if isinstance(obj, dict):
-        parse_status = "ok"
+    if start != -1 and end != -1 and end > start:
+        fragment = text[start:end + 1]
+        try:
+            obj = json.loads(fragment)
+            parse_status = "ok"
+        except Exception as e:
+            parse_error = str(e)
+    else:
+        parse_error = "no_braces"
 
     log_event(
         log,
         "structured_output.parse",
         "Structured output parse",
         status=parse_status,
-        strategy=strategy,
-        length=len(text or ""),
+        strategy="first_last_brace",
+        start=start,
+        end=end,
+        length=len_raw,
         error=parse_error,
-        json_extract_strategy=strategy,
+        json_extract_strategy="first_last_brace",
     )
 
     validation_errors: List[str] = []
@@ -883,10 +844,15 @@ def _run_responses_flow(
         openai_request_id=openai_request_id,
         openai_request_id_client=req_id_client,
         extracted_output_text_length=len(text or ""),
-        len_raw=len(text or ""),
+        len_raw=len_raw,
         usage=data.get("usage"),
         parse_status=parse_status,
     )
+    if status_cb:
+        try:
+            status_cb("OpenAI API: hotovo")
+        except Exception:
+            pass
     return obj_norm, text, model
 
 
@@ -896,8 +862,9 @@ def extract_with_openai(
     images: Optional[Sequence[Tuple[str, bytes]]] = None,
     pdf: Optional[Tuple[str, bytes]] = None,
     timeout: int = 40,
+    status_cb=None,
 ) -> Tuple[Optional[Dict[str, Any]], str, str]:
-    return _run_responses_flow(cfg, ocr_text, images, pdf, timeout, mode="primary")
+    return _run_responses_flow(cfg, ocr_text, images, pdf, timeout, mode="primary", status_cb=status_cb)
 
 
 def extract_with_openai_fallback(
@@ -906,5 +873,6 @@ def extract_with_openai_fallback(
     images: Optional[Sequence[Tuple[str, bytes]]] = None,
     pdf: Optional[Tuple[str, bytes]] = None,
     timeout: int = 40,
+    status_cb=None,
 ) -> Tuple[Optional[Dict[str, Any]], str, str]:
-    return _run_responses_flow(cfg, ocr_text, images, pdf, timeout, mode="fallback")
+    return _run_responses_flow(cfg, ocr_text, images, pdf, timeout, mode="fallback", status_cb=status_cb)

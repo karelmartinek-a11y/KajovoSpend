@@ -1,17 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
-
-# Include RapidOCR package data (notably config.yaml) for PyInstaller builds.
-rapidocr_datas = collect_data_files('rapidocr_onnxruntime') if True else []
-rapidocr_hidden = collect_submodules('rapidocr_onnxruntime') if True else []
 
 a = Analysis(
     ['run_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets', 'assets'), ('src', 'src')] + rapidocr_datas,
-    hiddenimports=rapidocr_hidden,
+    datas=[('assets', 'assets'), ('src', 'src')],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

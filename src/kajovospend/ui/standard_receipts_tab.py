@@ -1,38 +1,26 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-import json
-import re
-import shutil
-import uuid
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QRegularExpression
-from PySide6.QtGui import QDesktopServices, QRegularExpressionValidator, QUrl
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
-    QCheckBox,
-    QDialog,
-    QDialogButtonBox,
-    QFileDialog,
-    QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
-    QLineEdit,
     QMessageBox,
     QPushButton,
     QTableView,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
-    QHeaderView,
-    QAbstractItemView,
 )
 
-from kajovospend.extract.standard_receipts import legend_text, parse_template_schema_text, TemplateSchemaError
-from kajovospend.utils.hashing import sha256_file
+from kajovospend.extract.standard_receipts import legend_text
 
 from . import db_api
+from .receipt_template_editor import ReceiptTemplateEditorDialog
 
 
 class TemplateTableModel(QAbstractTableModel):
@@ -88,189 +76,6 @@ class TemplateTableModel(QAbstractTableModel):
         return self._rows[row]
 
 
-class StandardReceiptTemplateDialog(QDialog):
-    def __init__(self, paths, template: Dict[str, Any] | None = None, parent=None):
-        super().__init__(parent)
-        self.paths = paths
-        self._template = template or {}
-        self.setWindowTitle("Standardní účtenka")
-
-        self._selected_sample_path: Optional[Path] = None
-        self._sample_folder_relpath: Optional[Path] = None
-
-        sample_rel = self._template.get("sample_file_relpath")
-        if sample_rel:
-            try:
-                rel_path = Path(sample_rel)
-                if rel_path.parent:
-                    self._sample_folder_relpath = rel_path.parent
-            except Exception:
-                self._sample_folder_relpath = None
-
-        self._existing_sample_relpath = sample_rel
-
-        self._existing_sample_sha = self._template.get("sample_file_sha256")
-        self._existing_sample_name = self._template.get("sample_file_name")
-
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-
-        self.ed_name = QLineEdit(self._template.get("name") or "")
-        form.addRow("Název", self.ed_name)
-
-        self.chk_enabled = QCheckBox("Aktivní")
-        self.chk_enabled.setChecked(bool(self._template.get("enabled", True)))
-        form.addRow(self.chk_enabled)
-
-        ico_validator = QRegularExpressionValidator(QRegularExpression(r"^\d*$"), self)
-        self.ed_match_ico = QLineEdit(self._template.get("match_supplier_ico_norm") or "")
-        self.ed_match_ico.setValidator(ico_validator)
-        self.ed_match_ico.editingFinished.connect(self._normalize_ico_field)
-        form.addRow("Match IČO", self.ed_match_ico)
-
-        match_texts = self._template.get("match_texts_json")
-        tokens = []
-        if match_texts:
-            try:
-                parsed = json.loads(match_texts)
-                if isinstance(parsed, list):
-                    tokens = [str(x) for x in parsed if str(x).strip()]
-            except Exception:
-                tokens = []
-        self.match_texts = QTextEdit("\n".join(tokens))
-        form.addRow("Match texty (1 token / řádek)", self.match_texts)
-
-        sample_row = QHBoxLayout()
-        self.btn_choose_sample = QPushButton("Vybrat PDF")
-        self.btn_choose_sample.clicked.connect(self._select_sample_file)
-        self.lbl_sample = QLabel(self._existing_sample_name or "Žádný soubor")
-        self.lbl_sample.setWordWrap(True)
-        self.btn_open_sample = QPushButton("Otevřít")
-        self.btn_open_sample.clicked.connect(self._open_sample_file)
-        self.btn_open_sample.setEnabled(bool(self._existing_sample_name))
-        sample_row.addWidget(self.btn_choose_sample)
-        sample_row.addWidget(self.lbl_sample, 1)
-        sample_row.addWidget(self.btn_open_sample)
-        form.addRow("Vzorový soubor", sample_row)
-
-        schema_label = QLabel("Mapa polí (JSON)")
-        layout.addLayout(form)
-        layout.addWidget(schema_label)
-
-        self.schema_edit = QTextEdit(self._template.get("schema_json") or "")
-        layout.addWidget(self.schema_edit)
-
-        schema_controls = QHBoxLayout()
-        self.lbl_schema_status = QLabel("")
-        self.btn_validate_schema = QPushButton("Validovat JSON")
-        self.btn_validate_schema.clicked.connect(self._validate_schema_action)
-        schema_controls.addWidget(self.btn_validate_schema)
-        schema_controls.addWidget(self.lbl_schema_status, 1)
-        layout.addLayout(schema_controls)
-
-        legend_btn = QPushButton("Zkopírovat legendu")
-        legend_btn.clicked.connect(self._copy_legend)
-        layout.addWidget(legend_btn, alignment=Qt.AlignRight)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _normalize_ico_field(self) -> None:
-        text = self.ed_match_ico.text()
-        digits = re.sub(r"\D+", "", text)
-        if digits:
-            self.ed_match_ico.setText(digits.zfill(8) if len(digits) < 8 else digits)
-        else:
-            self.ed_match_ico.clear()
-
-    def _select_sample_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Vybrat vzorový PDF", str(Path.home()), "PDF Files (*.pdf)")
-        if not path:
-            return
-        self._selected_sample_path = Path(path)
-        self.lbl_sample.setText(self._selected_sample_path.name)
-        self.btn_open_sample.setEnabled(True)
-
-    def _open_sample_file(self) -> None:
-        if self._selected_sample_path:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._selected_sample_path)))
-            return
-        if not self._existing_sample_name or not self._existing_sample_relpath:
-            return
-        target = self.paths.data_dir / self._existing_sample_relpath
-        if target.exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
-
-    def _validate_schema_action(self) -> None:
-        text = self.schema_edit.toPlainText().strip()
-        if not text:
-            self.lbl_schema_status.setText("JSON nesmí být prázdný.")
-            return
-        try:
-            parse_template_schema_text(text)
-        except TemplateSchemaError as exc:
-            self.lbl_schema_status.setText(str(exc))
-            return
-        self.lbl_schema_status.setText("OK")
-
-    def _copy_legend(self) -> None:
-        QApplication.clipboard().setText(legend_text())
-        QMessageBox.information(self, "Legenda", "Legenda byla zkopírována.")
-
-    def _prepare_sample_info(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-        if self._selected_sample_path:
-            folder = self._sample_folder_relpath or Path("templates") / uuid.uuid4().hex
-            dest_dir = self.paths.data_dir / folder
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest_path = dest_dir / self._selected_sample_path.name
-            shutil.copy2(self._selected_sample_path, dest_path)
-            self._sample_folder_relpath = folder
-            relpath = str(dest_path.relative_to(self.paths.data_dir))
-            self._existing_sample_relpath = relpath
-            self._existing_sample_name = self._selected_sample_path.name
-            self._existing_sample_sha = sha256_file(dest_path)
-        return (self._existing_sample_name, self._existing_sample_sha, self._existing_sample_relpath)
-
-    def _canonical_schema(self) -> str:
-        text = self.schema_edit.toPlainText().strip()
-        try:
-            parsed = json.loads(text)
-        except Exception:
-            return text
-        return json.dumps(parsed, ensure_ascii=False, indent=2)
-
-    def accept(self) -> None:
-        if not self.ed_name.text().strip():
-            QMessageBox.warning(self, "Chyba", "Název je povinný.")
-            return
-        try:
-            schema = self._canonical_schema()
-            parse_template_schema_text(schema)
-        except TemplateSchemaError as exc:
-            QMessageBox.warning(self, "Schéma", f"Šablona není validní: {exc}")
-            return
-        super().accept()
-
-    @property
-    def payload(self) -> Dict[str, Any]:
-        schema = self._canonical_schema()
-        sample_name, sample_sha, sample_rel = self._prepare_sample_info()
-        tokens = [line.strip() for line in self.match_texts.toPlainText().splitlines() if line.strip()]
-        match_texts = json.dumps(tokens, ensure_ascii=False) if tokens else None
-        return {
-            "name": self.ed_name.text().strip(),
-            "enabled": bool(self.chk_enabled.isChecked()),
-            "match_supplier_ico_norm": self.ed_match_ico.text().strip() or None,
-            "match_texts_json": match_texts,
-            "schema_json": schema,
-            "sample_file_name": sample_name,
-            "sample_file_sha256": sample_sha,
-            "sample_file_relpath": sample_rel,
-        }
-
-
 class StandardReceiptsTab(QWidget):
     def __init__(self, sf, cfg, paths, runner_host, runner_cls, parent=None):
         super().__init__(parent)
@@ -315,13 +120,7 @@ class StandardReceiptsTab(QWidget):
         self._update_action_state()
         self.refresh_templates()
 
-    def _run_db(
-        self,
-        work,
-        done,
-        *,
-        timeout_ms: int | None = None,
-    ) -> None:
+    def _run_db(self, work, done, *, timeout_ms: int | None = None) -> None:
         def on_error(msg: str | None) -> None:
             QMessageBox.warning(self, "Šablony", f"Operace selhala: {msg}")
 
@@ -338,8 +137,7 @@ class StandardReceiptsTab(QWidget):
     def refresh_templates(self) -> None:
         def work():
             with self.sf() as session:
-                rows = db_api.list_standard_receipt_templates(session)
-            return rows
+                return db_api.list_standard_receipt_templates(session)
 
         def done(rows):
             self._templates = rows
@@ -380,8 +178,8 @@ class StandardReceiptsTab(QWidget):
         QMessageBox.information(self, "Legenda", "Legenda byla zkopírována.")
 
     def _add_template(self) -> None:
-        dlg = StandardReceiptTemplateDialog(self.paths, parent=self)
-        if dlg.exec() != QDialog.Accepted:
+        dlg = ReceiptTemplateEditorDialog(self.paths, self.cfg, parent=self)
+        if dlg.exec() != dlg.Accepted:
             return
         payload = dlg.payload
 
@@ -391,10 +189,7 @@ class StandardReceiptsTab(QWidget):
                 session.commit()
             return tid
 
-        def done(_):
-            self.refresh_templates()
-
-        self._run_db(work, done, timeout_ms=15000)
+        self._run_db(work, lambda _: self.refresh_templates(), timeout_ms=15000)
 
     def _edit_template(self) -> None:
         row = self._selected_row()
@@ -404,12 +199,11 @@ class StandardReceiptsTab(QWidget):
 
         def work():
             with self.sf() as session:
-                data = db_api.get_standard_receipt_template(session, template_id)
-            return data
+                return db_api.get_standard_receipt_template(session, template_id)
 
         def done(data):
-            dlg = StandardReceiptTemplateDialog(self.paths, template=data, parent=self)
-            if dlg.exec() != QDialog.Accepted:
+            dlg = ReceiptTemplateEditorDialog(self.paths, self.cfg, template=data, parent=self)
+            if dlg.exec() != dlg.Accepted:
                 return
             payload = dlg.payload
 
@@ -418,10 +212,7 @@ class StandardReceiptsTab(QWidget):
                     db_api.update_standard_receipt_template(session, template_id, payload)
                     session.commit()
 
-            def done_update(_):
-                self.refresh_templates()
-
-            self._run_db(work_update, done_update, timeout_ms=15000)
+            self._run_db(work_update, lambda _: self.refresh_templates(), timeout_ms=15000)
 
         self._run_db(work, done, timeout_ms=15000)
 
@@ -438,7 +229,4 @@ class StandardReceiptsTab(QWidget):
                 db_api.delete_standard_receipt_template(session, template_id)
                 session.commit()
 
-        def done(_):
-            self.refresh_templates()
-
-        self._run_db(work, done, timeout_ms=15000)
+        self._run_db(work, lambda _: self.refresh_templates(), timeout_ms=15000)

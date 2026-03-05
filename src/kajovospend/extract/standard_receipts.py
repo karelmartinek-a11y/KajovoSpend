@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
@@ -37,54 +37,68 @@ class TemplateSchema:
     fields: Dict[str, TemplateField]
 
 
+def serialize_template_schema(schema: TemplateSchema) -> str:
+    payload = {
+        "version": int(schema.version),
+        "fields": {
+            name: {
+                "page": int(field.page),
+                "box": [float(field.box[0]), float(field.box[1]), float(field.box[2]), float(field.box[3])],
+            }
+            for name, field in sorted(schema.fields.items())
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def _validate_box(box: Iterable[Any]) -> Tuple[float, float, float, float]:
     values = list(box)
     if len(values) != 4:
-        raise TemplateSchemaError("Souřadnice boxu musí obsahovat 4 hodnoty.")
-    coords = []
-    for idx, value in enumerate(values):
+        raise TemplateSchemaError("Souradnice boxu musi obsahovat 4 hodnoty.")
+    coords: List[float] = []
+    for value in values:
         try:
             num = float(value)
-        except Exception:
-            raise TemplateSchemaError("Souřadnice boxu musí být čísla v rozmezí 0..1.")
+        except Exception as exc:
+            raise TemplateSchemaError("Souradnice boxu musi byt cisla v rozmezi 0..1.") from exc
         if not (0.0 <= num <= 1.0):
-            raise TemplateSchemaError("Souřadnice boxu musí být v intervalu 0..1.")
+            raise TemplateSchemaError("Souradnice boxu musi byt v intervalu 0..1.")
         coords.append(num)
     x0, y0, x1, y1 = coords
     if x0 >= x1 or y0 >= y1:
-        raise TemplateSchemaError("Souřadnice boxu musí mít x0<x1 a y0<y1.")
+        raise TemplateSchemaError("Souradnice boxu musi mit x0<x1 a y0<y1.")
     return (x0, y0, x1, y1)
 
 
 def parse_template_schema_dict(schema: Mapping[str, Any]) -> TemplateSchema:
     if not isinstance(schema, Mapping):
-        raise TemplateSchemaError("Schéma musí být JSON objekt.")
+        raise TemplateSchemaError("Schema musi byt JSON objekt.")
     version = schema.get("version")
     if version != 1:
-        raise TemplateSchemaError("Podporovaná verze schématu je 1.")
+        raise TemplateSchemaError("Podporovana verze schematu je 1.")
     fields = schema.get("fields")
     if not isinstance(fields, Mapping):
-        raise TemplateSchemaError("Schéma musí obsahovat objekt fields.")
+        raise TemplateSchemaError("Schema musi obsahovat objekt fields.")
     parsed: Dict[str, TemplateField] = {}
     required = {"supplier_ico", "doc_number", "issue_date", "total_with_vat"}
     for name, raw in fields.items():
         if not isinstance(raw, Mapping):
-            raise TemplateSchemaError(f"Pole {name} musí být objekt s page/box.")
+            raise TemplateSchemaError(f"Pole {name} musi byt objekt s page/box.")
         page = raw.get("page")
         try:
             page_num = int(page or 1)
-        except Exception:
-            raise TemplateSchemaError(f"Pole {name}: 'page' musí být číslo.")
+        except Exception as exc:
+            raise TemplateSchemaError(f"Pole {name}: 'page' musi byt cislo.") from exc
         if page_num < 1:
-            raise TemplateSchemaError(f"Pole {name}: 'page' musí být >= 1.")
+            raise TemplateSchemaError(f"Pole {name}: 'page' musi byt >= 1.")
         box = raw.get("box")
         if box is None:
-            raise TemplateSchemaError(f"Pole {name} chybí box.")
+            raise TemplateSchemaError(f"Pole {name} chybi box.")
         coords = _validate_box(box)
         parsed[name] = TemplateField(name=name, page=page_num, box=coords)
     missing = required - set(parsed.keys())
     if missing:
-        raise TemplateSchemaError(f"Schéma musí obsahovat pole {', '.join(sorted(missing))}.")
+        raise TemplateSchemaError(f"Schema musi obsahovat pole {', '.join(sorted(missing))}.")
     return TemplateSchema(version=1, fields=parsed)
 
 
@@ -92,7 +106,7 @@ def parse_template_schema_text(text: str) -> TemplateSchema:
     try:
         doc = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise TemplateSchemaError(f"Chybný JSON: {exc}") from exc
+        raise TemplateSchemaError(f"Chybny JSON: {exc}") from exc
     return parse_template_schema_dict(doc)
 
 
@@ -115,6 +129,23 @@ def _normalize_digits(value: str | None) -> str | None:
     return digits
 
 
+def normalized_box_to_pixel_box(
+    box: Tuple[float, float, float, float],
+    width: int,
+    height: int,
+) -> Tuple[int, int, int, int]:
+    if width <= 0 or height <= 0:
+        raise TemplateSchemaError("Neplatna velikost stranky pro prevod ROI.")
+    x0, y0, x1, y1 = _validate_box(box)
+    px0 = max(0, min(width, int(round(x0 * width))))
+    py0 = max(0, min(height, int(round(y0 * height))))
+    px1 = max(0, min(width, int(round(x1 * width))))
+    py1 = max(0, min(height, int(round(y1 * height))))
+    if px1 <= px0 or py1 <= py0:
+        raise TemplateSchemaError("ROI je po prevodu prazdna.")
+    return (px0, py0, px1, py1)
+
+
 def match_template(template: Any, full_text: str) -> bool:
     text = (full_text or "").lower()
     has_rule = False
@@ -130,13 +161,13 @@ def match_template(template: Any, full_text: str) -> bool:
             return False
 
     match_texts = getattr(template, "match_texts_json", None)
-    tokens: List[str] = []
     if match_texts:
         has_rule = True
         try:
             parsed = json.loads(match_texts)
         except Exception:
             parsed = []
+        tokens: List[str]
         if isinstance(parsed, Iterable):
             tokens = [str(t).strip().lower() for t in parsed if isinstance(t, (str, int, float)) and str(t).strip()]
         else:
@@ -201,7 +232,7 @@ def _extract_currency(text: str) -> str:
     upper = (text or "").upper()
     if "EUR" in upper:
         return "EUR"
-    if "KČ" in upper or "Kc" in upper or "CZK" in upper:
+    if "KČ" in upper or "KC" in upper or "CZK" in upper:
         return "CZK"
     return "CZK"
 
@@ -228,34 +259,32 @@ def extract_using_template(
     full_text: str,
 ) -> "Extracted":
     if ocr_engine is None:
-        raise TemplateSchemaError("OCR engine není dostupný pro šablonu.")
+        raise TemplateSchemaError("OCR engine neni dostupny pro sablonu.")
 
     schema = parse_template_schema_text(template.schema_json)
     pages = sorted({field.page for field in schema.fields.values()})
     if not pages:
-        raise TemplateSchemaError("Šablona neobsahuje žádná pole.")
+        raise TemplateSchemaError("Sablona neobsahuje zadna pole.")
 
     ocr_cfg = cfg.get("ocr") if isinstance(cfg, Mapping) else {}
     dpi = int(ocr_cfg.get("pdf_dpi", 300) or 300)
     dpi = max(200, min(dpi, 600))
-    start_page = max(0, pages[0] - 1)
-    max_pages = pages[-1] - pages[0] + 1
 
     from PIL import Image
 
     from kajovospend.extract.parser import Extracted, extract_from_text, postprocess_items_for_db
 
+    page_map: Dict[int, Image.Image] = {}
     try:
         from kajovospend.ocr.pdf_render import render_pdf_to_images
 
-        images = render_pdf_to_images(pdf_path, dpi=dpi, start_page=start_page, max_pages=max_pages)
+        for page_no in pages:
+            start_page = max(0, int(page_no) - 1)
+            images = render_pdf_to_images(pdf_path, dpi=dpi, start_page=start_page, max_pages=1)
+            if images:
+                page_map[int(page_no)] = images[0]
     except Exception as exc:
-        raise TemplateSchemaError(f"Šablona: nepodařilo se renderovat PDF - {exc}") from exc
-
-    page_map: Dict[int, Image.Image] = {}
-    for idx, img in enumerate(images):
-        page_no = start_page + idx + 1
-        page_map[page_no] = img
+        raise TemplateSchemaError(f"Sablona: nepodarilo se renderovat PDF - {exc}") from exc
 
     field_texts: Dict[str, str] = {}
     confidences: List[float] = []
@@ -264,11 +293,9 @@ def extract_using_template(
         if img is None:
             continue
         w, h = img.size
-        x0 = max(0, min(w, int(field.box[0] * w)))
-        y0 = max(0, min(h, int(field.box[1] * h)))
-        x1 = max(0, min(w, int(field.box[2] * w)))
-        y1 = max(0, min(h, int(field.box[3] * h)))
-        if x1 <= x0 or y1 <= y0:
+        try:
+            x0, y0, x1, y1 = normalized_box_to_pixel_box(field.box, w, h)
+        except TemplateSchemaError:
             continue
         try:
             crop = img.crop((x0, y0, x1, y1))
@@ -323,15 +350,15 @@ def extract_using_template(
 
     review_reasons: List[str] = list(dict.fromkeys(reasons))
     if not supplier_ico:
-        review_reasons.append("Šablona: chybí IČO.")
+        review_reasons.append("Sablona: chybi ICO.")
     if not doc_number:
-        review_reasons.append("Šablona: chybí číslo dokladu.")
+        review_reasons.append("Sablona: chybi cislo dokladu.")
     if issue_date is None:
-        review_reasons.append("Šablona: chybí datum.")
+        review_reasons.append("Sablona: chybi datum.")
     if total_value is None or (total_value is not None and total_value <= 0.0):
-        review_reasons.append("Šablona: chybí nebo nulová částka.")
+        review_reasons.append("Sablona: chybi nebo nulova castka.")
     if items_txt and not items:
-        review_reasons.append("Šablona: nelze extrahovat položky.")
+        review_reasons.append("Sablona: nelze extrahovat polozky.")
 
     requires_review = (
         not (supplier_ico and doc_number and issue_date and total_value and total_value > 0.0)

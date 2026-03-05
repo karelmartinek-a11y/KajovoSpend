@@ -5,7 +5,7 @@ Desktopová aplikace pro evidenci a kategorizaci dokladů (faktury, účtenky, d
 ## Funkce (aktuální implementace)
 
 - GUI (PySide6): karta RUN (IMPORT + status + přehledné statistiky), ÚČTY, POLOŽKY, NEROZPOZNANÉ, DODAVATELÉ, PROVOZNÍ PANEL, PODEZŘELÉ, VÝDAJE.
-- Standardní účtenky: karta pro správu šablon (PDF vzor + JSON mapování + match pravidla). Při importu se šablony použijí jako `extraction_method="template"` a `processing_profile="template:<id>:<name>"`, s fallbackem na offline extrakci, pokud šablona nesedí.
+- Standardní účtenky: karta pro správu šablon s grafickým ROI editorem nad PDF. Workflow: vyberu pole -> myší označím oblast na konkrétní stránce (včetně vícestránkových PDF) -> uložím. Interně se stále ukládá `schema_json` v1 + match pravidla; při importu se šablony použijí jako `extraction_method="template"` a `processing_profile="template:<id>:<name>"`, s fallbackem na offline extrakci, pokud šablona nesedí.
 - Deduplikace podle SHA256 (duplicitní soubory se přesunou do OUTPUT/DUPLICITY).
 - OCR varianta B: RapidOCR (offline) + PDF render přes PDFium (pypdfium2). Pokud PDF obsahuje textovou vrstvu, použije se primárně ta.
 - ARES: dotažení dodavatele podle IČO (při neúspěchu jde doklad do kontroly).

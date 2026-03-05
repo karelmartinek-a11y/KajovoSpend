@@ -160,6 +160,44 @@ QProgressBar {
   background: #FFFFFF;
   text-align: center;
 }
+
+/* OpenAI andon + minimized progress */
+QLabel#OpenAIAndon {
+  padding: 4px 10px;
+  border-radius: 10px;
+  border: 1px solid #E5E7EB;
+  background: #FFFFFF;
+  color: #111827;
+  font-weight: 700;
+}
+QLabel#OpenAIAndon[on="true"] {
+  background: #EF4444;
+  border: 1px solid #DC2626;
+  color: #FFFFFF;
+}
+
+QWidget#MiniProgress {
+  border-radius: 12px;
+  border: 1px solid #E5E7EB;
+  background: #FFFFFF;
+}
+QLabel#MiniProgress2 {
+  color: #6B7280;
+  font-size: 11px;
+}
+
+QLabel#ProgressHeartbeat {
+  color: #111827;
+  font-weight: 800;
+}
+QLabel#ProgressTime {
+  color: #6B7280;
+  font-size: 11px;
+}
+QLabel#ProgressBatch {
+  color: #374151;
+  font-size: 11px;
+}
 QProgressBar::chunk {
   border-radius: 10px;
   background: #2F8FE5;

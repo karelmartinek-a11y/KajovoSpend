@@ -1,6 +1,7 @@
-README.md
 pyproject.toml
+docs/README.md
 src/kajovospend/__init__.py
+src/kajovospend/__main__.py
 src/kajovospend.egg-info/PKG-INFO
 src/kajovospend.egg-info/SOURCES.txt
 src/kajovospend.egg-info/dependency_links.txt
@@ -38,6 +39,8 @@ src/kajovospend/service/watcher.py
 src/kajovospend/ui/__init__.py
 src/kajovospend/ui/db_api.py
 src/kajovospend/ui/main_window.py
+src/kajovospend/ui/main_window_newdb.py
+src/kajovospend/ui/progress.py
 src/kajovospend/ui/styles.py
 src/kajovospend/utils/__init__.py
 src/kajovospend/utils/amount_correction.py
