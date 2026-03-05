@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +51,8 @@ from kajovospend.extract.standard_receipts import (
 )
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 from kajovospend.utils.hashing import sha256_file
+
+log = logging.getLogger(__name__)
 
 FIELD_ORDER: List[Tuple[str, str, bool]] = [
     ("supplier_ico", "IČO", True),
@@ -144,6 +148,7 @@ class RoiRectItem(QGraphicsRectItem):
         self._on_changed = on_changed
         self._on_selected = on_selected
         self._resizing = False
+        self._moving = False
 
         self.setPos(rect.topLeft())
         self.setBrush(QColor(color.red(), color.green(), color.blue(), 60))
@@ -251,9 +256,6 @@ class RoiRectItem(QGraphicsRectItem):
             clamped_y = min(max(new_pos.y(), self._page_rect.top()), self._page_rect.bottom() - h)
             return QPointF(clamped_x, clamped_y)
 
-        if change == QGraphicsItem.ItemPositionHasChanged and not self._resizing:
-            self._emit_changed()
-
         if change == QGraphicsItem.ItemSelectedHasChanged:
             selected = bool(value)
             self._show_handles(selected)
@@ -261,8 +263,20 @@ class RoiRectItem(QGraphicsRectItem):
 
         return super().itemChange(change, value)
 
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._moving = True
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if self._moving and not self._resizing:
+            self._emit_changed()
+        self._moving = False
+
 class PdfTemplateCanvas(QGraphicsView):
     roi_drawn = Signal(str, int, tuple)
+    roi_changed = Signal(str, int, tuple)
     roi_selected = Signal(str)
     roi_cleared = Signal()
 
@@ -280,9 +294,9 @@ class PdfTemplateCanvas(QGraphicsView):
         self._draw_origin = QPointF()
         self._draw_temp: Optional[QGraphicsRectItem] = None
 
-        self.setRenderHint(QPainter.Antialiasing, True)
+        self.setRenderHint(QPainter.Antialiasing, False)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+        self.setViewportUpdateMode(QGraphicsView.BoundingRectViewportUpdate)
 
     def clear(self) -> None:
         self._scene.clear()
@@ -332,7 +346,7 @@ class PdfTemplateCanvas(QGraphicsView):
         self.fit_to_width()
 
     def _on_item_changed(self, field: str, page: int, box: Tuple[float, float, float, float]) -> None:
-        self.roi_drawn.emit(field, int(page), box)
+        self.roi_changed.emit(field, int(page), box)
 
     def _on_item_selected(self, field: Optional[str]) -> None:
         if field:
@@ -559,6 +573,7 @@ class ReceiptTemplateEditorDialog(QDialog):
 
         self.canvas = PdfTemplateCanvas(self)
         self.canvas.roi_drawn.connect(self._on_roi_drawn)
+        self.canvas.roi_changed.connect(self._on_roi_changed)
         self.canvas.roi_selected.connect(self._on_roi_selected)
         self.canvas.roi_cleared.connect(self._on_roi_cleared)
         self.btn_fit_width.clicked.connect(self.canvas.fit_to_width)
@@ -638,6 +653,7 @@ class ReceiptTemplateEditorDialog(QDialog):
         self._render_current_page()
 
     def _render_current_page(self) -> None:
+        started = time.perf_counter()
         if not self._sample_pdf_path or self._page_count <= 0:
             self.canvas.clear()
             self.lbl_page.setText("Strana 0 / 0")
@@ -661,6 +677,9 @@ class ReceiptTemplateEditorDialog(QDialog):
                 return
         self.canvas.set_page(self._current_page, px, self._roi_by_field)
         self.lbl_page.setText(f"Strana {self._current_page} / {self._page_count}")
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if elapsed_ms > 250:
+            log.warning("Receipt template page render is slow: page=%s elapsed_ms=%.1f", self._current_page, elapsed_ms)
 
     def _go_prev_page(self) -> None:
         if self._page_count <= 0:
@@ -712,6 +731,15 @@ class ReceiptTemplateEditorDialog(QDialog):
         self._selected_roi_field = field
         self._refresh_roi_table()
 
+    def _on_roi_changed(self, field: str, page: int, box: tuple) -> None:
+        try:
+            _ = normalized_box_to_pixel_box(box, 1000, 1000)
+        except TemplateSchemaError:
+            return
+        self._roi_by_field[field] = RoiRecord(field=field, page=int(page), box=tuple(float(x) for x in box))
+        self._selected_roi_field = field
+        self._refresh_roi_table()
+
     def _on_roi_selected(self, field: str) -> None:
         self._selected_roi_field = field
         self._select_field_in_palette(field)
@@ -727,6 +755,7 @@ class ReceiptTemplateEditorDialog(QDialog):
                 return
 
     def _refresh_roi_table(self) -> None:
+        started = time.perf_counter()
         keys = [key for key, _, _ in FIELD_ORDER if key in self._roi_by_field]
         for key in sorted(self._roi_by_field.keys()):
             if key not in keys:
@@ -749,6 +778,9 @@ class ReceiptTemplateEditorDialog(QDialog):
             self.roi_table.setCellWidget(row, 4, btn_delete)
 
         self.roi_table.resizeColumnsToContents()
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if elapsed_ms > 120:
+            log.warning("Receipt ROI table refresh is slow: rows=%s elapsed_ms=%.1f", len(keys), elapsed_ms)
 
     def _focus_roi(self, field: str) -> None:
         roi = self._roi_by_field.get(field)
@@ -875,7 +907,10 @@ class ReceiptTemplateEditorDialog(QDialog):
             dest_dir = self.paths.data_dir / folder
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest_path = dest_dir / self._sample_pdf_path.name
-            shutil.copy2(self._sample_pdf_path, dest_path)
+            src_resolved = self._sample_pdf_path.resolve()
+            dst_resolved = dest_path.resolve()
+            if src_resolved != dst_resolved:
+                shutil.copy2(self._sample_pdf_path, dest_path)
             self._sample_folder_relpath = folder
             relpath = str(dest_path.relative_to(self.paths.data_dir))
             self._existing_sample_relpath = relpath

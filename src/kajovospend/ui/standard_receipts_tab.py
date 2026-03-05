@@ -190,7 +190,12 @@ class StandardReceiptsTab(QWidget):
             return
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        payload = dlg.payload
+        try:
+            payload = dlg.payload
+        except Exception:
+            log.exception("Nepodarilo se pripravit data sablony pro ulozeni")
+            QMessageBox.warning(self, "Sablony", "Nepodarilo se ulozit sablonu. Detaily jsou v logu.")
+            return
 
         def work():
             with self.sf() as session:
@@ -214,7 +219,12 @@ class StandardReceiptsTab(QWidget):
             dlg = ReceiptTemplateEditorDialog(self.paths, self.cfg, template=data, parent=self)
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
-            payload = dlg.payload
+            try:
+                payload = dlg.payload
+            except Exception:
+                log.exception("Nepodarilo se pripravit data sablony pro ulozeni")
+                QMessageBox.warning(self, "Sablony", "Nepodarilo se ulozit sablonu. Detaily jsou v logu.")
+                return
 
             def work_update():
                 with self.sf() as session:
