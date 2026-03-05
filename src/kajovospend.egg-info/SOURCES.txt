@@ -17,6 +17,7 @@ src/kajovospend/db/session.py
 src/kajovospend/extract/__init__.py
 src/kajovospend/extract/layout_items.py
 src/kajovospend/extract/parser.py
+src/kajovospend/extract/standard_receipts.py
 src/kajovospend/extract/structured_pdf.py
 src/kajovospend/extract/vat_math.py
 src/kajovospend/integrations/__init__.py
@@ -41,6 +42,8 @@ src/kajovospend/ui/db_api.py
 src/kajovospend/ui/main_window.py
 src/kajovospend/ui/main_window_newdb.py
 src/kajovospend/ui/progress.py
+src/kajovospend/ui/receipt_template_editor.py
+src/kajovospend/ui/standard_receipts_tab.py
 src/kajovospend/ui/styles.py
 src/kajovospend/utils/__init__.py
 src/kajovospend/utils/amount_correction.py

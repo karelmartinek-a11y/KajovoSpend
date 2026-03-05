@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QUrl
@@ -21,6 +22,8 @@ from kajovospend.extract.standard_receipts import legend_text
 
 from . import db_api
 from .receipt_template_editor import ReceiptTemplateEditorDialog
+
+log = logging.getLogger(__name__)
 
 
 class TemplateTableModel(QAbstractTableModel):
@@ -177,8 +180,13 @@ class StandardReceiptsTab(QWidget):
         QApplication.clipboard().setText(legend_text())
         QMessageBox.information(self, "Legenda", "Legenda byla zkopírována.")
 
-    def _add_template(self) -> None:
-        dlg = ReceiptTemplateEditorDialog(self.paths, self.cfg, parent=self)
+    def _add_template(self, _checked: bool = False) -> None:
+        try:
+            dlg = ReceiptTemplateEditorDialog(self.paths, self.cfg, parent=self)
+        except Exception:
+            log.exception("Nepodarilo se otevrit editor standardni uctenky")
+            QMessageBox.warning(self, "Sablony", "Nepodarilo se otevrit editor sablony. Detaily jsou v logu.")
+            return
         if dlg.exec() != dlg.Accepted:
             return
         payload = dlg.payload
