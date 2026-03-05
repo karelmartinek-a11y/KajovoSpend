@@ -563,7 +563,7 @@ class ReceiptTemplateEditorDialog(QDialog):
         self.canvas.roi_cleared.connect(self._on_roi_cleared)
         right_layout.addWidget(self.canvas, 1)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
