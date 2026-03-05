@@ -7,7 +7,15 @@ from sqlalchemy import select, text, func, case, bindparam
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem, ImportJob, ServiceState
+from kajovospend.db.models import (
+    Document,
+    DocumentFile,
+    ImportJob,
+    LineItem,
+    ServiceState,
+    StandardReceiptTemplate,
+    Supplier,
+)
 
 
 def counts(session: Session) -> Dict[str, int]:
@@ -53,6 +61,7 @@ def run_stats(session: Session) -> Dict[str, Any]:
             "items": 0,
             "pct_offline": 0.0,
             "pct_api": 0.0,
+            "pct_template": 0.0,
             "pct_manual": 0.0,
             "sum_items_wo_vat": 0.0,
             "sum_items_w_vat": 0.0,
@@ -97,6 +106,7 @@ def run_stats(session: Session) -> Dict[str, Any]:
 
     pct_offline = _pct("offline")
     pct_api = _pct("openai")
+    pct_template = _pct("template")
     pct_manual = _pct("manual")
 
     # sums and averages over items
@@ -215,6 +225,7 @@ def run_stats(session: Session) -> Dict[str, Any]:
         "items": items_count,
         "pct_offline": pct_offline,
         "pct_api": pct_api,
+        "pct_template": pct_template,
         "pct_manual": pct_manual,
         "sum_items_wo_vat": sum_wo_vat,
         "sum_items_w_vat": sum_with_vat,
@@ -227,6 +238,92 @@ def run_stats(session: Session) -> Dict[str, Any]:
         "max_item_price": max_price,
         "max_item_name": max_name,
     }
+
+
+def list_standard_receipt_templates(session: Session) -> List[Dict[str, Any]]:
+    rows = (
+        session.query(StandardReceiptTemplate)
+        .order_by(StandardReceiptTemplate.updated_at.desc())
+        .all()
+    )
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        result.append(
+            {
+                "id": int(row.id),
+                "name": row.name,
+                "enabled": bool(row.enabled),
+                "match_ico": row.match_supplier_ico_norm,
+                "updated_at": row.updated_at,
+                "sample_file_name": row.sample_file_name,
+                "sample_file_relpath": row.sample_file_relpath,
+            }
+        )
+    return result
+
+
+def get_standard_receipt_template(session: Session, template_id: int) -> Dict[str, Any]:
+    tpl = session.get(StandardReceiptTemplate, int(template_id))
+    if not tpl:
+        raise KeyError(template_id)
+    return {
+        "id": int(tpl.id),
+        "name": tpl.name,
+        "enabled": bool(tpl.enabled),
+        "match_supplier_ico_norm": tpl.match_supplier_ico_norm,
+        "match_texts_json": tpl.match_texts_json,
+        "schema_json": tpl.schema_json,
+        "sample_file_name": tpl.sample_file_name,
+        "sample_file_sha256": tpl.sample_file_sha256,
+        "sample_file_relpath": tpl.sample_file_relpath,
+        "updated_at": tpl.updated_at,
+    }
+
+
+def create_standard_receipt_template(session: Session, payload: Dict[str, Any]) -> int:
+    tpl = StandardReceiptTemplate(
+        name=str(payload.get("name") or ""),
+        enabled=bool(payload.get("enabled")) if payload.get("enabled") is not None else True,
+        match_supplier_ico_norm=payload.get("match_supplier_ico_norm"),
+        match_texts_json=payload.get("match_texts_json"),
+        schema_json=str(payload.get("schema_json") or ""),
+        sample_file_name=payload.get("sample_file_name"),
+        sample_file_sha256=payload.get("sample_file_sha256"),
+        sample_file_relpath=payload.get("sample_file_relpath"),
+    )
+    session.add(tpl)
+    session.flush()
+    return int(tpl.id)
+
+
+def update_standard_receipt_template(session: Session, template_id: int, payload: Dict[str, Any]) -> None:
+    tpl = session.get(StandardReceiptTemplate, int(template_id))
+    if not tpl:
+        raise KeyError(template_id)
+    if "name" in payload and payload["name"] is not None:
+        tpl.name = str(payload["name"])
+    if "enabled" in payload:
+        tpl.enabled = bool(payload["enabled"])
+    if "match_supplier_ico_norm" in payload:
+        tpl.match_supplier_ico_norm = payload.get("match_supplier_ico_norm")
+    if "match_texts_json" in payload:
+        tpl.match_texts_json = payload.get("match_texts_json")
+    if "schema_json" in payload and payload["schema_json"] is not None:
+        tpl.schema_json = str(payload["schema_json"])
+    if "sample_file_name" in payload:
+        tpl.sample_file_name = payload.get("sample_file_name")
+    if "sample_file_sha256" in payload:
+        tpl.sample_file_sha256 = payload.get("sample_file_sha256")
+    if "sample_file_relpath" in payload:
+        tpl.sample_file_relpath = payload.get("sample_file_relpath")
+    session.add(tpl)
+
+
+def delete_standard_receipt_template(session: Session, template_id: int) -> None:
+    tpl = session.get(StandardReceiptTemplate, int(template_id))
+    if not tpl:
+        raise KeyError(template_id)
+    session.delete(tpl)
 
 
 def list_suppliers(session: Session, q: str = "") -> List[Supplier]:

@@ -57,6 +57,7 @@ from kajovospend.ocr.pdf_render import render_pdf_to_images
 from kajovospend.utils.env import load_user_env_var, set_user_env_var, sanitize_openai_api_key
 
 from .styles import QSS
+from .standard_receipts_tab import StandardReceiptsTab
 from . import db_api
 from .main_window_newdb import init_new_db
 
@@ -152,6 +153,7 @@ class TrafficLightDelegate(QStyledItemDelegate):
 OPS_STAGE_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("offline", "Offline"),
     ("openai_any", "OpenAI"),
+    ("template", "Šablony"),
 )
 
 
@@ -1516,11 +1518,13 @@ class MainWindow(QMainWindow):
         # Řada 1: Procentuální úspěšnost ze všech zpracovaných souborů
         t_pct_off = add_tile1("pct_offline", "% Offline extrakce", "percent", 1, 0)
         t_pct_ai = add_tile1("pct_openai", "% OpenAI extrakce", "percent", 1, 1)
-        t_pct_q = add_tile1("pct_quarantine", "% Karanténa", "percent", 1, 2)
-        t_pct_d = add_tile1("pct_duplicate", "% Duplicita", "percent", 1, 3)
+        t_pct_template = add_tile1("pct_template", "% Šablonová extrakce", "percent", 1, 2)
+        t_pct_q = add_tile1("pct_quarantine", "% Karanténa", "percent", 1, 3)
+        t_pct_d = add_tile1("pct_duplicate", "% Duplicita", "percent", 1, 4)
 
         self._stat_labels["pct_offline"] = t_pct_off.lbl_value
         self._stat_labels["pct_openai"] = t_pct_ai.lbl_value
+        self._stat_labels["pct_template"] = t_pct_template.lbl_value
         self._stat_labels["pct_quarantine"] = t_pct_q.lbl_value
         self._stat_labels["pct_duplicate"] = t_pct_d.lbl_value
 
@@ -2114,6 +2118,15 @@ class MainWindow(QMainWindow):
         spl.addWidget(left, 1)
         spl.addWidget(right, 1)
         self.tabs.addTab(self.tab_suppliers, "DODAVATELÉ")
+        self.tab_standard_receipts = StandardReceiptsTab(
+            self.sf,
+            self.cfg,
+            self.paths,
+            runner_host=self,
+            runner_cls=_SilentRunner,
+            parent=self,
+        )
+        self.tabs.addTab(self.tab_standard_receipts, "STANDARDNÍ ÚČTENKY")
 
         # Položky (per-item search)
         self.tab_items = QWidget()
@@ -5221,6 +5234,8 @@ class MainWindow(QMainWindow):
                     stage_used["offline"] = True
                 if method.startswith("openai"):
                     stage_used["openai_any"] = True
+                if method.startswith("template"):
+                    stage_used["template"] = True
 
             for code, _label in OPS_STAGE_COLUMNS:
                 if not stage_used.get(code):
@@ -5292,9 +5307,10 @@ class MainWindow(QMainWindow):
                     7: 120,  # výsledek
                     8: 80,   # offline
                     9: 80,   # openai
-                    10: 110, # zopakovat offline
-                    11: 120, # zopakovat openai
-                    12: 90,  # otevřít
+                    10: 80,  # šablony
+                    11: 110, # zopakovat offline
+                    12: 120, # zopakovat openai
+                    13: 90,  # otevřít
                 }
                 for col, width in defaults.items():
                     try:
@@ -5887,19 +5903,25 @@ class MainWindow(QMainWindow):
                 receipts = int(rs.get("receipts", 0) or 0)
                 pct_off_raw = float(rs.get("pct_offline", 0.0) or 0.0)
                 pct_ai_raw = float(rs.get("pct_api", 0.0) or 0.0)
+                pct_template_raw = float(rs.get("pct_template", 0.0) or 0.0)
                 # scale: receipts = počet úspěšně zpracovaných dokladů, total_files zahrnuje i karanténu a duplicity
                 scale = (receipts / total_files) if total_files > 0 and receipts > 0 else 1.0
                 pct_off_files = pct_off_raw * scale
                 pct_ai_files = pct_ai_raw * scale
+                pct_template_files = pct_template_raw * scale
                 if "pct_offline" in self._stat_labels:
                     self._stat_labels["pct_offline"].setText(f"{pct_off_files:.1f} %")
                 if "pct_openai" in self._stat_labels:
                     self._stat_labels["pct_openai"].setText(f"{pct_ai_files:.1f} %")
+                if "pct_template" in self._stat_labels:
+                    self._stat_labels["pct_template"].setText(f"{pct_template_files:.1f} %")
             else:
                 if "pct_offline" in self._stat_labels:
                     self._stat_labels["pct_offline"].setText(f"{float(rs.get('pct_offline', 0.0) or 0.0):.1f} %")
                 if "pct_openai" in self._stat_labels:
                     self._stat_labels["pct_openai"].setText(f"{float(rs.get('pct_api', 0.0) or 0.0):.1f} %")
+                if "pct_template" in self._stat_labels:
+                    self._stat_labels["pct_template"].setText(f"{float(rs.get('pct_template', 0.0) or 0.0):.1f} %")
 
             if st and isinstance(st, dict):
                 power_txt = "Zapnuto" if st.get("running") else "Vypnuto"

@@ -4,7 +4,10 @@ import os
 from pathlib import Path
 from typing import Callable
 
+import warnings
+
 from sqlalchemy import create_engine
+from sqlalchemy.exc import SADeprecationWarning
 from sqlalchemy.orm import sessionmaker
 
 from kajovospend.db.processing_models import BaseProcessing
@@ -40,10 +43,14 @@ def create_processing_session_factory(cfg) -> Callable[[], sessionmaker]:
 def dispose_processing_session_factory(sf) -> None:
     """Best-effort uvolnění SQLite engine pro processing DB (Windows lock prevention)."""
     try:
-        try:
-            sf.close_all()
-        except Exception:
-            pass
+        close_fn = getattr(sf, "close_all_sessions", None) or getattr(sf, "close_all", None)
+        if close_fn:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", SADeprecationWarning)
+                    close_fn()
+            except Exception:
+                pass
         bind = getattr(sf, "_engine", None) or getattr(sf, "bind", None)
         if bind is not None:
             bind.dispose()

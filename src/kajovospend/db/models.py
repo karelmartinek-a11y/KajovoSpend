@@ -96,6 +96,28 @@ class Document(Base):
     )
 
 
+class StandardReceiptTemplate(Base):
+    __tablename__ = "standard_receipt_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    match_supplier_ico_norm: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    match_texts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    schema_json: Mapped[str] = mapped_column(Text, nullable=False)
+    sample_file_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    sample_file_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sample_file_relpath: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utc_now_naive)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
+
+    __table_args__ = (
+        Index("idx_standard_receipt_templates_enabled", "enabled"),
+        Index("idx_standard_receipt_templates_match_supplier_ico_norm", "match_supplier_ico_norm"),
+        Index("idx_standard_receipt_templates_name", "name"),
+    )
+
+
 class DocumentPageAudit(Base):
     __tablename__ = "document_page_audit"
 

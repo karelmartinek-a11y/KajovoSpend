@@ -291,6 +291,46 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
             )
         )
 
+        # Standard receipt templates
+        con.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS standard_receipt_templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    enabled INTEGER DEFAULT 1 NOT NULL,
+                    match_supplier_ico_norm TEXT,
+                    match_texts_json TEXT,
+                    schema_json TEXT NOT NULL,
+                    sample_file_name TEXT,
+                    sample_file_sha256 TEXT,
+                    sample_file_relpath TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        cols_templates = con.execute(text("PRAGMA table_info('standard_receipt_templates')")).fetchall()
+        tmpl_col_names = {row[1] for row in cols_templates}
+        for name, col_type in [
+            ("name", "TEXT"),
+            ("enabled", "INTEGER"),
+            ("match_supplier_ico_norm", "TEXT"),
+            ("match_texts_json", "TEXT"),
+            ("schema_json", "TEXT"),
+            ("sample_file_name", "TEXT"),
+            ("sample_file_sha256", "TEXT"),
+            ("sample_file_relpath", "TEXT"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ]:
+            if name not in tmpl_col_names:
+                con.execute(text(f"ALTER TABLE standard_receipt_templates ADD COLUMN {name} {col_type}"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_standard_receipt_templates_enabled ON standard_receipt_templates(enabled)"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_standard_receipt_templates_match_supplier_ico_norm ON standard_receipt_templates(match_supplier_ico_norm)"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_standard_receipt_templates_name ON standard_receipt_templates(name)"))
+
         # Receipts/documents: ID_Uctenky
         cols_docs = con.execute(text("PRAGMA table_info('documents')")).fetchall()
         doc_col_names = {row[1] for row in cols_docs}
