@@ -551,7 +551,6 @@ class ReceiptTemplateEditorDialog(QDialog):
         self.btn_next_page.clicked.connect(self._go_next_page)
         self.btn_zoom_out.clicked.connect(lambda: self.canvas.scale(0.85, 0.85))
         self.btn_zoom_in.clicked.connect(lambda: self.canvas.scale(1.2, 1.2))
-        self.btn_fit_width.clicked.connect(self.canvas.fit_to_width)
         for w in (self.btn_prev_page, self.btn_next_page, self.lbl_page, self.btn_zoom_out, self.btn_zoom_in, self.btn_fit_width):
             toolbar.addWidget(w)
         toolbar.addStretch(1)
@@ -561,6 +560,7 @@ class ReceiptTemplateEditorDialog(QDialog):
         self.canvas.roi_drawn.connect(self._on_roi_drawn)
         self.canvas.roi_selected.connect(self._on_roi_selected)
         self.canvas.roi_cleared.connect(self._on_roi_cleared)
+        self.btn_fit_width.clicked.connect(self.canvas.fit_to_width)
         right_layout.addWidget(self.canvas, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)

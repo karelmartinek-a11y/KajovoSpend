@@ -35,6 +35,11 @@ class _FakeDialog:
         return type(self).exec_result
 
 
+class _RaisingDialog:
+    def __init__(self, *args, **kwargs) -> None:
+        raise AttributeError("boom")
+
+
 class TestStandardReceiptsTabAdd(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -89,6 +94,17 @@ class TestStandardReceiptsTabAdd(unittest.TestCase):
         self.assertEqual(_FakeDialog.init_calls, 1)
         self.assertEqual(self.created_payload, {"name": "Moje sablona"})
         self.assertEqual(self.session.commit_calls, 1)
+
+    def test_add_template_handles_editor_init_failure(self) -> None:
+        warning_calls = []
+        original_warning = srt.QMessageBox.warning
+        srt.ReceiptTemplateEditorDialog = _RaisingDialog
+        srt.QMessageBox.warning = lambda *args, **kwargs: warning_calls.append((args, kwargs))
+        try:
+            self.tab._add_template(True)
+        finally:
+            srt.QMessageBox.warning = original_warning
+        self.assertEqual(len(warning_calls), 1)
 
 
 if __name__ == "__main__":
