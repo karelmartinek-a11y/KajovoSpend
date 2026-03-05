@@ -56,6 +56,7 @@ FIELD_ORDER: List[Tuple[str, str, bool]] = [
     ("issue_date", "Datum vystavení", True),
     ("total_with_vat", "Celkem včetně DPH", True),
     ("items_region", "Položky - oblast", False),
+    ("items_region_page2", "Položky - oblast (2. strana)", False),
     ("bank_account", "Bankovní účet", False),
 ]
 FIELD_LABELS = {key: label for key, label, _ in FIELD_ORDER}

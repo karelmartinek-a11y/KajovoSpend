@@ -8,6 +8,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -187,7 +188,7 @@ class StandardReceiptsTab(QWidget):
             log.exception("Nepodarilo se otevrit editor standardni uctenky")
             QMessageBox.warning(self, "Sablony", "Nepodarilo se otevrit editor sablony. Detaily jsou v logu.")
             return
-        if dlg.exec() != dlg.Accepted:
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         payload = dlg.payload
 
@@ -211,7 +212,7 @@ class StandardReceiptsTab(QWidget):
 
         def done(data):
             dlg = ReceiptTemplateEditorDialog(self.paths, self.cfg, template=data, parent=self)
-            if dlg.exec() != dlg.Accepted:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             payload = dlg.payload
 

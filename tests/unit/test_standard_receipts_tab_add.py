@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog
 
 from kajovospend.ui import standard_receipts_tab as srt
 
@@ -23,8 +23,7 @@ class _DummySession:
 
 
 class _FakeDialog:
-    Accepted = 1
-    exec_result = 0
+    exec_result = QDialog.DialogCode.Rejected
     payload = {"name": "Test"}
     init_calls = 0
 
@@ -49,6 +48,8 @@ class TestStandardReceiptsTabAdd(unittest.TestCase):
         self._orig_dialog = srt.ReceiptTemplateEditorDialog
         self._orig_list = srt.db_api.list_standard_receipt_templates
         self._orig_create = srt.db_api.create_standard_receipt_template
+        self._orig_get = srt.db_api.get_standard_receipt_template
+        self._orig_update = srt.db_api.update_standard_receipt_template
         srt.ReceiptTemplateEditorDialog = _FakeDialog
         srt.db_api.list_standard_receipt_templates = lambda _session: []
         _FakeDialog.init_calls = 0
@@ -73,10 +74,12 @@ class TestStandardReceiptsTabAdd(unittest.TestCase):
         srt.ReceiptTemplateEditorDialog = self._orig_dialog
         srt.db_api.list_standard_receipt_templates = self._orig_list
         srt.db_api.create_standard_receipt_template = self._orig_create
+        srt.db_api.get_standard_receipt_template = self._orig_get
+        srt.db_api.update_standard_receipt_template = self._orig_update
         self.tab.deleteLater()
 
     def test_add_template_accepts_checked_argument(self) -> None:
-        _FakeDialog.exec_result = 0
+        _FakeDialog.exec_result = QDialog.DialogCode.Rejected
         self.tab._add_template(True)
         self.assertEqual(_FakeDialog.init_calls, 1)
 
@@ -86,7 +89,7 @@ class TestStandardReceiptsTabAdd(unittest.TestCase):
             return 42
 
         srt.db_api.create_standard_receipt_template = fake_create
-        _FakeDialog.exec_result = _FakeDialog.Accepted
+        _FakeDialog.exec_result = QDialog.DialogCode.Accepted
         _FakeDialog.payload = {"name": "Moje sablona"}
 
         self.tab._add_template(True)
@@ -105,6 +108,29 @@ class TestStandardReceiptsTabAdd(unittest.TestCase):
         finally:
             srt.QMessageBox.warning = original_warning
         self.assertEqual(len(warning_calls), 1)
+
+    def test_edit_template_persists_when_dialog_accepted(self) -> None:
+        get_calls = []
+        update_calls = []
+
+        def fake_get(_session, template_id):
+            get_calls.append(template_id)
+            return {"id": template_id, "name": "Old"}
+
+        def fake_update(_session, template_id, payload):
+            update_calls.append((template_id, payload))
+
+        srt.db_api.get_standard_receipt_template = fake_get
+        srt.db_api.update_standard_receipt_template = fake_update
+        _FakeDialog.exec_result = QDialog.DialogCode.Accepted
+        _FakeDialog.payload = {"name": "New"}
+
+        self.tab.model.update_rows([{"id": 1, "name": "X", "sample_file_relpath": None}])
+        self.tab.table.setCurrentIndex(self.tab.model.index(0, 0))
+        self.tab._edit_template()
+
+        self.assertEqual(get_calls, [1])
+        self.assertEqual(update_calls, [(1, {"name": "New"})])
 
 
 if __name__ == "__main__":

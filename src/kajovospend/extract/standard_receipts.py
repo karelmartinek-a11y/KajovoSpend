@@ -13,6 +13,7 @@ FIELD_LEGEND: Tuple[Tuple[str, str], ...] = (
     ("total_with_vat", "#FFD700"),
     ("bank_account", "#FF00FF"),
     ("items_region", "#00FFFF"),
+    ("items_region_page2", "#40E0D0"),
 )
 
 
@@ -267,6 +268,8 @@ def extract_using_template(
         raise TemplateSchemaError("Sablona neobsahuje zadna pole.")
 
     ocr_cfg = cfg.get("ocr") if isinstance(cfg, Mapping) else {}
+    if not isinstance(ocr_cfg, Mapping):
+        ocr_cfg = {}
     dpi = int(ocr_cfg.get("pdf_dpi", 300) or 300)
     dpi = max(200, min(dpi, 600))
 
@@ -312,7 +315,12 @@ def extract_using_template(
     issue_txt = field_texts.get("issue_date", "")
     total_txt = field_texts.get("total_with_vat", "")
     bank_txt = field_texts.get("bank_account", "")
-    items_txt = field_texts.get("items_region", "")
+    items_parts: List[str] = []
+    for key in ("items_region", "items_region_page2"):
+        val = (field_texts.get(key) or "").strip()
+        if val:
+            items_parts.append(val)
+    items_txt = "\n".join(items_parts)
 
     supplier_ico = _normalize_digits(supplier_txt)
     doc_number = _find_number_token(doc_txt)
