@@ -1242,6 +1242,60 @@ class Processor:
                 pass
         return "R-" + "-".join(parts)
 
+    @staticmethod
+    def _resolve_openai_runtime_flags(
+        openai_cfg: Dict[str, Any] | None,
+        features_cfg: Dict[str, Any] | None,
+        *,
+        api_key: str,
+        backend_available: bool,
+    ) -> Dict[str, bool]:
+        """Normalize OpenAI runtime switches so primary/fallback gates stay explicit."""
+        cfg = openai_cfg or {}
+        features = features_cfg or {}
+        openai_only = bool(cfg.get("only_openai", False))
+        primary_enabled = bool(cfg.get("primary_enabled", True))
+        fallback_enabled = bool(cfg.get("fallback_enabled", True))
+        auto_enable = bool(cfg.get("auto_enable", True))
+        explicit_enabled = bool(cfg.get("enabled"))
+        legacy_feature_enabled = bool((features.get("openai_fallback", {}) or {}).get("enabled", False))
+        has_api_key = bool(sanitize_openai_api_key(api_key or ""))
+        openai_master_enabled = bool(explicit_enabled or auto_enable or legacy_feature_enabled)
+        openai_available = bool(backend_available and has_api_key and openai_master_enabled)
+        return {
+            "openai_only": openai_only,
+            "primary_enabled": primary_enabled,
+            "fallback_enabled": fallback_enabled,
+            "auto_enable": auto_enable,
+            "explicit_enabled": explicit_enabled,
+            "legacy_feature_enabled": legacy_feature_enabled,
+            "has_api_key": has_api_key,
+            "openai_master_enabled": openai_master_enabled,
+            "openai_available": openai_available,
+            "primary_allowed": bool(openai_available and primary_enabled),
+            "fallback_allowed": bool(openai_available and fallback_enabled),
+        }
+
+    @staticmethod
+    def _openai_only_mode_notes(
+        *,
+        openai_only: bool,
+        has_api_key: bool,
+        openai_enabled: bool,
+        primary_enabled: bool,
+        fallback_enabled: bool,
+    ) -> List[str]:
+        if not openai_only:
+            return []
+        notes: List[str] = []
+        if not has_api_key:
+            notes.append("OpenAI only režim: chybí API key – online extrakce přeskočena")
+        elif not openai_enabled:
+            notes.append("OpenAI only režim: OpenAI není povoleno (enabled/auto_enable/feature) nebo backend není dostupný")
+        if not primary_enabled and not fallback_enabled:
+            notes.append("OpenAI only režim: primary i fallback větev jsou vypnuté")
+        return notes
+
     def _prune_receipt_reasons(self, reasons: List[str]) -> List[str]:
         """U uctenek nechame duvody zobrazeny, skryjeme jen obecne duplicitni hlasky."""
         drop = {
@@ -1692,11 +1746,18 @@ class Processor:
             self._validate_extracted(extracted)
 
             api_key = sanitize_openai_api_key(openai_cfg.get("api_key") or os.getenv("KAJOVOSPEND_OPENAI_API_KEY", ""))
-            auto_enable = bool(openai_cfg.get("auto_enable", True))
             features = (self.cfg.get("features") or {}) if isinstance(self.cfg, dict) else {}
-            openai_feature_enabled = bool((features.get("openai_fallback", {}) or {}).get("enabled", False))
-            openai_enabled = bool((openai_feature_enabled or openai_only) and (OpenAIConfig is not None) and api_key and (openai_cfg.get("enabled") or auto_enable))
-            primary_enabled = bool(openai_cfg.get("primary_enabled", True))
+            openai_flags = self._resolve_openai_runtime_flags(
+                openai_cfg,
+                features,
+                api_key=api_key,
+                backend_available=OpenAIConfig is not None and extract_with_openai is not None and extract_with_openai_fallback is not None,
+            )
+            openai_enabled = bool(openai_flags["openai_available"])
+            primary_enabled = bool(openai_flags["primary_enabled"])
+            fallback_enabled = bool(openai_flags["fallback_enabled"])
+            primary_allowed = bool(openai_flags["primary_allowed"])
+            fallback_allowed = bool(openai_flags["fallback_allowed"])
             openai_model = str(openai_cfg.get("model") or "auto").strip() or "auto"
             fallback_model = str(openai_cfg.get("fallback_model") or "").strip() or None
             use_json_schema = bool(openai_cfg.get("use_json_schema", True))
@@ -1709,31 +1770,35 @@ class Processor:
 
             try:
                 self.log.info(
-                    "OpenAI cfg | only=%s enabled=%s primary=%s fallback_flag=%s api=%s… env=%s…",
+                    "OpenAI cfg | only=%s openai_enabled=%s explicit=%s auto=%s feature_legacy=%s primary=%s fallback=%s api=%s… env=%s…",
                     openai_only,
-                    openai_cfg.get("enabled"),
+                    openai_enabled,
+                    openai_flags["explicit_enabled"],
+                    openai_flags["auto_enable"],
+                    openai_flags["legacy_feature_enabled"],
                     primary_enabled,
-                    openai_feature_enabled,
+                    fallback_enabled,
                     (openai_cfg.get("api_key") or "")[:6],
                     (os.getenv("KAJOVOSPEND_OPENAI_API_KEY") or "")[:6],
                 )
             except Exception:
                 pass
 
-            if openai_only and not api_key:
-                reasons.append("OpenAI only režim: chybí API key – online extrakce přeskočena")
+            openai_only_notes = self._openai_only_mode_notes(
+                openai_only=openai_only,
+                has_api_key=bool(openai_flags["has_api_key"]),
+                openai_enabled=openai_enabled,
+                primary_enabled=primary_enabled,
+                fallback_enabled=fallback_enabled,
+            )
+            for note in openai_only_notes:
+                reasons.append(note)
                 try:
-                    self.log.warning("OpenAI only mode aktivován, ale API key chybí – online extrakce vynechána")
-                except Exception:
-                    pass
-            if openai_only and api_key and not openai_enabled:
-                reasons.append("OpenAI only režim: OpenAI není povoleno (feature flag nebo nastavení)")
-                try:
-                    self.log.warning("OpenAI only mode aktivován, ale openai_enabled=False (feature flag?) – online extrakce vynechána")
+                    self.log.warning(note)
                 except Exception:
                     pass
 
-            if not template_used and openai_enabled and primary_enabled:
+            if not template_used and primary_allowed:
                 need_primary = (
                     openai_only
                     or (doc_type == "receipt")
@@ -1797,8 +1862,8 @@ class Processor:
                             self.log.exception("OpenAI primary selhal: %s", e)
                         except Exception:
                             pass
-            elif openai_only and not openai_enabled:
-                reasons.append("OpenAI only režim: chybí API key nebo povolení")
+            elif openai_only and not primary_allowed and primary_enabled and not openai_enabled:
+                reasons.append("OpenAI only režim: primary větev není dostupná (chybí API key nebo OpenAI není povoleno)")
 
             # Pokud chybí IČO, zkus heuristiku: najít 8-místné číslo a ověřit v ARES.
             if not template_used and not extracted.supplier_ico:
@@ -1857,7 +1922,7 @@ class Processor:
                     and sum_ok
                 )
 
-            if not template_used and openai_enabled and (need_openai or openai_only):
+            if not template_used and fallback_allowed and need_openai:
                 try:
                     if status_cb:
                         status_cb("OpenAI fallback: doplnuji polozky...")
