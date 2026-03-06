@@ -9,6 +9,7 @@ import uuid
 from dateutil import parser as dtparser
 import re
 import hashlib
+import unicodedata
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
@@ -1311,12 +1312,18 @@ class Processor:
 
     def _prune_receipt_reasons(self, reasons: List[str]) -> List[str]:
         """U uctenek nechame duvody zobrazeny, skryjeme jen obecne duplicitni hlasky."""
+        def _norm(txt: str) -> str:
+            raw = str(txt or "").strip().lower()
+            raw = unicodedata.normalize("NFKD", raw)
+            raw = "".join(ch for ch in raw if not unicodedata.combining(ch))
+            return re.sub(r"\s+", " ", raw)
+
         drop = {
             "nekompletni vytezeni",
         }
         out: List[str] = []
         for r in reasons or []:
-            rr = str(r or "")
+            rr = _norm(str(r or ""))
             if rr in drop:
                 continue
             out.append(r)

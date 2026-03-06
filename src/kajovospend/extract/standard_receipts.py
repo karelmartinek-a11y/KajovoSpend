@@ -390,3 +390,99 @@ def extract_using_template(
         full_text=full_text or "",
     )
     return extracted
+
+
+def _default_seed_schema_text() -> str:
+    schema = TemplateSchema(
+        version=1,
+        fields={
+            "supplier_ico": TemplateField(name="supplier_ico", page=1, box=(0.05, 0.05, 0.35, 0.12)),
+            "doc_number": TemplateField(name="doc_number", page=1, box=(0.55, 0.05, 0.95, 0.12)),
+            "issue_date": TemplateField(name="issue_date", page=1, box=(0.55, 0.12, 0.95, 0.18)),
+            "total_with_vat": TemplateField(name="total_with_vat", page=1, box=(0.55, 0.82, 0.95, 0.95)),
+        },
+    )
+    return serialize_template_schema(schema)
+
+
+def build_seed_template_scaffolds() -> List[Dict[str, Any]]:
+    """Seed/scaffold templates for high-frequency document families."""
+    schema_json = _default_seed_schema_text()
+    families = [
+        ("rhl_invoice_scaffold", ["rhl-invoice"], "03024130"),
+        ("wolt_market_scaffold", ["wolt_market", "wolt market"], "11700661"),
+        ("better_hotel_scaffold", ["better_hotel_invoice", "betterhotel_online_faktura"], None),
+        ("invoice_fa_scaffold", ["invoice-fa"], "02653389"),
+        ("series_1000_scaffold", ["1000-"], "31047344"),
+        ("saac_scaffold", ["saac"], "28926561"),
+    ]
+    out: List[Dict[str, Any]] = []
+    for name, tokens, ico in families:
+        out.append(
+            {
+                "name": name,
+                "enabled": False,
+                "match_supplier_ico_norm": ico,
+                "match_texts_json": json.dumps(tokens, ensure_ascii=False),
+                "schema_json": schema_json,
+            }
+        )
+    return out
+
+
+def export_templates_payload(templates: Iterable[Any]) -> str:
+    """Export templates to deterministic JSON payload for backup/import."""
+    rows: List[Dict[str, Any]] = []
+    for tpl in templates or []:
+        rows.append(
+            {
+                "name": str(getattr(tpl, "name", "") or "").strip(),
+                "enabled": bool(getattr(tpl, "enabled", True)),
+                "match_supplier_ico_norm": _normalize_digits(getattr(tpl, "match_supplier_ico_norm", None)),
+                "match_texts_json": getattr(tpl, "match_texts_json", None),
+                "schema_json": str(getattr(tpl, "schema_json", "") or ""),
+            }
+        )
+    rows.sort(key=lambda item: item.get("name") or "")
+    return json.dumps({"version": 1, "templates": rows}, ensure_ascii=False, indent=2)
+
+
+def import_templates_payload(payload_text: str) -> List[Dict[str, Any]]:
+    """Import template payload and return normalized row dicts ready for DB create/update."""
+    try:
+        doc = json.loads(payload_text or "")
+    except json.JSONDecodeError as exc:
+        raise TemplateSchemaError(f"Import payload není validní JSON: {exc}") from exc
+    if not isinstance(doc, Mapping):
+        raise TemplateSchemaError("Import payload musí být objekt.")
+    templates = doc.get("templates")
+    if not isinstance(templates, list):
+        raise TemplateSchemaError("Import payload musí obsahovat pole 'templates'.")
+
+    out: List[Dict[str, Any]] = []
+    for idx, row in enumerate(templates):
+        if not isinstance(row, Mapping):
+            raise TemplateSchemaError(f"Template #{idx + 1} musí být objekt.")
+        name = str(row.get("name") or "").strip()
+        if not name:
+            raise TemplateSchemaError(f"Template #{idx + 1}: chybí name.")
+        schema_json = str(row.get("schema_json") or "")
+        parse_template_schema_text(schema_json)
+        match_texts_json = row.get("match_texts_json")
+        if match_texts_json is not None:
+            try:
+                parsed = json.loads(str(match_texts_json))
+            except Exception as exc:
+                raise TemplateSchemaError(f"Template '{name}': match_texts_json není validní JSON pole.") from exc
+            if not isinstance(parsed, list):
+                raise TemplateSchemaError(f"Template '{name}': match_texts_json musí být JSON pole.")
+        out.append(
+            {
+                "name": name,
+                "enabled": bool(row.get("enabled", True)),
+                "match_supplier_ico_norm": _normalize_digits(row.get("match_supplier_ico_norm")),
+                "match_texts_json": match_texts_json,
+                "schema_json": schema_json,
+            }
+        )
+    return out
