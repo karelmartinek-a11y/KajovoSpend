@@ -63,12 +63,13 @@ def main() -> int:
     p_engine = create_production_engine(paths.production_db_path)
     init_working_db(w_engine)
     init_production_db(p_engine)
-    sf = make_session_factory(w_engine)
+    sf_working = make_session_factory(w_engine)
+    sf_production = make_session_factory(p_engine)
 
     if args.command == "sync-ares":
         ttl_hours = float(cfg.get("ares", {}).get("ttl_hours", 24.0) or 24.0)
         limit = int(getattr(args, "limit", 500) or 500)
-        stats = sync_pending_suppliers(sf, log, ttl_hours=ttl_hours, limit=limit)
+        stats = sync_pending_suppliers(sf_production, log, ttl_hours=ttl_hours, limit=limit)
         log.info("sync-ares done: %s", stats)
         return 0
 
@@ -76,7 +77,7 @@ def main() -> int:
     pid_path = paths.data_dir / "service.pid"
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
 
-    app = ServiceApp(cfg, sf, paths, log)
+    app = ServiceApp(cfg, sf_working, sf_production, paths, log)
 
     ctrl = ControlServer(
         cfg["service"].get("host", "127.0.0.1"),

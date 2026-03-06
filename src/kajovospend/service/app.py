@@ -13,8 +13,8 @@ from typing import Any, Dict
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
-from kajovospend.db.models import ImportJob, ServiceState
-from kajovospend.db.queries import update_service_state, queue_size
+from kajovospend.db.working_models import ImportJob, ServiceState
+from kajovospend.db.working_queries import update_service_state, queue_size
 from kajovospend.db.processing_session import create_processing_session_factory
 from kajovospend.db.processing_models import IngestFile
 from kajovospend.service.watcher import DirectoryWatcher
@@ -22,9 +22,10 @@ from kajovospend.service.processor import Processor, safe_move
 
 
 class ServiceApp:
-    def __init__(self, cfg: Dict[str, Any], session_factory, paths, logger):
+    def __init__(self, cfg: Dict[str, Any], working_session_factory, production_session_factory, paths, logger):
         self.cfg = cfg
-        self.sf = session_factory
+        self.sf = working_session_factory
+        self.sf_production = production_session_factory
         self.pf = create_processing_session_factory(cfg)
         self.paths = paths
         self.log = logger
@@ -35,7 +36,7 @@ class ServiceApp:
         self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
         self._inflight_lock = threading.Lock()
         self._inflight: set[Future] = set()
-        self._processor = Processor(cfg, paths, logger)
+        self._processor = Processor(cfg, paths, logger, working_session_factory, production_session_factory)
         self._supported_ext = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
         # Tvrdá stěna: po startu přesunout doklady bez dodavatele do karantény (fyzicky)

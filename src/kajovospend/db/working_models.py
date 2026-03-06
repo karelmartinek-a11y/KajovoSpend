@@ -155,3 +155,25 @@ class ServiceState(BaseWorking):
     heartbeat_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     stuck: Mapped[bool] = mapped_column(Boolean, default=False)
     stuck_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DocumentPageAudit(BaseWorking):
+    __tablename__ = "document_page_audit"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    file_id: Mapped[int] = mapped_column(ForeignKey("files.id", ondelete="CASCADE"), index=True)
+    page_no: Mapped[int] = mapped_column(Integer)
+    chosen_mode: Mapped[str] = mapped_column(String(16))
+    chosen_score: Mapped[float] = mapped_column(Float, default=0.0)
+    embedded_score: Mapped[float] = mapped_column(Float, default=0.0)
+    ocr_score: Mapped[float] = mapped_column(Float, default=0.0)
+    embedded_len: Mapped[int] = mapped_column(Integer, default=0)
+    ocr_len: Mapped[int] = mapped_column(Integer, default=0)
+    ocr_conf: Mapped[float] = mapped_column(Float, default=0.0)
+    token_groups: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (
+        UniqueConstraint("document_id", "page_no", name="uq_w_page_audit_doc_page"),
+        Index("ix_w_page_audit_doc_page", "document_id", "page_no"),
+    )

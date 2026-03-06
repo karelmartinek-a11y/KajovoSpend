@@ -20,13 +20,14 @@ import warnings
 from sqlalchemy import select, text
 from sqlalchemy.exc import SADeprecationWarning
 
-from kajovospend.db.models import ImportJob, DocumentFile, StandardReceiptTemplate, Supplier
-from kajovospend.db.queries import (
+from kajovospend.db.working_models import ImportJob, DocumentFile, StandardReceiptTemplate, Supplier
+from kajovospend.db.working_queries import (
     add_document,
     create_file_record,
-    rebuild_fts_for_document,
     upsert_supplier,
 )
+from kajovospend.db.production_models import Document as ProdDocument
+from kajovospend.service.promotion import promote_document
 from kajovospend.db.processing_session import create_processing_session_factory, dispose_processing_session_factory
 from kajovospend.db.processing_models import IngestFile
 from kajovospend.extract.parser import extract_from_text, postprocess_items_for_db
@@ -60,10 +61,12 @@ from kajovospend.utils.logging_setup import log_event
 
 
 class Processor:
-    def __init__(self, cfg: Dict[str, Any], paths, logger):
+    def __init__(self, cfg: Dict[str, Any], paths, logger, working_session_factory, production_session_factory):
         self.cfg = cfg
         self.paths = paths
         self.log = logger
+        self.sf = working_session_factory
+        self.sf_production = production_session_factory
         self.pf = create_processing_session_factory(cfg)
         # OCR engine is optional; if unavailable we quarantine rather than crash service.
         try:
@@ -150,23 +153,19 @@ class Processor:
 
     @staticmethod
     def _find_business_duplicate(
-        session,
+        prod_session,
         *,
         supplier_ico: str,
         doc_number: str,
         issue_date,
-        exclude_file_id: int | None = None,
     ):
-        sql = (
-            "SELECT id FROM documents "
-            "WHERE supplier_ico = :ico AND doc_number = :dn AND issue_date = :d"
-        )
-        params: Dict[str, Any] = {"ico": supplier_ico, "dn": doc_number, "d": issue_date}
-        if exclude_file_id is not None:
-            sql += " AND file_id <> :exclude_file_id"
-            params["exclude_file_id"] = int(exclude_file_id)
-        sql += " LIMIT 1"
-        return session.execute(text(sql), params).fetchone()
+        return prod_session.execute(
+            select(ProdDocument.id).where(
+                ProdDocument.supplier_ico == supplier_ico,
+                ProdDocument.doc_number == doc_number,
+                ProdDocument.issue_date == issue_date,
+            ).limit(1)
+        ).first()
 
 
 
@@ -1991,13 +1990,13 @@ class Processor:
             # Business duplicita per-doc
             if extracted.supplier_ico and extracted.doc_number and extracted.issue_date:
                 try:
-                    dup = self._find_business_duplicate(
-                        session,
-                        supplier_ico=extracted.supplier_ico,
-                        doc_number=extracted.doc_number,
-                        issue_date=extracted.issue_date,
-                        exclude_file_id=int(file_record.id) if file_record is not None else None,
-                    )
+                    with self.sf_production() as prod_s:
+                        dup = self._find_business_duplicate(
+                            prod_s,
+                            supplier_ico=extracted.supplier_ico,
+                            doc_number=extracted.doc_number,
+                            issue_date=extracted.issue_date,
+                        )
                     if dup:
                         dup_dir = out_base / self.cfg["paths"].get("duplicate_dir_name", "DUPLICITY")
                         moved = safe_move(path, dup_dir, path.name)
@@ -2172,7 +2171,7 @@ class Processor:
 
             # Persist per-page audit rows for the pages belonging to this document chunk
             try:
-                from kajovospend.db.models import DocumentPageAudit
+                from kajovospend.db.working_models import DocumentPageAudit
                 for pno in range(int(page_from), int(page_to) + 1):
                     rec = page_audit_map.get(int(pno))
                     if not rec:
@@ -2260,6 +2259,22 @@ class Processor:
             created_doc_ids=created_doc_ids,
             correlation_id=correlation_id,
         )
+        # commit working changes before promotion
+        try:
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        # Promotion into production DB (idempotent)
+        try:
+            with self.sf_production() as prod_s:
+                for did in created_doc_ids:
+                    promote_document(session, prod_s, did)
+        except Exception as e:
+            try:
+                self.log.warning("Promotion failed for docs %s: %s", created_doc_ids, e)
+            except Exception:
+                pass
         return {
             "status": status,
             "sha256": sha,

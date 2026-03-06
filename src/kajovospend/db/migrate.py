@@ -215,25 +215,27 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
               doc_type = COALESCE(doc_type, CASE WHEN doc_number IS NULL OR TRIM(doc_number) = '' THEN 'receipt' ELSE 'invoice' END)
         """))
 
-        # service_state: observability columns (idempotent)
-        cols_ss = con.execute(text("PRAGMA table_info('service_state')")).fetchall()
-        ss_col_names = {row[1] for row in cols_ss}
-        for name, coltype, dflt in [
-            ("inflight", "INTEGER", "0"),
-            ("max_workers", "INTEGER", "0"),
-            ("current_job_id", "INTEGER", "NULL"),
-            ("current_path", "TEXT", "NULL"),
-            ("current_phase", "TEXT", "NULL"),
-            ("current_progress", "REAL", "NULL"),
-            ("heartbeat_at", "TEXT", "NULL"),
-            ("stuck", "INTEGER", "0"),
-            ("stuck_reason", "TEXT", "NULL"),
-        ]:
-            if name not in ss_col_names:
-                if dflt == "NULL":
-                    con.execute(text(f"ALTER TABLE service_state ADD COLUMN {name} {coltype}"))
-                else:
-                    con.execute(text(f"ALTER TABLE service_state ADD COLUMN {name} {coltype} DEFAULT {dflt}"))
+        # service_state: observability columns (idempotent) – only if table exists
+        tbls = {row[0] for row in con.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}
+        if "service_state" in tbls:
+            cols_ss = con.execute(text("PRAGMA table_info('service_state')")).fetchall()
+            ss_col_names = {row[1] for row in cols_ss}
+            for name, coltype, dflt in [
+                ("inflight", "INTEGER", "0"),
+                ("max_workers", "INTEGER", "0"),
+                ("current_job_id", "INTEGER", "NULL"),
+                ("current_path", "TEXT", "NULL"),
+                ("current_phase", "TEXT", "NULL"),
+                ("current_progress", "REAL", "NULL"),
+                ("heartbeat_at", "TEXT", "NULL"),
+                ("stuck", "INTEGER", "0"),
+                ("stuck_reason", "TEXT", "NULL"),
+            ]:
+                if name not in ss_col_names:
+                    if dflt == "NULL":
+                        con.execute(text(f"ALTER TABLE service_state ADD COLUMN {name} {coltype}"))
+                    else:
+                        con.execute(text(f"ALTER TABLE service_state ADD COLUMN {name} {coltype} DEFAULT {dflt}"))
 
         # --- indexes (IF NOT EXISTS is safe) ---
         # Supplier fast lookups / joins
@@ -258,12 +260,13 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_ean ON items(ean)"))
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_line_items_item_code ON items(item_code)"))
 
-        # Import jobs: processing_id_in pro vazbu na zpracovatelskou DB
-        cols_jobs = con.execute(text("PRAGMA table_info('import_jobs')")).fetchall()
-        job_col_names = {row[1] for row in cols_jobs}
-        if "processing_id_in" not in job_col_names:
-            con.execute(text("ALTER TABLE import_jobs ADD COLUMN processing_id_in INTEGER"))
-            con.execute(text("CREATE INDEX IF NOT EXISTS idx_import_jobs_idin ON import_jobs(processing_id_in)"))
+        # Import jobs: processing_id_in pro vazbu na zpracovatelskou DB (pokud tabulka existuje)
+        if "import_jobs" in tbls:
+            cols_jobs = con.execute(text("PRAGMA table_info('import_jobs')")).fetchall()
+            job_col_names = {row[1] for row in cols_jobs}
+            if "processing_id_in" not in job_col_names:
+                con.execute(text("ALTER TABLE import_jobs ADD COLUMN processing_id_in INTEGER"))
+                con.execute(text("CREATE INDEX IF NOT EXISTS idx_import_jobs_idin ON import_jobs(processing_id_in)"))
 
         # Items: technické ID + skupiny + ID účtenky/dodavatele
         cols_items = con.execute(text("PRAGMA table_info('items')")).fetchall()
@@ -364,28 +367,29 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
         )
 
         # Tvrdá stěna: soubory/doklady bez dodavatele do karantény
-        con.execute(
-            text(
-                """
-                UPDATE files
-                SET status='QUARANTINE'
-                WHERE id IN (
-                    SELECT DISTINCT file_id FROM documents
-                    WHERE supplier_id IS NULL OR supplier_ico IS NULL OR TRIM(COALESCE(supplier_ico,''))=''
+        if "files" in tbls and "documents" in tbls:
+            con.execute(
+                text(
+                    """
+                    UPDATE files
+                    SET status='QUARANTINE'
+                    WHERE id IN (
+                        SELECT DISTINCT file_id FROM documents
+                        WHERE supplier_id IS NULL OR supplier_ico IS NULL OR TRIM(COALESCE(supplier_ico,''))=''
+                    )
+                    """
                 )
-                """
             )
-        )
-        con.execute(
-            text(
-                """
-                UPDATE documents
-                SET requires_review=1,
-                    review_reasons=COALESCE(review_reasons||'; ','') || 'dodavatel_chybi'
-                WHERE supplier_id IS NULL OR supplier_ico IS NULL OR TRIM(COALESCE(supplier_ico,''))=''
-                """
+            con.execute(
+                text(
+                    """
+                    UPDATE documents
+                    SET requires_review=1,
+                        review_reasons=COALESCE(review_reasons||'; ','') || 'dodavatel_chybi'
+                    WHERE supplier_id IS NULL OR supplier_ico IS NULL OR TRIM(COALESCE(supplier_ico,''))=''
+                    """
+                )
             )
-        )
 
 
 def init_db(engine: Engine) -> None:
