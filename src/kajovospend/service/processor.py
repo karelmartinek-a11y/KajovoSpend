@@ -56,7 +56,7 @@ from kajovospend.utils.hashing import sha256_file
 from kajovospend.utils.text_quality import compute_text_quality, summarize_text_quality, text_quality_score
 from kajovospend.utils.qr_spayd import decode_qr_from_pil, parse_spayd
 from kajovospend.utils.iban import normalize_iban, is_valid_iban
-from kajovospend.utils.forensic_context import forensic_scope, new_correlation_id
+from kajovospend.utils.forensic_context import forensic_scope, new_correlation_id, get_forensic_fields
 from kajovospend.utils.logging_setup import log_event
 
 
@@ -1844,6 +1844,11 @@ class Processor:
                             use_json_schema=use_json_schema,
                             temperature=temperature,
                             max_output_tokens=max_output_tokens,
+                            forensic_fields={
+                                k: v
+                                for k, v in get_forensic_fields().items()
+                                if k in {"correlation_id", "document_id", "file_sha256", "job_id"} and v is not None
+                            },
                         )
                         with forensic_scope(phase="openai_primary", mode="primary"):
                             obj, raw, used_model = extract_with_openai(
@@ -1960,6 +1965,11 @@ class Processor:
                         use_json_schema=use_json_schema,
                         temperature=temperature,
                         max_output_tokens=max_output_tokens,
+                        forensic_fields={
+                            k: v
+                            for k, v in get_forensic_fields().items()
+                            if k in {"correlation_id", "document_id", "file_sha256", "job_id"} and v is not None
+                        },
                     )
                     with forensic_scope(phase="openai_fallback", mode="fallback"):
                         obj, raw, used_model = extract_with_openai_fallback(

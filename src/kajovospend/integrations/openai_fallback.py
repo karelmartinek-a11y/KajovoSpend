@@ -24,6 +24,7 @@ class OpenAIConfig:
     use_json_schema: bool = True
     temperature: float = 0.0
     max_output_tokens: int = 2000
+    forensic_fields: Dict[str, Any] | None = None
 
 
 _MODEL_CACHE: dict[str, Any] = {"ts": 0.0, "ids": []}
@@ -524,6 +525,17 @@ def _next_max_output_tokens(current: int) -> int:
     return min(8000, max(base + 1000, int(base * 1.5)))
 
 
+def _forensic_seed_fields(source: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Only keep stable linkage fields so phase/mode can still be set locally."""
+    src = source or {}
+    out: Dict[str, Any] = {}
+    for key in ("correlation_id", "document_id", "file_sha256", "job_id"):
+        val = src.get(key)
+        if val is not None:
+            out[key] = val
+    return out
+
+
 def ensure_schema_defaults(obj: Dict[str, Any]) -> Dict[str, Any]:
     """
     Doplňuje chybějící klíče dle _JSON_SCHEMA na výchozí hodnoty (null/{} / [] podle typu).
@@ -568,7 +580,16 @@ def ensure_schema_defaults(obj: Dict[str, Any]) -> Dict[str, Any]:
     return filled
 
 
-def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: str, attempt: int, api_key: str) -> Tuple[requests.Response, float, Optional[str], Optional[str], str]:
+def _openai_post_responses(
+    payload: Dict[str, Any],
+    *,
+    timeout: int,
+    log,
+    mode: str,
+    attempt: int,
+    api_key: str,
+    forensic_linkage: Dict[str, Any] | None = None,
+) -> Tuple[requests.Response, float, Optional[str], Optional[str], str]:
     """
     Vykoná jeden HTTP POST na /v1/responses, zaloguje openai.request + případný openai.error.
     Vrací (response, latency_ms, response_body_hash, openai_request_id, openai_request_id_client).
@@ -619,6 +640,7 @@ def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: 
         pass
 
     with forensic_scope(openai_request_id_client=req_id_client, attempt=attempt, mode=mode):
+        linkage = _forensic_seed_fields(forensic_linkage)
         log_event(
             log,
             "openai.request",
@@ -635,6 +657,10 @@ def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: 
             attachments=attachments_meta,
             request_body_hash=body_hash,
             openai_request_id_client=req_id_client,
+            correlation_id=linkage.get("correlation_id"),
+            file_sha256=linkage.get("file_sha256"),
+            job_id=linkage.get("job_id"),
+            document_id=linkage.get("document_id"),
         )
 
         start = time.perf_counter()
@@ -671,6 +697,10 @@ def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: 
                     safe_excerpt=(err_msg or "")[:500] if err_msg else None,
                     openai_request_id=openai_request_id,
                     openai_request_id_client=req_id_client,
+                    correlation_id=linkage.get("correlation_id"),
+                    file_sha256=linkage.get("file_sha256"),
+                    job_id=linkage.get("job_id"),
+                    document_id=linkage.get("document_id"),
                 )
             return r, latency_ms, resp_hash, openai_request_id, req_id_client
         except requests.RequestException as exc:
@@ -691,6 +721,10 @@ def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: 
                 safe_excerpt=(err_msg or "")[:500],
                 openai_request_id=getattr(resp, "headers", {}).get("x-request-id") if resp is not None else None,
                 openai_request_id_client=req_id_client,
+                correlation_id=linkage.get("correlation_id"),
+                file_sha256=linkage.get("file_sha256"),
+                job_id=linkage.get("job_id"),
+                document_id=linkage.get("document_id"),
             )
             raise
 
@@ -706,6 +740,7 @@ def _openai_post_with_retry(
     log,
     mode: str,
     api_key: str,
+    forensic_linkage: Dict[str, Any] | None = None,
     attempt_start: int = 1,
     max_retries: int = _MAX_HTTP_RETRIES,
 ) -> Tuple[requests.Response, float, Optional[str], Optional[str], str, int]:
@@ -719,6 +754,7 @@ def _openai_post_with_retry(
                 mode=mode,
                 attempt=attempt,
                 api_key=api_key,
+                forensic_linkage=forensic_linkage,
             )
         except requests.RequestException:
             if attempt - attempt_start >= max_retries:
@@ -815,6 +851,7 @@ def _run_responses_flow(
     status_cb=None,
 ) -> Tuple[Optional[Dict[str, Any]], str, str]:
     log = logging.getLogger(__name__)
+    forensic_linkage = _forensic_seed_fields(cfg.forensic_fields) or _forensic_seed_fields(get_forensic_fields())
     if cfg.use_json_schema:
         validate_schema_invariants_or_raise(_OPENAI_JSON_SCHEMA, log=log)
     model = _resolve_model(cfg.api_key, cfg.model if mode == "primary" else (cfg.fallback_model or cfg.model), _MODEL_PREFER_PRIMARY if mode == "primary" else _MODEL_PREFER_FALLBACK)
@@ -846,7 +883,7 @@ def _run_responses_flow(
         except Exception:
             pass
     resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt = _openai_post_with_retry(
-        payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, attempt_start=attempt
+        payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, forensic_linkage=forensic_linkage, attempt_start=attempt
     )
     if status_cb:
         try:
@@ -895,7 +932,7 @@ def _run_responses_flow(
             payload["text"] = {"format": {"type": "json_object"}}
             attempt += 1
             resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt = _openai_post_with_retry(
-                payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, attempt_start=attempt
+                payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, forensic_linkage=forensic_linkage, attempt_start=attempt
             )
     resp.raise_for_status()
 
@@ -940,7 +977,7 @@ def _run_responses_flow(
             attempt += 1
             parse_retry_used = True
             resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt = _openai_post_with_retry(
-                payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, attempt_start=attempt
+                payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, forensic_linkage=forensic_linkage, attempt_start=attempt
             )
             resp.raise_for_status()
             data = resp.json()
@@ -1003,6 +1040,10 @@ def _run_responses_flow(
         parse_strategy=parse_strategy,
         parse_retry_used=parse_retry_used,
         request_max_output_tokens=req_max_output_tokens,
+        correlation_id=forensic_linkage.get("correlation_id"),
+        file_sha256=forensic_linkage.get("file_sha256"),
+        job_id=forensic_linkage.get("job_id"),
+        document_id=forensic_linkage.get("document_id"),
     )
     if status_cb:
         try:
