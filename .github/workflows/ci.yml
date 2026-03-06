@@ -16,6 +16,7 @@ jobs:
       PYTHONPATH: src
       # deterministic temp dirs for dual-DB tests
       PYTEST_ADDOPTS: "--basetemp=.pytest_tmp_ci"
+      QT_QPA_PLATFORM: offscreen
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,6 +28,8 @@ jobs:
 
       - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -U pytest
