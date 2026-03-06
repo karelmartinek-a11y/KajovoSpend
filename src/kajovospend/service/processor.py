@@ -218,12 +218,17 @@ class Processor:
             return
 
     @staticmethod
-    def _supplier_details_complete(supplier: Supplier | None) -> tuple[bool, list[str]]:
-        """Tvrdé pravidlo: bez kompletních detailů dodavatele nesmí doklad do produkční DB."""
+    def _supplier_details_complete(supplier: Supplier | None) -> tuple[bool, list[str], list[str]]:
+        """
+        Supplier gate policy:
+        - blocker fields: without these the document is blocked
+        - soft fields: missing values are review reasons only (non-blocking)
+        """
         if supplier is None:
-            return False, ["chybí dodavatel"]
+            return False, ["chybí dodavatel"], []
 
-        missing: list[str] = []
+        missing_blockers: list[str] = []
+        missing_soft: list[str] = []
 
         def _is_missing(value: Any) -> bool:
             if value is None:
@@ -232,9 +237,11 @@ class Processor:
                 return True
             return False
 
-        required_fields: list[tuple[str, Any]] = [
+        blocker_fields: list[tuple[str, Any]] = [
             ("IČO", getattr(supplier, "ico", None)),
             ("název", getattr(supplier, "name", None)),
+        ]
+        soft_fields: list[tuple[str, Any]] = [
             ("adresa", getattr(supplier, "address", None)),
             ("ulice", getattr(supplier, "street", None)),
             ("číslo popisné", getattr(supplier, "street_number", None)),
@@ -243,14 +250,20 @@ class Processor:
             ("právní forma", getattr(supplier, "legal_form", None)),
             ("ARES synchronizace", getattr(supplier, "ares_last_sync", None)),
         ]
-        for label, value in required_fields:
+        for label, value in blocker_fields:
             if _is_missing(value):
-                missing.append(label)
+                missing_blockers.append(label)
+        for label, value in soft_fields:
+            if _is_missing(value):
+                missing_soft.append(label)
 
         if getattr(supplier, "is_vat_payer", None) is None:
-            missing.append("status plátce DPH")
+            missing_soft.append("status plátce DPH")
 
-        return len(missing) == 0, missing
+        # stable deterministic ordering + dedup
+        missing_blockers = list(dict.fromkeys(missing_blockers))
+        missing_soft = list(dict.fromkeys(missing_soft))
+        return len(missing_blockers) == 0, missing_blockers, missing_soft
     
     def _validate_extracted(self, extracted) -> None:
         """Dodatečné validace (např. IBAN checksum). Nic nehazí."""
@@ -2169,11 +2182,11 @@ class Processor:
                 self._update_processing_status(id_in, status="QUARANTINE", last_error=file_record.last_error, path_current=file_record.current_path, sha256=sha)
                 continue
 
-            supplier_ok, missing_supplier_details = self._supplier_details_complete(supplier_rec)
+            supplier_ok, missing_supplier_blockers, missing_supplier_soft = self._supplier_details_complete(supplier_rec)
             if not supplier_ok:
                 requires_review = True
                 reasons.append(
-                    "dodavatel není kompletně vytěžen: " + ", ".join(missing_supplier_details)
+                    "dodavatel blokován: chybí kritická pole: " + ", ".join(missing_supplier_blockers)
                 )
                 any_requires_review = True
                 try:
@@ -2189,6 +2202,12 @@ class Processor:
                     sha256=sha,
                 )
                 continue
+
+            if missing_supplier_soft:
+                reasons.append(
+                    "dodavatel nekompletní (neblokující): " + ", ".join(missing_supplier_soft)
+                )
+                reasons = list(dict.fromkeys(reasons))
 
             last_error_msg = "; ".join(dict.fromkeys(reasons)) if reasons else "nekompletní vytěžení"
             if requires_review:
