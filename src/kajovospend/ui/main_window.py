@@ -3070,15 +3070,15 @@ class MainWindow(QMainWindow):
                         "doc_id": did,
                         "doc_supplier_id": int(d.supplier_id) if d.supplier_id else "",
                         "file_id": int(f.id) if f else None,
-                        "path": getattr(f, \"current_path\", None),
+                        "path": getattr(f, "current_path", None),
                         "date": d.issue_date.isoformat() if d.issue_date else "",
                         "total": float(d.total_with_vat or 0.0) if d.total_with_vat is not None else 0.0,
-                        "supplier": (sup_names.get(int(d.supplier_id)) if d.supplier_id else \"\") or (d.supplier_ico or \"\") or \"\",
-                        "supplier_ico": (d.supplier_ico or \"\") if getattr(d, \"supplier_ico\", None) is not None else \"\",
+                        "supplier": (sup_names.get(int(d.supplier_id)) if d.supplier_id else "") or (d.supplier_ico or "") or "",
+                        "supplier_ico": (d.supplier_ico or "") if getattr(d, "supplier_ico", None) is not None else "",
                         "total_without_vat": float(d.total_without_vat or 0.0) if d.total_without_vat is not None else 0.0,
-                        "doc_number": (d.doc_number or \"\") if getattr(d, \"doc_number\", None) is not None else \"\",
+                        "doc_number": (d.doc_number or "") if getattr(d, "doc_number", None) is not None else "",
                         "items_count": counts.get(did, 0),
-                        "status": getattr(f, \"status\", \"\") if f else \"\",
+                        "status": getattr(f, "status", "") if f else "",
                     }
                 )
 
