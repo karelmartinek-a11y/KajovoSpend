@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Any, Dict
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, text
 
-from kajovospend.db.working_models import ImportJob, ServiceState
+from kajovospend.db.working_models import ImportJob, ServiceState, DocumentFile, Document
 from kajovospend.db.working_queries import update_service_state, queue_size
 from kajovospend.db.processing_session import create_processing_session_factory
 from kajovospend.db.processing_models import IngestFile

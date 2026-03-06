@@ -11,6 +11,7 @@ from kajovospend.db.working_session import create_working_engine
 from kajovospend.db.production_session import create_production_engine
 from kajovospend.db.dual_db_guard import ensure_separate_databases
 from kajovospend.utils.paths import resolve_app_paths
+from kajovospend.service.processor import Processor
 
 
 def init_new_db(window) -> None:
@@ -43,6 +44,7 @@ def init_new_db(window) -> None:
     init_working_db(w_eng)
     init_production_db(p_eng)
     sf = make_session_factory(w_eng)
+    sf_production = make_session_factory(p_eng)
 
     # update config + state
     window.ed_db_dir.setText(str(path.parent))
@@ -63,7 +65,13 @@ def init_new_db(window) -> None:
     except Exception:
         pass
     window.engine = w_eng
+    window.engine_production = p_eng
     window.sf = sf
+    window.sf_production = sf_production
+    try:
+        window.processor = Processor(window.cfg, window.paths, window.log, window.sf, window.sf_production)
+    except Exception:
+        pass
     QMessageBox.information(
         window,
         "Databáze",

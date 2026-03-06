@@ -68,6 +68,11 @@ copy config.example.yaml config.yaml
 
 3) Inicializace DB proběhne automaticky při startu GUI.
 
+### Dual-DB režim
+- Aplikace používá dva fyzické SQLite soubory: **working DB** pro frontu/import/karanténu a **production DB** pro obchodní data (dashboard, statistiky, seznamy dokladů a položek).
+- Výchozí cesty: `KajovoSpend/kajovospend-working.sqlite` a `kajovospend-working-production.sqlite` (odvozeno z legacy `db_path`). Cesty lze nastavit v `config.yaml` (`app.working_db_path`, `app.production_db_path`).
+- Guard brání tomu, aby oba soubory ukazovaly na stejnou cestu; dashboard/business dotazy čtou vždy z production DB, workflow/ops z working DB.
+
 ## Spuštění
 
 ```powershell
