@@ -20,11 +20,13 @@ import warnings
 from sqlalchemy import select, text
 from sqlalchemy.exc import SADeprecationWarning
 
-from kajovospend.db.working_models import ImportJob, DocumentFile, StandardReceiptTemplate, Supplier
+from kajovospend.db.working_models import ImportJob, DocumentFile, Supplier
+from kajovospend.db.production_models import StandardReceiptTemplate
 from kajovospend.db.working_queries import (
     add_document,
     create_file_record,
     upsert_supplier,
+    rebuild_fts_for_document,
 )
 from kajovospend.db.production_models import Document as ProdDocument
 from kajovospend.service.promotion import promote_document
@@ -1519,9 +1521,18 @@ class Processor:
                     "key": None,
                 }]
 
-        templates = session.execute(
-            select(StandardReceiptTemplate).where(StandardReceiptTemplate.enabled == True)
-        ).scalars().all()
+        # Standard receipt templates live in production DB; read-only here.
+        try:
+            with self.sf_production() as prod_session:
+                templates = (
+                    prod_session.execute(
+                        select(StandardReceiptTemplate).where(StandardReceiptTemplate.enabled == True)
+                    )
+                    .scalars()
+                    .all()
+                )
+        except Exception:
+            templates = []
         out_base = Path(self.cfg["paths"]["output_dir"])
         quarantine_dir = out_base / self.cfg["paths"].get("quarantine_dir_name", "KARANTENA")
 

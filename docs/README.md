@@ -73,6 +73,12 @@ copy config.example.yaml config.yaml
 - Výchozí cesty: `KajovoSpend/kajovospend-working.sqlite` a `kajovospend-working-production.sqlite` (odvozeno z legacy `db_path`). Cesty lze nastavit v `config.yaml` (`app.working_db_path`, `app.production_db_path`).
 - Guard brání tomu, aby oba soubory ukazovaly na stejnou cestu; dashboard/business dotazy čtou vždy z production DB, workflow/ops z working DB.
 
+## Lokální testy
+- Unit testy: `PYTHONPATH=src pytest tests/unit`
+- Integration + migrace: `PYTHONPATH=src pytest tests/integration`
+- Dual-DB/forensic guard: `PYTHONPATH=src pytest tests/integration/test_dual_db_dashboard_reads.py`
+- Kompletní rychlý běh: `PYTHONPATH=src pytest tests`
+
 ## Spuštění
 
 ```powershell
