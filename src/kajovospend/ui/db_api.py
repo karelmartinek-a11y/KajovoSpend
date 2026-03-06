@@ -7,51 +7,78 @@ from sqlalchemy import select, text, func, case, bindparam
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from kajovospend.db.models import (
-    Document,
+from kajovospend.db.production_models import (
+    Document as ProdDocument,
+    LineItem as ProdLineItem,
+    StandardReceiptTemplate,
+    Supplier as ProdSupplier,
+)
+from kajovospend.db.working_models import (
+    Document as WorkDocument,
     DocumentFile,
     ImportJob,
-    LineItem,
     ServiceState,
-    StandardReceiptTemplate,
-    Supplier,
 )
 
 
-def counts(session: Session) -> Dict[str, int]:
+def working_counts(session: Session) -> Dict[str, int]:
+    """Operational counts from working DB."""
     unprocessed = session.execute(select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "NEW")).scalar_one()
     processed = session.execute(select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "PROCESSED")).scalar_one()
     quarantine = session.execute(select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "QUARANTINE")).scalar_one()
     duplicates = session.execute(select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "DUPLICATE")).scalar_one()
-    suppliers = session.execute(select(func.count()).select_from(Supplier)).scalar_one()
-    docs = session.execute(select(func.count()).select_from(Document)).scalar_one()
+    jobs = session.execute(select(func.count()).select_from(ImportJob)).scalar_one()
     return {
         "unprocessed": int(unprocessed),
         "processed": int(processed),
         "quarantine": int(quarantine),
         "duplicates": int(duplicates),
-        "suppliers": int(suppliers),
-        "documents": int(docs),
+        "import_jobs": int(jobs),
     }
 
 
-def run_stats(session: Session) -> Dict[str, Any]:
-    """Statistics for RUN tab.
+def production_counts(session: Session) -> Dict[str, int]:
+    """Business counts from production DB (no workflow statuses)."""
+    suppliers = session.execute(select(func.count()).select_from(ProdSupplier)).scalar_one()
+    docs = session.execute(select(func.count()).select_from(ProdDocument)).scalar_one()
+    items = session.execute(select(func.count()).select_from(ProdLineItem)).scalar_one()
+    return {
+        "suppliers": int(suppliers),
+        "documents": int(docs),
+        "items": int(items),
+    }
 
-    All indicators are computed strictly from *fully processed* receipts:
-    documents whose underlying file has status PROCESSED.
-    QUARANTINE and DUPLICATE files are excluded from denominators.
+
+def dashboard_counts(prod_session: Session, *, working_session: Session | None = None) -> Dict[str, int]:
     """
+    Mixed dashboard view:
+    - processed/business numbers come exclusively from production DB
+    - operational/quarantine/duplicate numbers come from working DB (optional)
+    """
+    prod = production_counts(prod_session)
+    out: Dict[str, int] = {
+        "processed": prod.get("documents", 0),
+        "suppliers": prod.get("suppliers", 0),
+        "items": prod.get("items", 0),
+    }
+    if working_session:
+        ops = working_counts(working_session)
+        out.update(
+            {
+                "unprocessed": ops.get("unprocessed", 0),
+                "quarantine": ops.get("quarantine", 0),
+                "duplicates": ops.get("duplicates", 0),
+                "import_jobs": ops.get("import_jobs", 0),
+                "processed_working": ops.get("processed", 0),
+            }
+        )
+    return out
 
-    # base document set = documents that belong to files marked as PROCESSED
-    doc_ids = [
-        int(r[0])
-        for r in session.execute(
-            select(Document.id)
-            .join(DocumentFile, Document.file_id == DocumentFile.id)
-            .where(DocumentFile.status == "PROCESSED")
-        ).all()
-    ]
+
+def run_stats(session: Session) -> Dict[str, Any]:
+    """Statistics for RUN tab, production DB only."""
+
+    doc_ids = [int(r[0]) for r in session.execute(select(ProdDocument.id)).all()]
 
     total_docs = len(doc_ids)
     if total_docs == 0:
@@ -78,16 +105,14 @@ def run_stats(session: Session) -> Dict[str, Any]:
     # counts
     suppliers = int(
         session.execute(
-            select(func.count(func.distinct(Document.supplier_ico)))
-            .join(DocumentFile, Document.file_id == DocumentFile.id)
-            .where(DocumentFile.status == "PROCESSED")
-            .where(Document.supplier_ico.is_not(None))
+            select(func.count(func.distinct(ProdDocument.supplier_ico)))
+            .where(ProdDocument.supplier_ico.is_not(None))
         ).scalar_one()
         or 0
     )
 
     items_count = int(
-        session.execute(select(func.count()).select_from(LineItem).where(LineItem.document_id.in_(doc_ids))).scalar_one()
+        session.execute(select(func.count()).select_from(ProdLineItem).where(ProdLineItem.document_id.in_(doc_ids))).scalar_one()
         or 0
     )
 
@@ -96,9 +121,9 @@ def run_stats(session: Session) -> Dict[str, Any]:
         n = int(
             session.execute(
                 select(func.count())
-                .select_from(Document)
-                .where(Document.id.in_(doc_ids))
-                .where(Document.extraction_method == method)
+                .select_from(ProdDocument)
+                .where(ProdDocument.id.in_(doc_ids))
+                .where(ProdDocument.extraction_method == method)
             ).scalar_one()
             or 0
         )
@@ -112,9 +137,9 @@ def run_stats(session: Session) -> Dict[str, Any]:
     # sums and averages over items
     sum_with_vat = float(
         session.execute(
-            select(func.sum(LineItem.line_total))
-            .select_from(LineItem)
-            .where(LineItem.document_id.in_(doc_ids))
+            select(func.sum(ProdLineItem.line_total))
+            .select_from(ProdLineItem)
+            .where(ProdLineItem.document_id.in_(doc_ids))
         ).scalar_one()
         or 0.0
     )
@@ -126,34 +151,34 @@ def run_stats(session: Session) -> Dict[str, Any]:
                 func.sum(
                     case(
                         (
-                            (LineItem.vat_rate.is_(None)) | (LineItem.vat_rate == 0),
-                            LineItem.line_total,
+                            (ProdLineItem.vat_rate.is_(None)) | (ProdLineItem.vat_rate == 0),
+                            ProdLineItem.line_total,
                         ),
-                        else_=LineItem.line_total / (1.0 + (LineItem.vat_rate / 100.0)),
+                        else_=ProdLineItem.line_total / (1.0 + (ProdLineItem.vat_rate / 100.0)),
                     )
                 )
             )
-            .select_from(LineItem)
-            .where(LineItem.document_id.in_(doc_ids))
+            .select_from(ProdLineItem)
+            .where(ProdLineItem.document_id.in_(doc_ids))
         ).scalar_one()
         or 0.0
     )
 
     avg_item = float(
         session.execute(
-            select(func.avg(LineItem.line_total))
-            .select_from(LineItem)
-            .where(LineItem.document_id.in_(doc_ids))
+            select(func.avg(ProdLineItem.line_total))
+            .select_from(ProdLineItem)
+            .where(ProdLineItem.document_id.in_(doc_ids))
         ).scalar_one()
         or 0.0
     )
 
     # per-document item counts (for avg/min/max)
     counts_rows = session.execute(
-        select(LineItem.document_id, func.count(LineItem.id))
-        .select_from(LineItem)
-        .where(LineItem.document_id.in_(doc_ids))
-        .group_by(LineItem.document_id)
+        select(ProdLineItem.document_id, func.count(ProdLineItem.id))
+        .select_from(ProdLineItem)
+        .where(ProdLineItem.document_id.in_(doc_ids))
+        .group_by(ProdLineItem.document_id)
     ).all()
     per_doc_counts = [int(c or 0) for _doc_id, c in counts_rows]
     # documents with 0 items (shouldn't happen but keep deterministic)
@@ -166,11 +191,11 @@ def run_stats(session: Session) -> Dict[str, Any]:
 
     # average receipt value: prefer Document.total_with_vat, fallback to sum(items)
     per_doc_sums = {int(did): float(s or 0.0) for did, s in session.execute(
-        select(LineItem.document_id, func.sum(LineItem.line_total))
-        .where(LineItem.document_id.in_(doc_ids))
-        .group_by(LineItem.document_id)
+        select(ProdLineItem.document_id, func.sum(ProdLineItem.line_total))
+        .where(ProdLineItem.document_id.in_(doc_ids))
+        .group_by(ProdLineItem.document_id)
     ).all()}
-    doc_totals = session.execute(select(Document.id, Document.total_with_vat).where(Document.id.in_(doc_ids))).all()
+    doc_totals = session.execute(select(ProdDocument.id, ProdDocument.total_with_vat).where(ProdDocument.id.in_(doc_ids))).all()
     vals = []
     for did, tv in doc_totals:
         if tv is not None:
@@ -182,21 +207,21 @@ def run_stats(session: Session) -> Dict[str, Any]:
     # average receipt value without VAT: prefer Document.total_without_vat, fallback to computed wo_vat per doc
     per_doc_sums_wo = {int(did): float(s or 0.0) for did, s in session.execute(
         select(
-            LineItem.document_id,
+            ProdLineItem.document_id,
             func.sum(
                 case(
                     (
-                        (LineItem.vat_rate.is_(None)) | (LineItem.vat_rate == 0),
-                        LineItem.line_total,
+                        (ProdLineItem.vat_rate.is_(None)) | (ProdLineItem.vat_rate == 0),
+                        ProdLineItem.line_total,
                     ),
-                    else_=LineItem.line_total / (1.0 + (LineItem.vat_rate / 100.0)),
+                    else_=ProdLineItem.line_total / (1.0 + (ProdLineItem.vat_rate / 100.0)),
                 )
             ),
         )
-        .where(LineItem.document_id.in_(doc_ids))
-        .group_by(LineItem.document_id)
+        .where(ProdLineItem.document_id.in_(doc_ids))
+        .group_by(ProdLineItem.document_id)
     ).all()}
-    doc_totals_wo = session.execute(select(Document.id, Document.total_without_vat).where(Document.id.in_(doc_ids))).all()
+    doc_totals_wo = session.execute(select(ProdDocument.id, ProdDocument.total_without_vat).where(ProdDocument.id.in_(doc_ids))).all()
     vals_wo = []
     for did, tv in doc_totals_wo:
         if tv is not None and float(tv) > 0.0:
@@ -207,10 +232,10 @@ def run_stats(session: Session) -> Dict[str, Any]:
 
     # max item
     max_row = session.execute(
-        select(LineItem.name, LineItem.line_total)
-        .select_from(LineItem)
-        .where(LineItem.document_id.in_(doc_ids))
-        .order_by(LineItem.line_total.desc())
+        select(ProdLineItem.name, ProdLineItem.line_total)
+        .select_from(ProdLineItem)
+        .where(ProdLineItem.document_id.in_(doc_ids))
+        .order_by(ProdLineItem.line_total.desc())
         .limit(1)
     ).first()
     max_name = None
@@ -326,20 +351,20 @@ def delete_standard_receipt_template(session: Session, template_id: int) -> None
     session.delete(tpl)
 
 
-def list_suppliers(session: Session, q: str = "") -> List[Supplier]:
-    stmt = select(Supplier)
+def list_suppliers(session: Session, q: str = "") -> List[ProdSupplier]:
+    stmt = select(ProdSupplier)
     if q.strip():
         qq = f"%{q.strip()}%"
         stmt = stmt.where(
-            (Supplier.ico.like(qq))
-            | (Supplier.name.like(qq))
-            | (Supplier.dic.like(qq))
-            | (Supplier.address.like(qq))
-            | (Supplier.city.like(qq))
-            | (Supplier.legal_form.like(qq))
-            | (Supplier.street.like(qq))
+            (ProdSupplier.ico.like(qq))
+            | (ProdSupplier.name.like(qq))
+            | (ProdSupplier.dic.like(qq))
+            | (ProdSupplier.address.like(qq))
+            | (ProdSupplier.city.like(qq))
+            | (ProdSupplier.legal_form.like(qq))
+            | (ProdSupplier.street.like(qq))
         )
-    stmt = stmt.order_by(Supplier.name.is_(None), Supplier.name)
+    stmt = stmt.order_by(ProdSupplier.name.is_(None), ProdSupplier.name)
     return list(session.execute(stmt).scalars().all())
 
 
@@ -347,11 +372,11 @@ def merge_suppliers(session: Session, keep_id: int, merge_ids: List[int]) -> Non
     merge_ids = [i for i in merge_ids if i != keep_id]
     if not merge_ids:
         return
-    keep = session.get(Supplier, keep_id)
+    keep = session.get(ProdSupplier, keep_id)
     if not keep:
         raise KeyError(keep_id)
 
-    docs = session.execute(select(Document).where(Document.supplier_id.in_(merge_ids))).scalars().all()
+    docs = session.execute(select(ProdDocument).where(ProdDocument.supplier_id.in_(merge_ids))).scalars().all()
     for d in docs:
         d.supplier_id = keep_id
         d.supplier_ico = keep.ico
@@ -366,16 +391,16 @@ def merge_suppliers(session: Session, keep_id: int, merge_ids: List[int]) -> Non
             pass
 
     for sid in merge_ids:
-        sup = session.get(Supplier, sid)
+        sup = session.get(ProdSupplier, sid)
         if sup:
             session.delete(sup)
     session.flush()
 
 def _apply_date_filters(stmt, date_from=None, date_to=None):
     if date_from:
-        stmt = stmt.where(Document.issue_date >= date_from)
+        stmt = stmt.where(ProdDocument.issue_date >= date_from)
     if date_to:
-        stmt = stmt.where(Document.issue_date <= date_to)
+        stmt = stmt.where(ProdDocument.issue_date <= date_to)
     return stmt
 
 
@@ -465,7 +490,7 @@ def count_documents(session: Session, q: str = "", date_from=None, date_to=None)
         """
         return int(session.execute(text(sql), params).scalar_one() or 0)
 
-    stmt = select(func.count(Document.id))
+    stmt = select(func.count(ProdDocument.id))
     stmt = _apply_date_filters(stmt, date_from=date_from, date_to=date_to)
     return int(session.execute(stmt).scalar_one() or 0)
 
@@ -478,7 +503,8 @@ def list_documents(
     *,
     limit: int | None = None,
     offset: int = 0,
-) -> List[Tuple[Document, DocumentFile]]:
+    working_session: Session | None = None,
+) -> List[Tuple[ProdDocument, DocumentFile | None]]:
     """
     Fast document listing suitable for tens of thousands of rows:
     - supports pagination (limit/offset)
@@ -497,45 +523,49 @@ def list_documents(
         if not ids:
             return []
 
-        stmt = (
-            select(Document, DocumentFile)
-            .join(DocumentFile, Document.file_id == DocumentFile.id)
-            .where(Document.id.in_(ids))
-            .where(DocumentFile.status != "QUARANTINE")
-        )
-        # extra safety on date range (even if already applied in FTS)
+        stmt = select(ProdDocument).where(ProdDocument.id.in_(ids))
         stmt = _apply_date_filters(stmt, date_from=date_from, date_to=date_to)
-        rows = session.execute(stmt).all()
-        by_id: Dict[int, Tuple[Document, DocumentFile]] = {int(d.id): (d, f) for d, f in rows}
-        # keep FTS order
-        return [by_id[i] for i in ids if i in by_id]
+        docs = session.execute(stmt).scalars().all()
+    else:
+        stmt = select(ProdDocument).order_by(ProdDocument.issue_date.desc().nullslast(), ProdDocument.id.desc())
+        stmt = _apply_date_filters(stmt, date_from=date_from, date_to=date_to)
+        if limit is not None:
+            stmt = stmt.limit(int(limit))
+        if offset:
+            stmt = stmt.offset(int(offset))
+        docs = session.execute(stmt).scalars().all()
 
-    stmt = (
-        select(Document, DocumentFile)
-        .join(DocumentFile, Document.file_id == DocumentFile.id)
-        .where(DocumentFile.status != "QUARANTINE")
-        .order_by(Document.issue_date.desc().nullslast(), Document.id.desc())
-    )
-    stmt = _apply_date_filters(stmt, date_from=date_from, date_to=date_to)
-    if limit is not None:
-        stmt = stmt.limit(int(limit))
-    if offset:
-        stmt = stmt.offset(int(offset))
-    return session.execute(stmt).all()
+    file_map: Dict[int, DocumentFile | None] = {}
+    if working_session:
+        file_ids = [int(d.file_id) for d in docs if d.file_id is not None]
+        if file_ids:
+            rows = working_session.execute(select(DocumentFile).where(DocumentFile.id.in_(file_ids))).scalars().all()
+            file_map = {int(f.id): f for f in rows}
+    return [(d, file_map.get(int(d.file_id)) if d.file_id is not None else None) for d in docs]
 
 
-def get_document_detail(session: Session, doc_id: int) -> Dict[str, Any]:
-    doc = session.get(Document, doc_id)
+def get_document_detail(session: Session, doc_id: int, *, working_session: Session | None = None) -> Dict[str, Any]:
+    doc = session.get(ProdDocument, doc_id)
     if not doc:
         raise KeyError(doc_id)
-    f = session.get(DocumentFile, doc.file_id)
-    items = session.execute(select(LineItem).where(LineItem.document_id == doc_id).order_by(LineItem.line_no)).scalars().all()
+    f = None
+    if working_session and doc.file_id is not None:
+        f = working_session.get(DocumentFile, doc.file_id)
+    items = (
+        session.execute(select(ProdLineItem).where(ProdLineItem.document_id == doc_id).order_by(ProdLineItem.line_no))
+        .scalars()
+        .all()
+    )
     return {"doc": doc, "file": f, "items": items}
 
 
-def list_quarantine(session: Session) -> List[Tuple[Document, DocumentFile]]:
-    stmt = select(Document, DocumentFile).join(DocumentFile, DocumentFile.id == Document.file_id).where(DocumentFile.status == "QUARANTINE")
-    stmt = stmt.order_by(Document.created_at.desc())
+def list_quarantine(session: Session) -> List[Tuple[WorkDocument, DocumentFile]]:
+    stmt = (
+        select(WorkDocument, DocumentFile)
+        .join(DocumentFile, DocumentFile.id == WorkDocument.file_id)
+        .where(DocumentFile.status == "QUARANTINE")
+        .order_by(WorkDocument.created_at.desc())
+    )
     return list(session.execute(stmt).all())
 
 
@@ -579,7 +609,7 @@ def _ensure_items_fts2_populated(session: Session) -> None:
 
 def count_items(session: Session, q: str = "") -> int:
     """
-    Count of line items (excluding quarantine files).
+    Count of line items from production DB.
     Supports fulltext search via items_fts2 if available.
     """
     try:
@@ -592,9 +622,7 @@ def count_items(session: Session, q: str = "") -> int:
                 FROM items_fts2
                 JOIN items i ON i.id = items_fts2.item_id
                 JOIN documents d ON d.id = i.document_id
-                JOIN files f ON f.id = d.file_id
                 WHERE items_fts2 MATCH :q
-                  AND f.status != 'QUARANTINE'
                 """
                 cnt = int(session.execute(text(sql), {"q": q}).scalar_one() or 0)
                 if cnt > 0:
@@ -607,9 +635,7 @@ def count_items(session: Session, q: str = "") -> int:
             SELECT COUNT(*) AS c
             FROM items i
             JOIN documents d ON d.id = i.document_id
-            JOIN files f ON f.id = d.file_id
-            WHERE f.status != 'QUARANTINE'
-              AND (LOWER(i.name) LIKE LOWER(:qq) OR LOWER(d.supplier_ico) LIKE LOWER(:qq) OR LOWER(d.doc_number) LIKE LOWER(:qq))
+            WHERE (LOWER(i.name) LIKE LOWER(:qq) OR LOWER(d.supplier_ico) LIKE LOWER(:qq) OR LOWER(d.doc_number) LIKE LOWER(:qq))
             """
             return int(session.execute(text(sql), {"qq": qq}).scalar_one() or 0)
 
@@ -617,8 +643,6 @@ def count_items(session: Session, q: str = "") -> int:
         SELECT COUNT(*) AS c
         FROM items i
         JOIN documents d ON d.id = i.document_id
-        JOIN files f ON f.id = d.file_id
-        WHERE f.status != 'QUARANTINE'
         """
         return int(session.execute(text(sql)).scalar_one() or 0)
     except OperationalError:
@@ -666,6 +690,7 @@ def list_items(
     price_val: float | None = None,
     price_min: float | None = None,
     price_max: float | None = None,
+    working_session: Session | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Paginated list of line items for UI tab "POLOŽKY".
@@ -681,7 +706,7 @@ def list_items(
             params["lim"] = int(limit)
             params["off"] = int(offset or 0)
 
-        where = ["f.status != 'QUARANTINE'"]
+        where: List[str] = []
 
         # Skupiny
         if group_id is not None:
@@ -785,19 +810,27 @@ def list_items(
           d.doc_number   AS doc_number,
           d.supplier_ico AS supplier_ico,
           s.name         AS supplier_name,
-          f.current_path AS current_path
+          d.file_id      AS file_id
         FROM items i
         JOIN documents d ON d.id = i.document_id
-        JOIN files f ON f.id = d.file_id
         LEFT JOIN suppliers s ON s.id = d.supplier_id
         WHERE {where_sql_final}
-        ORDER BY d.issue_date DESC NULLS LAST, d.id DESC, i.line_no ASC
+        ORDER BY d.issue_date DESC, d.id DESC, i.line_no ASC
         {lim_sql}
         """
         stmt = text(sql_base)
         if "ids" in params:
             stmt = stmt.bindparams(bindparam("ids", expanding=True))
-        return [dict(r) for r in session.execute(stmt, params).mappings().all()]
+        rows = [dict(r) for r in session.execute(stmt, params).mappings().all()]
+        if working_session:
+            file_ids = {int(r["file_id"]) for r in rows if r.get("file_id") is not None}
+            file_map = {}
+            if file_ids:
+                from kajovospend.db.working_models import DocumentFile
+                file_map = {int(f.id): f.current_path for f in working_session.execute(select(DocumentFile).where(DocumentFile.id.in_(file_ids))).scalars().all()}
+            for r in rows:
+                r["current_path"] = file_map.get(int(r["file_id"])) if r.get("file_id") is not None else None
+        return rows
     except OperationalError:
         return []
 

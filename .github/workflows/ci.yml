@@ -6,7 +6,17 @@ on:
 
 jobs:
   test:
+    name: python${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    env:
+      PYTHONPATH: src
+      # deterministic temp dirs for dual-DB tests
+      PYTEST_ADDOPTS: "--basetemp=.pytest_tmp_ci"
+      QT_QPA_PLATFORM: offscreen
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -14,14 +24,24 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest
+          pip install -U pytest
 
-      - name: Run tests
-        run: |
-          PYTHONPATH=src pytest tests
+      - name: Bytecode compile (sanity)
+        run: python -m compileall -q src tests
+
+      - name: Unit tests
+        run: pytest tests/unit
+
+      - name: Integration + dual-DB guards
+        run: pytest tests/integration
+
+      - name: Forensic/dual-DB dashboard guard
+        run: pytest tests/integration/test_dual_db_dashboard_reads.py

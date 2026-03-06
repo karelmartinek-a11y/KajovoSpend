@@ -9,9 +9,11 @@ from typing import Any, Dict, List
 
 from sqlalchemy import select
 
-from kajovospend.db.migrate import init_db
-from kajovospend.db.models import Document, LineItem
-from kajovospend.db.session import make_engine, make_session_factory
+from kajovospend.db.migrate import init_working_db, init_production_db
+from kajovospend.db.working_models import Document, LineItem
+from kajovospend.db.working_session import create_working_engine
+from kajovospend.db.production_session import create_production_engine
+from kajovospend.db.session import make_session_factory
 from kajovospend.service.processor import Processor
 from kajovospend.utils.paths import resolve_app_paths
 
@@ -93,9 +95,12 @@ class TestExtractionFixturesHarness(unittest.TestCase):
             h.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
             log.addHandler(h)
 
-            engine = make_engine(str(paths.db_path))
-            init_db(engine)
-            sf = make_session_factory(engine)
+            w_engine = create_working_engine(str(paths.working_db_path))
+            p_engine = create_production_engine(str(paths.production_db_path))
+            init_working_db(w_engine)
+            init_production_db(p_engine)
+            sf = make_session_factory(w_engine)
+            sf_prod = make_session_factory(p_engine)
 
             # Embedded-text PDF that should parse basic fields + 1 rounding item
             txt = "\n".join(
@@ -110,7 +115,8 @@ class TestExtractionFixturesHarness(unittest.TestCase):
             pdf_path = root / "fixture1.pdf"
             pdf_path.write_bytes(_make_minimal_pdf_with_text(txt))
 
-            proc = Processor(cfg, paths, log)
+            with patch("kajovospend.service.processor.RapidOcrEngine", lambda *a, **k: None):
+                proc = Processor(cfg, paths, log, sf, sf_prod)
             with patch("kajovospend.service.processor.fetch_by_ico") as fetch_ares:
                 from kajovospend.integrations.ares import AresRecord
 
@@ -144,7 +150,8 @@ class TestExtractionFixturesHarness(unittest.TestCase):
                     self.assertGreaterEqual(len(items), 1)
 
             proc.close()
-            engine.dispose()
+            w_engine.dispose()
+            p_engine.dispose()
 
             # Verify decision log exists
             joined = "\n".join(h.lines)

@@ -36,4 +36,8 @@ def make_engine(db_path: str):
 
 
 def make_session_factory(engine):
-    return sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    sf = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    # back-compat helpers (sqlalchemy 2.x hides .bind)
+    sf.bind = engine  # type: ignore[attr-defined]
+    sf._engine = engine  # type: ignore[attr-defined]
+    return sf

@@ -7,6 +7,7 @@ from sqlalchemy import String, Integer, DateTime, Text
 from sqlalchemy.orm import declarative_base, mapped_column
 
 BaseProcessing = declarative_base()
+# Processing DB is staging/ingest only; remains separate from working/production DBs.
 
 
 class IngestFile(BaseProcessing):

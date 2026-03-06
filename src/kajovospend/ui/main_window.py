@@ -36,13 +36,16 @@ from sqlalchemy.orm import selectinload
 from shiboken6 import Shiboken
 from kajovospend.utils.config import load_yaml, save_yaml, deep_set
 import requests
-import requests
 from kajovospend.utils.paths import resolve_app_paths
 from kajovospend.utils.logging_setup import setup_logging
-from kajovospend.db.session import make_engine, make_session_factory
-from kajovospend.db.migrate import init_db
-from kajovospend.db.models import Supplier, Document, DocumentFile, LineItem, ImportJob
-from kajovospend.db.queries import upsert_supplier, rebuild_fts_for_document, create_file_record, add_document
+from kajovospend.db.session import make_session_factory
+from kajovospend.db.working_session import create_working_engine
+from kajovospend.db.production_session import create_production_engine
+from kajovospend.db.dual_db_guard import ensure_separate_databases
+from kajovospend.db.migrate import init_working_db, init_production_db
+from kajovospend.db.working_models import Supplier, Document, DocumentFile, LineItem, ImportJob
+from kajovospend.db.production_models import Document as ProdDocument, LineItem as ProdLineItem, Supplier as ProdSupplier
+from kajovospend.db.working_queries import upsert_supplier, rebuild_fts_for_document, create_file_record, add_document
 from kajovospend.db.processing_session import create_processing_session_factory
 from kajovospend.db.processing_models import IngestFile
 from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
@@ -961,14 +964,20 @@ class MainWindow(QMainWindow):
             self.cfg["app"].get("db_path"),
             self.cfg["app"].get("log_dir"),
             self.cfg.get("ocr", {}).get("models_dir"),
+            working_db=self.cfg["app"].get("working_db_path"),
+            production_db=self.cfg["app"].get("production_db_path"),
         )
         self.log = setup_logging(self.paths.log_dir, name="kajovospend_gui")
 
-        self.engine = make_engine(str(self.paths.db_path))
-        init_db(self.engine)
-        self.sf = make_session_factory(self.engine)
+        ensure_separate_databases(str(self.paths.working_db_path), str(self.paths.production_db_path))
+        self.engine = create_working_engine(str(self.paths.working_db_path))
+        self.engine_production = create_production_engine(str(self.paths.production_db_path))
+        init_working_db(self.engine)
+        init_production_db(self.engine_production)
+        self.sf = make_session_factory(self.engine)  # working session (ops/workflow)
+        self.sf_production = make_session_factory(self.engine_production)  # business reads
         self.pf = create_processing_session_factory(self.cfg)
-        self.processor = Processor(self.cfg, self.paths, self.log)
+        self.processor = Processor(self.cfg, self.paths, self.log, self.sf, self.sf_production)
 
         self.setWindowTitle("KájovoSpend")
         ico = self.assets_dir / "app.ico"
@@ -2509,10 +2518,10 @@ class MainWindow(QMainWindow):
         vat_choice = self.items_vat_filter.currentData()
 
         def _query():
-            with self.sf() as session:
-                total = db_api.count_items(session, q=q)
+            with self.sf_production() as prod_session, self.sf() as work_session:
+                total = db_api.count_items(prod_session, q=q)
                 rows = db_api.list_items(
-                    session,
+                    prod_session,
                     q=q,
                     limit=limit,
                     offset=offset,
@@ -2525,6 +2534,7 @@ class MainWindow(QMainWindow):
                     price_val=price_val if price_enabled else None,
                     price_min=price_min if price_enabled else None,
                     price_max=price_max if price_enabled else None,
+                    working_session=work_session,
                 )
             return total, rows
 
@@ -2746,9 +2756,9 @@ class MainWindow(QMainWindow):
         except Exception:
             doc_id = 0
         if doc_id:
-            with self.sf() as session:
+            with self.sf_production() as session:
                 doc_items = session.execute(
-                    select(LineItem).where(LineItem.document_id == doc_id).order_by(LineItem.line_no.asc())
+                    select(ProdLineItem).where(ProdLineItem.document_id == doc_id).order_by(ProdLineItem.line_no.asc())
                 ).scalars().all()
             item_headers = ["Počet", "Název položky", "Cena bez DPH za kus"]
             item_rows = []
@@ -3021,15 +3031,16 @@ class MainWindow(QMainWindow):
                 date_from = None
                 date_to = None
 
-        with self.sf() as session:
-            self._doc_total = db_api.count_documents(session, q=q, date_from=date_from, date_to=date_to)
+        with self.sf_production() as prod_session, self.sf() as work_session:
+            self._doc_total = db_api.count_documents(prod_session, q=q, date_from=date_from, date_to=date_to)
             rows = db_api.list_documents(
-                session,
+                prod_session,
                 q=q,
                 date_from=date_from,
                 date_to=date_to,
                 limit=int(self._doc_page_size),
                 offset=int(self._doc_offset),
+                working_session=work_session,
             )
 
             if reset:
@@ -3038,18 +3049,18 @@ class MainWindow(QMainWindow):
                 self._docs_listing = []
 
             doc_ids = [int(d.id) for d, _f in rows]
-            # counts items per doc
+            # counts items per doc (production DB)
             counts = {}
             if doc_ids:
-                for did, c in session.execute(
-                    select(LineItem.document_id, text("COUNT(*)")).where(LineItem.document_id.in_(doc_ids)).group_by(LineItem.document_id)
+                for did, c in prod_session.execute(
+                    select(ProdLineItem.document_id, text("COUNT(*)")).where(ProdLineItem.document_id.in_(doc_ids)).group_by(ProdLineItem.document_id)
                 ).all():
                     counts[int(did)] = int(c)
-            # supplier names
+            # supplier names from production
             sup_ids = list({int(d.supplier_id) for d, _f in rows if d.supplier_id})
             sup_names: Dict[int, str] = {}
             if sup_ids:
-                for s in session.execute(select(Supplier).where(Supplier.id.in_(sup_ids))).scalars().all():
+                for s in prod_session.execute(select(ProdSupplier).where(ProdSupplier.id.in_(sup_ids))).scalars().all():
                     sup_names[int(s.id)] = (s.name or s.ico or "").strip()
 
             for d, f in rows:
@@ -3058,8 +3069,8 @@ class MainWindow(QMainWindow):
                     {
                         "doc_id": did,
                         "doc_supplier_id": int(d.supplier_id) if d.supplier_id else "",
-                        "file_id": int(f.id),
-                        "path": f.current_path,
+                        "file_id": int(f.id) if f else None,
+                        "path": getattr(f, "current_path", None),
                         "date": d.issue_date.isoformat() if d.issue_date else "",
                         "total": float(d.total_with_vat or 0.0) if d.total_with_vat is not None else 0.0,
                         "supplier": (sup_names.get(int(d.supplier_id)) if d.supplier_id else "") or (d.supplier_ico or "") or "",
@@ -3067,7 +3078,7 @@ class MainWindow(QMainWindow):
                         "total_without_vat": float(d.total_without_vat or 0.0) if d.total_without_vat is not None else 0.0,
                         "doc_number": (d.doc_number or "") if getattr(d, "doc_number", None) is not None else "",
                         "items_count": counts.get(did, 0),
-                        "status": f.status or "",
+                        "status": getattr(f, "status", "") if f else "",
                     }
                 )
 
@@ -3380,17 +3391,23 @@ class MainWindow(QMainWindow):
         deep_set(self.cfg, ["openai", "allow_synthetic_items"], (not only))
         save_yaml(self.config_path, self.cfg)
         # refresh paths and engine if db moved
-        old_db = self.paths.db_path
+        old_db = self.paths.working_db_path
         self.paths = resolve_app_paths(
             self.cfg["app"].get("data_dir"),
             self.cfg["app"].get("db_path"),
             self.cfg["app"].get("log_dir"),
             self.cfg.get("ocr", {}).get("models_dir"),
+            working_db=self.cfg["app"].get("working_db_path"),
+            production_db=self.cfg["app"].get("production_db_path"),
         )
-        if self.paths.db_path != old_db:
-            self.engine = make_engine(str(self.paths.db_path))
-            init_db(self.engine)
+        if self.paths.working_db_path != old_db:
+            ensure_separate_databases(str(self.paths.working_db_path), str(self.paths.production_db_path))
+            self.engine = create_working_engine(str(self.paths.working_db_path))
+            self.engine_production = create_production_engine(str(self.paths.production_db_path))
+            init_working_db(self.engine)
+            init_production_db(self.engine_production)
             self.sf = make_session_factory(self.engine)
+            self.sf_production = make_session_factory(self.engine_production)
         # Upozorni, pokud je zapnut jen OpenAI, ale není klíč ani v poli ani v ENV.
         if self.cb_openai_only.isChecked():
             api_inline = self.ed_api_key.text().strip()
@@ -3564,10 +3581,14 @@ class MainWindow(QMainWindow):
 
             # znovu inicializovat engine + processor
             try:
-                self.engine = make_engine(str(self.paths.db_path))
-                init_db(self.engine)
+                ensure_separate_databases(str(self.paths.working_db_path), str(self.paths.production_db_path))
+                self.engine = create_working_engine(str(self.paths.working_db_path))
+                self.engine_production = create_production_engine(str(self.paths.production_db_path))
+                init_working_db(self.engine)
+                init_production_db(self.engine_production)
                 self.sf = make_session_factory(self.engine)
-                self.processor = Processor(self.cfg, self.paths, self.log)
+                self.sf_production = make_session_factory(self.engine_production)
+                self.processor = Processor(self.cfg, self.paths, self.log, self.sf, self.sf_production)
             except Exception as exc:
                 errors.append(f"Reinit po obnově: {exc}")
 
@@ -3674,11 +3695,15 @@ class MainWindow(QMainWindow):
             errors.append(f"Smazání DB souboru: {exc}")
 
         try:
-            self.paths.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self.engine = make_engine(str(self.paths.db_path))
-            init_db(self.engine)
+            self.paths.working_db_path.parent.mkdir(parents=True, exist_ok=True)
+            ensure_separate_databases(str(self.paths.working_db_path), str(self.paths.production_db_path))
+            self.engine = create_working_engine(str(self.paths.working_db_path))
+            self.engine_production = create_production_engine(str(self.paths.production_db_path))
+            init_working_db(self.engine)
+            init_production_db(self.engine_production)
             self.sf = make_session_factory(self.engine)
-            self.processor = Processor(self.cfg, self.paths, self.log)
+            self.sf_production = make_session_factory(self.engine_production)
+            self.processor = Processor(self.cfg, self.paths, self.log, self.sf, self.sf_production)
         except Exception as exc:
             errors.append(f"Init nové DB: {exc}")
 
@@ -4762,15 +4787,16 @@ class MainWindow(QMainWindow):
     def _refresh_documents_page(self, reset: bool):
         self._toggle_doc_dates(self.cb_all_dates.isChecked())
         q, dfrom, dto = self._current_doc_filters()
-        with self.sf() as session:
-            self._doc_total = db_api.count_documents(session, q=q, date_from=dfrom, date_to=dto)
+        with self.sf_production() as prod_session, self.sf() as work_session:
+            self._doc_total = db_api.count_documents(prod_session, q=q, date_from=dfrom, date_to=dto)
             docs = db_api.list_documents(
-                session,
+                prod_session,
                 q=q,
                 date_from=dfrom,
                 date_to=dto,
                 limit=self._doc_page_size,
                 offset=self._doc_offset,
+                working_session=work_session,
             )
 
         shown = min(self._doc_offset + len(docs), self._doc_total)
@@ -5984,14 +6010,14 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-                with self.sf() as session:
-                    c = db_api.counts(session)
-                    # DB počty karanténa/duplikáty (produkční files)
+                with self.sf_production() as prod_session, self.sf() as work_session:
+                    c = db_api.dashboard_counts(prod_session, working_session=work_session)
+                    # DB počty karanténa/duplikáty (working files)
                     try:
-                        q_db = session.execute(
+                        q_db = work_session.execute(
                             select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "QUARANTINE")
                         ).scalar_one()
-                        d_db = session.execute(
+                        d_db = work_session.execute(
                             select(func.count()).select_from(DocumentFile).where(DocumentFile.status == "DUPLICATE")
                         ).scalar_one()
                         quarantine_fs += int(q_db or 0)
@@ -6003,8 +6029,8 @@ class MainWindow(QMainWindow):
                         c["in_waiting"] = in_waiting
                         c["quarantine_fs"] = quarantine_fs
                         c["duplicates_fs"] = duplicates_fs
-                    rs = db_api.run_stats(session)
-                    st = db_api.service_state(session)
+                    rs = db_api.run_stats(prod_session)
+                    st = db_api.service_state(work_session)
                     if st:
                         st_dict = {
                             "running": bool(st.running),
@@ -6016,9 +6042,9 @@ class MainWindow(QMainWindow):
                             "last_success": st.last_success,
                         }
 
-                    # recent average processing time (PROCESSED only; best-effort)
+                    # recent average processing time (PROCESSED only; best-effort) from working queue
                     try:
-                        jobs = session.execute(
+                        jobs = work_session.execute(
                             select(ImportJob.started_at, ImportJob.finished_at)
                             .where(ImportJob.status == "PROCESSED")
                             .where(ImportJob.started_at.is_not(None))
@@ -6098,3 +6124,9 @@ class MainWindow(QMainWindow):
             self._dash_refresh_inflight = False
 
         _SilentRunner.run(self, work, done, err, timeout_ms=12000)
+
+
+
+
+
+

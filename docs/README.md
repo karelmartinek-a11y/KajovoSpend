@@ -68,6 +68,18 @@ copy config.example.yaml config.yaml
 
 3) Inicializace DB proběhne automaticky při startu GUI.
 
+### Dual-DB režim
+- Aplikace používá dva fyzické SQLite soubory: **working DB** pro frontu/import/karanténu a **production DB** pro obchodní data (dashboard, statistiky, seznamy dokladů a položek).
+- Výchozí cesty: `KajovoSpend/kajovospend-working.sqlite` a `kajovospend-working-production.sqlite` (odvozeno z legacy `db_path`). Cesty lze nastavit v `config.yaml` (`app.working_db_path`, `app.production_db_path`).
+- Guard brání tomu, aby oba soubory ukazovaly na stejnou cestu; dashboard/business dotazy čtou vždy z production DB, workflow/ops z working DB.
+
+## Lokální testy
+- Unit testy: `PYTHONPATH=src pytest tests/unit`
+- Integration + migrace: `PYTHONPATH=src pytest tests/integration`
+- Dual-DB/forensic guard: `PYTHONPATH=src pytest tests/integration/test_dual_db_dashboard_reads.py`
+- Kompletní rychlý běh: `PYTHONPATH=src pytest tests`
+- CI aktuálně běží na Pythonu 3.11 a 3.12 (na 3.13 chybí binární wheel pro pandas 2.2.x; až bude dostupný, můžeme matrix rozšířit).
+
 ## Spuštění
 
 ```powershell
