@@ -6,6 +6,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from .base import Base
+from .working_models import BaseWorking
+from .production_models import BaseProduction
 
 
 FTS_DOCS = """
@@ -402,3 +404,15 @@ def init_db(engine: Engine) -> None:
                 """
             )
         )
+
+
+def init_working_db(engine: Engine) -> None:
+    """Create working DB schema (workflow/operational)."""
+    BaseWorking.metadata.create_all(engine)
+    # working DB intentionally omits FTS; keep lean for workflow.
+
+
+def init_production_db(engine: Engine) -> None:
+    """Create production DB schema (business/reporting) including FTS tables."""
+    BaseProduction.metadata.create_all(engine)
+    _ensure_columns_and_indexes(engine)

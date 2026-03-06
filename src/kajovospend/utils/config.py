@@ -37,3 +37,11 @@ def deep_set(d: Dict[str, Any], keys: list[str], value: Any) -> None:
             cur[k] = {}
         cur = cur[k]
     cur[keys[-1]] = value
+
+
+def extract_db_paths(cfg: Dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return working_db_path, production_db_path with backward compatibility for legacy app.db_path."""
+    app_cfg = cfg.get("app", {}) if isinstance(cfg, dict) else {}
+    working = app_cfg.get("working_db_path") or app_cfg.get("db_path")
+    production = app_cfg.get("production_db_path")
+    return working, production

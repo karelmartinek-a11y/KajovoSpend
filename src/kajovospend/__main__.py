@@ -29,6 +29,7 @@ def main() -> int:
         return run_gui_mod.main()
 
     # Fallback: nabídni uživateli informaci, proč start selhal.
+    # Dual-DB bootstrap je řešen uvnitř run_gui.py; pokud chybí, raději fail-fast.
     raise RuntimeError(
         "Nenalezl jsem soubor run_gui.py. Spusť prosím příkaz z kořene repozitáře "
         "nebo nainstaluj aplikaci v editable režimu (pip install -e .)."

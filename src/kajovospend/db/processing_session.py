@@ -11,6 +11,7 @@ from sqlalchemy.exc import SADeprecationWarning
 from sqlalchemy.orm import sessionmaker
 
 from kajovospend.db.processing_models import BaseProcessing
+# Processing DB remains separate from working/production split; unchanged schema.
 
 
 def _processing_db_path(cfg) -> Path:

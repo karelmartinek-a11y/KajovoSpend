@@ -1,34 +1,31 @@
 from __future__ import annotations
 
 import datetime as dt
+from typing import List
+
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Index
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from kajovospend.utils.time import utc_now_naive
 
-# NOTE: Legacy single-DB models. Dual-DB rollout introduces separate schemas in
-# working_models.py and production_models.py; keep this file for backward compatibility
-# during transition. New code should prefer the split models.
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Index
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from typing import List
 
-from .base import Base
+class BaseWorking(DeclarativeBase):
+    pass
 
 
-class Supplier(Base):
+class Supplier(BaseWorking):
     __tablename__ = "suppliers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # Canonical IČO (usually 8 digits, but we store whatever upstream provides)
     ico: Mapped[str] = mapped_column(String(32), unique=True, index=True)
-    # Normalized IČO used for fast matching (digits-only, left padded to 8 where applicable)
     ico_norm: Mapped[str | None] = mapped_column(String(16), unique=True, index=True, nullable=True)
     dic: Mapped[str | None] = mapped_column(String(32), nullable=True)
     name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     legal_form: Mapped[str | None] = mapped_column(String(256), nullable=True)
     address: Mapped[str | None] = mapped_column(String(512), nullable=True)
     street: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    street_number: Mapped[str | None] = mapped_column(String(32), nullable=True)          # cislo popisne
-    orientation_number: Mapped[str | None] = mapped_column(String(32), nullable=True)     # cislo orientacni
+    street_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    orientation_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
     city: Mapped[str | None] = mapped_column(String(128), nullable=True)
     zip_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
     is_vat_payer: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
@@ -38,7 +35,7 @@ class Supplier(Base):
     documents: Mapped[List["Document"]] = relationship(back_populates="supplier")  # type: ignore[name-defined]
 
 
-class DocumentFile(Base):
+class DocumentFile(BaseWorking):
     __tablename__ = "files"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -47,16 +44,15 @@ class DocumentFile(Base):
     mime_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     pages: Mapped[int] = mapped_column(Integer, default=1)
     current_path: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(24), index=True)  # NEW/PROCESSED/QUARANTINE/DUPLICATE/ERROR
+    status: Mapped[str] = mapped_column(String(24), index=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utc_now_naive)
     processed_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
-    # one file can contain multiple documents (e.g., multiple receipts in one PDF)
     documents: Mapped[List["Document"]] = relationship(back_populates="file", cascade="all, delete-orphan")  # type: ignore[name-defined]
 
 
-class Document(Base):
+class Document(BaseWorking):
     __tablename__ = "documents"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -71,16 +67,14 @@ class Document(Base):
     total_without_vat: Mapped[float | None] = mapped_column(Float, nullable=True)
     total_vat_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
     vat_breakdown_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    doc_type: Mapped[str | None] = mapped_column(String(16), nullable=True)  # invoice/receipt
+    doc_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
     processing_profile: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # page range within the original file (1-based, inclusive)
     page_from: Mapped[int] = mapped_column(Integer, default=1)
     page_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
     currency: Mapped[str] = mapped_column(String(8), default="CZK")
 
     extraction_confidence: Mapped[float] = mapped_column(Float, default=0.0)
-    extraction_method: Mapped[str] = mapped_column(String(16), default="offline")  # offline/openai/manual
-    # aggregated quality of chosen per-page text (0..1)
+    extraction_method: Mapped[str] = mapped_column(String(16), default="offline")
     document_text_quality: Mapped[float] = mapped_column(Float, default=0.0)
     openai_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
     openai_raw_response: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -95,63 +89,15 @@ class Document(Base):
     items: Mapped[List["LineItem"]] = relationship(back_populates="document", cascade="all, delete-orphan")  # type: ignore[name-defined]
 
     __table_args__ = (
-        Index("ix_documents_issue_date", "issue_date"),
-        Index("ix_documents_file_page", "file_id", "page_from", "page_to"),
+        Index("ix_w_documents_issue_date", "issue_date"),
+        Index("ix_w_documents_file_page", "file_id", "page_from", "page_to"),
     )
 
 
-class StandardReceiptTemplate(Base):
-    __tablename__ = "standard_receipt_templates"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    match_supplier_ico_norm: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    match_texts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    schema_json: Mapped[str] = mapped_column(Text, nullable=False)
-    sample_file_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    sample_file_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    sample_file_relpath: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utc_now_naive)
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
-
-    __table_args__ = (
-        Index("idx_standard_receipt_templates_enabled", "enabled"),
-        Index("idx_standard_receipt_templates_match_supplier_ico_norm", "match_supplier_ico_norm"),
-        Index("idx_standard_receipt_templates_name", "name"),
-    )
-
-
-class DocumentPageAudit(Base):
-    __tablename__ = "document_page_audit"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
-    file_id: Mapped[int] = mapped_column(ForeignKey("files.id", ondelete="CASCADE"), index=True)
-
-    page_no: Mapped[int] = mapped_column(Integer)  # 1-based
-    chosen_mode: Mapped[str] = mapped_column(String(16))  # embedded/ocr
-
-    chosen_score: Mapped[float] = mapped_column(Float, default=0.0)
-    embedded_score: Mapped[float] = mapped_column(Float, default=0.0)
-    ocr_score: Mapped[float] = mapped_column(Float, default=0.0)
-
-    embedded_len: Mapped[int] = mapped_column(Integer, default=0)
-    ocr_len: Mapped[int] = mapped_column(Integer, default=0)
-    ocr_conf: Mapped[float] = mapped_column(Float, default=0.0)
-    token_groups: Mapped[int] = mapped_column(Integer, default=0)
-
-    __table_args__ = (
-        UniqueConstraint("document_id", "page_no", name="uq_page_audit_doc_page"),
-        Index("ix_page_audit_file_page", "file_id", "page_no"),
-    )
-
-
-class LineItem(Base):
+class LineItem(BaseWorking):
     __tablename__ = "items"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # Produkční identifikátor (zpětná kompatibilita s původní DB); může být shodný s id.
     id_item: Mapped[int | None] = mapped_column(Integer, unique=True, index=True, nullable=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"), index=True)
     line_no: Mapped[int] = mapped_column(Integer)
@@ -172,12 +118,10 @@ class LineItem(Base):
 
     document: Mapped[Document] = relationship(back_populates="items")
 
-    __table_args__ = (
-        UniqueConstraint("document_id", "line_no", name="uq_items_doc_line"),
-    )
+    __table_args__ = (UniqueConstraint("document_id", "line_no", name="uq_w_items_doc_line"),)
 
 
-class ImportJob(Base):
+class ImportJob(BaseWorking):
     __tablename__ = "import_jobs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -188,11 +132,11 @@ class ImportJob(Base):
 
     path: Mapped[str] = mapped_column(Text)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    status: Mapped[str] = mapped_column(String(24), index=True)  # QUEUED/RUNNING/DONE/ERROR/DUPLICATE/QUARANTINE
+    status: Mapped[str] = mapped_column(String(24), index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-class ServiceState(Base):
+class ServiceState(BaseWorking):
     __tablename__ = "service_state"
 
     singleton: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
@@ -202,14 +146,12 @@ class ServiceState(Base):
     last_error_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     queue_size: Mapped[int] = mapped_column(Integer, default=0)
     last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
-
-    # dashboard / observability
-    inflight: Mapped[int] = mapped_column(Integer, default=0)                 # futures currently running
-    max_workers: Mapped[int] = mapped_column(Integer, default=0)              # configured worker pool size
+    inflight: Mapped[int] = mapped_column(Integer, default=0)
+    max_workers: Mapped[int] = mapped_column(Integer, default=0)
     current_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     current_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-    current_phase: Mapped[str | None] = mapped_column(String(32), nullable=True)   # idle/scanning/dispatching/processing/shutdown
-    current_progress: Mapped[float | None] = mapped_column(Float, nullable=True)  # 0..100 best-effort
+    current_phase: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    current_progress: Mapped[float | None] = mapped_column(Float, nullable=True)
     heartbeat_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     stuck: Mapped[bool] = mapped_column(Boolean, default=False)
     stuck_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

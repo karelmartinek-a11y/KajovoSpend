@@ -14,8 +14,11 @@ if str(SRC_DIR) not in sys.path:
 from kajovospend.utils.config import load_yaml
 from kajovospend.utils.paths import resolve_app_paths, default_data_dir
 from kajovospend.utils.logging_setup import setup_logging
-from kajovospend.db.session import make_engine, make_session_factory
-from kajovospend.db.migrate import init_db
+from kajovospend.db.session import make_session_factory
+from kajovospend.db.migrate import init_working_db, init_production_db
+from kajovospend.db.dual_db_guard import ensure_separate_databases, DualDbConfigError
+from kajovospend.db.working_session import create_working_engine
+from kajovospend.db.production_session import create_production_engine
 from kajovospend.service.app import ServiceApp
 from kajovospend.service.control import ControlContext, ControlServer
 from kajovospend.service.sync_ares import sync_pending_suppliers
@@ -50,12 +53,17 @@ def main() -> int:
         cfg["app"].get("db_path"),
         cfg["app"].get("log_dir"),
         cfg.get("ocr", {}).get("models_dir"),
+        working_db=cfg["app"].get("working_db_path"),
+        production_db=cfg["app"].get("production_db_path"),
     )
+    ensure_separate_databases(str(paths.working_db_path), str(paths.production_db_path))
     log = setup_logging(paths.log_dir, name="kajovospend_service")
 
-    engine = make_engine(str(paths.db_path))
-    init_db(engine)
-    sf = make_session_factory(engine)
+    w_engine = create_working_engine(paths.working_db_path)
+    p_engine = create_production_engine(paths.production_db_path)
+    init_working_db(w_engine)
+    init_production_db(p_engine)
+    sf = make_session_factory(w_engine)
 
     if args.command == "sync-ares":
         ttl_hours = float(cfg.get("ares", {}).get("ttl_hours", 24.0) or 24.0)
