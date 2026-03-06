@@ -40,6 +40,12 @@ jobs:
       - name: Unit tests
         run: pytest tests/unit
 
+      - name: Root regression guards
+        run: |
+          pytest tests/test_forensic_logging.py
+          pytest tests/test_json_schema_defaults.py
+          pytest tests/test_openai_schema_invariants.py
+
       - name: Integration + dual-DB guards
         run: pytest tests/integration
 

@@ -77,6 +77,11 @@ copy config.example.yaml config.yaml
 - Unit testy: `PYTHONPATH=src pytest tests/unit`
 - Integration + migrace: `PYTHONPATH=src pytest tests/integration`
 - Dual-DB/forensic guard: `PYTHONPATH=src pytest tests/integration/test_dual_db_dashboard_reads.py`
+- Receipt/OpenAI regressní guard:
+  - `PYTHONPATH=src pytest tests/unit/test_openai_mode_gating.py`
+  - `PYTHONPATH=src pytest tests/unit/test_openai_fallback_retry.py tests/unit/test_openai_truncation_retry.py tests/unit/test_openai_parse_recovery.py`
+  - `PYTHONPATH=src pytest tests/unit/test_supplier_gate.py tests/unit/test_forensic_openai_linkage.py`
+  - `PYTHONPATH=src pytest tests/test_forensic_logging.py tests/test_json_schema_defaults.py tests/test_openai_schema_invariants.py`
 - Kompletní rychlý běh: `PYTHONPATH=src pytest tests`
 - CI aktuálně běží na Pythonu 3.11 a 3.12 (na 3.13 chybí binární wheel pro pandas 2.2.x; až bude dostupný, můžeme matrix rozšířit).
 
