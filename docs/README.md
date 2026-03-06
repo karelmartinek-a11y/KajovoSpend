@@ -78,6 +78,7 @@ copy config.example.yaml config.yaml
 - Integration + migrace: `PYTHONPATH=src pytest tests/integration`
 - Dual-DB/forensic guard: `PYTHONPATH=src pytest tests/integration/test_dual_db_dashboard_reads.py`
 - Kompletní rychlý běh: `PYTHONPATH=src pytest tests`
+- CI aktuálně běží na Pythonu 3.11 a 3.12 (na 3.13 chybí binární wheel pro pandas 2.2.x; až bude dostupný, můžeme matrix rozšířit).
 
 ## Spuštění
 
