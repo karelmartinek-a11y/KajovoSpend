@@ -24,20 +24,50 @@ def _supplier_complete() -> Supplier:
 
 
 def test_supplier_gate_accepts_complete_supplier() -> None:
-    ok, missing = Processor._supplier_details_complete(_supplier_complete())
+    ok, missing_blockers, missing_soft = Processor._supplier_details_complete(_supplier_complete())
     assert ok is True
-    assert missing == []
+    assert missing_blockers == []
+    assert missing_soft == []
 
 
-def test_supplier_gate_rejects_missing_supplier_details() -> None:
+def test_supplier_gate_rejects_missing_ico() -> None:
     s = _supplier_complete()
-    s.city = None
-    s.legal_form = None
-    s.is_vat_payer = None
+    s.ico = None
 
-    ok, missing = Processor._supplier_details_complete(s)
+    ok, missing_blockers, missing_soft = Processor._supplier_details_complete(s)
 
     assert ok is False
-    assert "město" in missing
-    assert "právní forma" in missing
-    assert "status plátce DPH" in missing
+    assert "IČO" in missing_blockers
+    assert missing_soft == []
+
+
+def test_supplier_gate_rejects_missing_name() -> None:
+    s = _supplier_complete()
+    s.name = " "
+
+    ok, missing_blockers, _missing_soft = Processor._supplier_details_complete(s)
+
+    assert ok is False
+    assert "název" in missing_blockers
+
+
+def test_supplier_gate_missing_ares_sync_is_soft_review_only() -> None:
+    s = _supplier_complete()
+    s.ares_last_sync = None
+
+    ok, missing_blockers, missing_soft = Processor._supplier_details_complete(s)
+
+    assert ok is True
+    assert missing_blockers == []
+    assert "ARES synchronizace" in missing_soft
+
+
+def test_supplier_gate_missing_vat_status_is_soft_review_only() -> None:
+    s = _supplier_complete()
+    s.is_vat_payer = None
+
+    ok, missing_blockers, missing_soft = Processor._supplier_details_complete(s)
+
+    assert ok is True
+    assert missing_blockers == []
+    assert "status plátce DPH" in missing_soft

@@ -24,6 +24,7 @@ class OpenAIConfig:
     use_json_schema: bool = True
     temperature: float = 0.0
     max_output_tokens: int = 2000
+    forensic_fields: Dict[str, Any] | None = None
 
 
 _MODEL_CACHE: dict[str, Any] = {"ts": 0.0, "ids": []}
@@ -406,6 +407,135 @@ def _extract_output_text(data: Dict[str, Any]) -> str:
     return text
 
 
+def _parse_json_first_last_brace(text: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    start = text.find("{")
+    end = text.rfind("}")
+    meta: Dict[str, Any] = {
+        "strategy": "first_last_brace",
+        "start": start,
+        "end": end,
+        "length": len(text or ""),
+        "error": None,
+    }
+    if start == -1 or end == -1 or end <= start:
+        meta["error"] = "no_braces"
+        return None, meta
+    fragment = text[start:end + 1]
+    try:
+        parsed = json.loads(fragment)
+    except Exception as exc:
+        meta["error"] = str(exc)
+        return None, meta
+    if not isinstance(parsed, dict):
+        meta["error"] = "json_not_object"
+        return None, meta
+    return parsed, meta
+
+
+def _iter_balanced_object_fragments(text: str) -> List[Tuple[int, int, str]]:
+    fragments: List[Tuple[int, int, str]] = []
+    if not text:
+        return fragments
+    in_string = False
+    escape = False
+    depth = 0
+    start_idx: Optional[int] = None
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start_idx = idx
+            depth += 1
+            continue
+        if ch == "}":
+            if depth <= 0:
+                continue
+            depth -= 1
+            if depth == 0 and start_idx is not None:
+                end_idx = idx
+                fragment = text[start_idx:end_idx + 1]
+                fragments.append((start_idx, end_idx, fragment))
+                start_idx = None
+    # try larger fragments first
+    fragments.sort(key=lambda item: (item[1] - item[0]), reverse=True)
+    return fragments
+
+
+def _parse_json_balanced_objects(text: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    last_error = "no_balanced_object"
+    for start, end, fragment in _iter_balanced_object_fragments(text):
+        try:
+            parsed = json.loads(fragment)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        if isinstance(parsed, dict):
+            return parsed, {
+                "strategy": "balanced_object_scan",
+                "start": start,
+                "end": end,
+                "length": len(text or ""),
+                "error": None,
+            }
+        last_error = "json_not_object"
+    return None, {
+        "strategy": "balanced_object_scan",
+        "start": -1,
+        "end": -1,
+        "length": len(text or ""),
+        "error": last_error,
+    }
+
+
+def _parse_openai_output_json(text: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    parsed, meta = _parse_json_first_last_brace(text)
+    if parsed is not None:
+        return parsed, meta
+    parsed2, meta2 = _parse_json_balanced_objects(text)
+    if parsed2 is not None:
+        return parsed2, meta2
+    return None, meta2
+
+
+def _should_retry_after_parse_fail(*, usage: Dict[str, Any], max_output_tokens: int, parse_status: str) -> bool:
+    if parse_status != "fail":
+        return False
+    try:
+        out_tokens = int((usage or {}).get("output_tokens") or 0)
+    except Exception:
+        return False
+    if max_output_tokens <= 0:
+        return False
+    return out_tokens >= max_output_tokens
+
+
+def _next_max_output_tokens(current: int) -> int:
+    base = max(1, int(current or 1))
+    # conservative step-up to limit costs while avoiding immediate truncation repeats
+    return min(8000, max(base + 1000, int(base * 1.5)))
+
+
+def _forensic_seed_fields(source: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Only keep stable linkage fields so phase/mode can still be set locally."""
+    src = source or {}
+    out: Dict[str, Any] = {}
+    for key in ("correlation_id", "document_id", "file_sha256", "job_id"):
+        val = src.get(key)
+        if val is not None:
+            out[key] = val
+    return out
+
+
 def ensure_schema_defaults(obj: Dict[str, Any]) -> Dict[str, Any]:
     """
     Doplňuje chybějící klíče dle _JSON_SCHEMA na výchozí hodnoty (null/{} / [] podle typu).
@@ -450,7 +580,16 @@ def ensure_schema_defaults(obj: Dict[str, Any]) -> Dict[str, Any]:
     return filled
 
 
-def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: str, attempt: int, api_key: str) -> Tuple[requests.Response, float, Optional[str], Optional[str], str]:
+def _openai_post_responses(
+    payload: Dict[str, Any],
+    *,
+    timeout: int,
+    log,
+    mode: str,
+    attempt: int,
+    api_key: str,
+    forensic_linkage: Dict[str, Any] | None = None,
+) -> Tuple[requests.Response, float, Optional[str], Optional[str], str]:
     """
     Vykoná jeden HTTP POST na /v1/responses, zaloguje openai.request + případný openai.error.
     Vrací (response, latency_ms, response_body_hash, openai_request_id, openai_request_id_client).
@@ -501,6 +640,7 @@ def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: 
         pass
 
     with forensic_scope(openai_request_id_client=req_id_client, attempt=attempt, mode=mode):
+        linkage = _forensic_seed_fields(forensic_linkage)
         log_event(
             log,
             "openai.request",
@@ -517,6 +657,10 @@ def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: 
             attachments=attachments_meta,
             request_body_hash=body_hash,
             openai_request_id_client=req_id_client,
+            correlation_id=linkage.get("correlation_id"),
+            file_sha256=linkage.get("file_sha256"),
+            job_id=linkage.get("job_id"),
+            document_id=linkage.get("document_id"),
         )
 
         start = time.perf_counter()
@@ -553,6 +697,10 @@ def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: 
                     safe_excerpt=(err_msg or "")[:500] if err_msg else None,
                     openai_request_id=openai_request_id,
                     openai_request_id_client=req_id_client,
+                    correlation_id=linkage.get("correlation_id"),
+                    file_sha256=linkage.get("file_sha256"),
+                    job_id=linkage.get("job_id"),
+                    document_id=linkage.get("document_id"),
                 )
             return r, latency_ms, resp_hash, openai_request_id, req_id_client
         except requests.RequestException as exc:
@@ -573,6 +721,10 @@ def _openai_post_responses(payload: Dict[str, Any], *, timeout: int, log, mode: 
                 safe_excerpt=(err_msg or "")[:500],
                 openai_request_id=getattr(resp, "headers", {}).get("x-request-id") if resp is not None else None,
                 openai_request_id_client=req_id_client,
+                correlation_id=linkage.get("correlation_id"),
+                file_sha256=linkage.get("file_sha256"),
+                job_id=linkage.get("job_id"),
+                document_id=linkage.get("document_id"),
             )
             raise
 
@@ -588,6 +740,7 @@ def _openai_post_with_retry(
     log,
     mode: str,
     api_key: str,
+    forensic_linkage: Dict[str, Any] | None = None,
     attempt_start: int = 1,
     max_retries: int = _MAX_HTTP_RETRIES,
 ) -> Tuple[requests.Response, float, Optional[str], Optional[str], str, int]:
@@ -601,6 +754,7 @@ def _openai_post_with_retry(
                 mode=mode,
                 attempt=attempt,
                 api_key=api_key,
+                forensic_linkage=forensic_linkage,
             )
         except requests.RequestException:
             if attempt - attempt_start >= max_retries:
@@ -697,6 +851,7 @@ def _run_responses_flow(
     status_cb=None,
 ) -> Tuple[Optional[Dict[str, Any]], str, str]:
     log = logging.getLogger(__name__)
+    forensic_linkage = _forensic_seed_fields(cfg.forensic_fields) or _forensic_seed_fields(get_forensic_fields())
     if cfg.use_json_schema:
         validate_schema_invariants_or_raise(_OPENAI_JSON_SCHEMA, log=log)
     model = _resolve_model(cfg.api_key, cfg.model if mode == "primary" else (cfg.fallback_model or cfg.model), _MODEL_PREFER_PRIMARY if mode == "primary" else _MODEL_PREFER_FALLBACK)
@@ -728,7 +883,7 @@ def _run_responses_flow(
         except Exception:
             pass
     resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt = _openai_post_with_retry(
-        payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, attempt_start=attempt
+        payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, forensic_linkage=forensic_linkage, attempt_start=attempt
     )
     if status_cb:
         try:
@@ -777,7 +932,7 @@ def _run_responses_flow(
             payload["text"] = {"format": {"type": "json_object"}}
             attempt += 1
             resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt = _openai_post_with_retry(
-                payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, attempt_start=attempt
+                payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, forensic_linkage=forensic_linkage, attempt_start=attempt
             )
     resp.raise_for_status()
 
@@ -791,33 +946,68 @@ def _run_responses_flow(
     if not text:
         text = str(data)
     len_raw = len(text or "")
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    req_max_output_tokens = int(payload.get("max_output_tokens") or int(cfg.max_output_tokens or 2000))
+    parse_retry_used = False
 
-    start = text.find("{")
-    end = text.rfind("}")
-    obj = None
-    parse_status = "fail"
-    parse_error = None
-    if start != -1 and end != -1 and end > start:
-        fragment = text[start:end + 1]
-        try:
-            obj = json.loads(fragment)
-            parse_status = "ok"
-        except Exception as e:
-            parse_error = str(e)
-    else:
-        parse_error = "no_braces"
+    obj, parse_meta = _parse_openai_output_json(text)
+    parse_status = "ok" if isinstance(obj, dict) else "fail"
+    parse_strategy = str(parse_meta.get("strategy") or "unknown")
+    parse_error = parse_meta.get("error")
+    parse_start_raw = parse_meta.get("start", -1)
+    parse_end_raw = parse_meta.get("end", -1)
+    parse_start = int(parse_start_raw if isinstance(parse_start_raw, int) else -1)
+    parse_end = int(parse_end_raw if isinstance(parse_end_raw, int) else -1)
+
+    if _should_retry_after_parse_fail(usage=usage, max_output_tokens=req_max_output_tokens, parse_status=parse_status):
+        next_tokens = _next_max_output_tokens(req_max_output_tokens)
+        if next_tokens > req_max_output_tokens:
+            log_event(
+                log,
+                "openai.retry",
+                "OpenAI retry after parse fail on output token cap",
+                attempt_from=attempt,
+                attempt_to=attempt + 1,
+                reason="parse_fail_output_token_cap",
+                backoff_ms=0,
+                old_max_output_tokens=req_max_output_tokens,
+                new_max_output_tokens=next_tokens,
+            )
+            payload["max_output_tokens"] = next_tokens
+            attempt += 1
+            parse_retry_used = True
+            resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt = _openai_post_with_retry(
+                payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, forensic_linkage=forensic_linkage, attempt_start=attempt
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = _extract_output_text(data)
+            if not text:
+                text = str(data)
+            len_raw = len(text or "")
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+            obj, parse_meta = _parse_openai_output_json(text)
+            parse_status = "ok" if isinstance(obj, dict) else "fail"
+            parse_strategy = str(parse_meta.get("strategy") or "unknown")
+            parse_error = parse_meta.get("error")
+            parse_start_raw = parse_meta.get("start", -1)
+            parse_end_raw = parse_meta.get("end", -1)
+            parse_start = int(parse_start_raw if isinstance(parse_start_raw, int) else -1)
+            parse_end = int(parse_end_raw if isinstance(parse_end_raw, int) else -1)
+            req_max_output_tokens = int(payload.get("max_output_tokens") or req_max_output_tokens)
 
     log_event(
         log,
         "structured_output.parse",
         "Structured output parse",
         status=parse_status,
-        strategy="first_last_brace",
-        start=start,
-        end=end,
+        strategy=parse_strategy,
+        start=parse_start,
+        end=parse_end,
         length=len_raw,
         error=parse_error,
-        json_extract_strategy="first_last_brace",
+        json_extract_strategy=parse_strategy,
+        parse_retry_used=parse_retry_used,
     )
 
     validation_errors: List[str] = []
@@ -845,8 +1035,15 @@ def _run_responses_flow(
         openai_request_id_client=req_id_client,
         extracted_output_text_length=len(text or ""),
         len_raw=len_raw,
-        usage=data.get("usage"),
+        usage=usage,
         parse_status=parse_status,
+        parse_strategy=parse_strategy,
+        parse_retry_used=parse_retry_used,
+        request_max_output_tokens=req_max_output_tokens,
+        correlation_id=forensic_linkage.get("correlation_id"),
+        file_sha256=forensic_linkage.get("file_sha256"),
+        job_id=forensic_linkage.get("job_id"),
+        document_id=forensic_linkage.get("document_id"),
     )
     if status_cb:
         try:

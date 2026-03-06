@@ -9,6 +9,7 @@ import uuid
 from dateutil import parser as dtparser
 import re
 import hashlib
+import unicodedata
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
@@ -56,7 +57,7 @@ from kajovospend.utils.hashing import sha256_file
 from kajovospend.utils.text_quality import compute_text_quality, summarize_text_quality, text_quality_score
 from kajovospend.utils.qr_spayd import decode_qr_from_pil, parse_spayd
 from kajovospend.utils.iban import normalize_iban, is_valid_iban
-from kajovospend.utils.forensic_context import forensic_scope, new_correlation_id
+from kajovospend.utils.forensic_context import forensic_scope, new_correlation_id, get_forensic_fields
 from kajovospend.utils.logging_setup import log_event
 
 
@@ -218,12 +219,17 @@ class Processor:
             return
 
     @staticmethod
-    def _supplier_details_complete(supplier: Supplier | None) -> tuple[bool, list[str]]:
-        """Tvrdé pravidlo: bez kompletních detailů dodavatele nesmí doklad do produkční DB."""
+    def _supplier_details_complete(supplier: Supplier | None) -> tuple[bool, list[str], list[str]]:
+        """
+        Supplier gate policy:
+        - blocker fields: without these the document is blocked
+        - soft fields: missing values are review reasons only (non-blocking)
+        """
         if supplier is None:
-            return False, ["chybí dodavatel"]
+            return False, ["chybí dodavatel"], []
 
-        missing: list[str] = []
+        missing_blockers: list[str] = []
+        missing_soft: list[str] = []
 
         def _is_missing(value: Any) -> bool:
             if value is None:
@@ -232,9 +238,11 @@ class Processor:
                 return True
             return False
 
-        required_fields: list[tuple[str, Any]] = [
+        blocker_fields: list[tuple[str, Any]] = [
             ("IČO", getattr(supplier, "ico", None)),
             ("název", getattr(supplier, "name", None)),
+        ]
+        soft_fields: list[tuple[str, Any]] = [
             ("adresa", getattr(supplier, "address", None)),
             ("ulice", getattr(supplier, "street", None)),
             ("číslo popisné", getattr(supplier, "street_number", None)),
@@ -243,14 +251,20 @@ class Processor:
             ("právní forma", getattr(supplier, "legal_form", None)),
             ("ARES synchronizace", getattr(supplier, "ares_last_sync", None)),
         ]
-        for label, value in required_fields:
+        for label, value in blocker_fields:
             if _is_missing(value):
-                missing.append(label)
+                missing_blockers.append(label)
+        for label, value in soft_fields:
+            if _is_missing(value):
+                missing_soft.append(label)
 
         if getattr(supplier, "is_vat_payer", None) is None:
-            missing.append("status plátce DPH")
+            missing_soft.append("status plátce DPH")
 
-        return len(missing) == 0, missing
+        # stable deterministic ordering + dedup
+        missing_blockers = list(dict.fromkeys(missing_blockers))
+        missing_soft = list(dict.fromkeys(missing_soft))
+        return len(missing_blockers) == 0, missing_blockers, missing_soft
     
     def _validate_extracted(self, extracted) -> None:
         """Dodatečné validace (např. IBAN checksum). Nic nehazí."""
@@ -1242,14 +1256,74 @@ class Processor:
                 pass
         return "R-" + "-".join(parts)
 
+    @staticmethod
+    def _resolve_openai_runtime_flags(
+        openai_cfg: Dict[str, Any] | None,
+        features_cfg: Dict[str, Any] | None,
+        *,
+        api_key: str,
+        backend_available: bool,
+    ) -> Dict[str, bool]:
+        """Normalize OpenAI runtime switches so primary/fallback gates stay explicit."""
+        cfg = openai_cfg or {}
+        features = features_cfg or {}
+        openai_only = bool(cfg.get("only_openai", False))
+        primary_enabled = bool(cfg.get("primary_enabled", True))
+        fallback_enabled = bool(cfg.get("fallback_enabled", True))
+        auto_enable = bool(cfg.get("auto_enable", True))
+        explicit_enabled = bool(cfg.get("enabled"))
+        legacy_feature_enabled = bool((features.get("openai_fallback", {}) or {}).get("enabled", False))
+        has_api_key = bool(sanitize_openai_api_key(api_key or ""))
+        openai_master_enabled = bool(explicit_enabled or auto_enable or legacy_feature_enabled)
+        openai_available = bool(backend_available and has_api_key and openai_master_enabled)
+        return {
+            "openai_only": openai_only,
+            "primary_enabled": primary_enabled,
+            "fallback_enabled": fallback_enabled,
+            "auto_enable": auto_enable,
+            "explicit_enabled": explicit_enabled,
+            "legacy_feature_enabled": legacy_feature_enabled,
+            "has_api_key": has_api_key,
+            "openai_master_enabled": openai_master_enabled,
+            "openai_available": openai_available,
+            "primary_allowed": bool(openai_available and primary_enabled),
+            "fallback_allowed": bool(openai_available and fallback_enabled),
+        }
+
+    @staticmethod
+    def _openai_only_mode_notes(
+        *,
+        openai_only: bool,
+        has_api_key: bool,
+        openai_enabled: bool,
+        primary_enabled: bool,
+        fallback_enabled: bool,
+    ) -> List[str]:
+        if not openai_only:
+            return []
+        notes: List[str] = []
+        if not has_api_key:
+            notes.append("OpenAI only režim: chybí API key – online extrakce přeskočena")
+        elif not openai_enabled:
+            notes.append("OpenAI only režim: OpenAI není povoleno (enabled/auto_enable/feature) nebo backend není dostupný")
+        if not primary_enabled and not fallback_enabled:
+            notes.append("OpenAI only režim: primary i fallback větev jsou vypnuté")
+        return notes
+
     def _prune_receipt_reasons(self, reasons: List[str]) -> List[str]:
         """U uctenek nechame duvody zobrazeny, skryjeme jen obecne duplicitni hlasky."""
+        def _norm(txt: str) -> str:
+            raw = str(txt or "").strip().lower()
+            raw = unicodedata.normalize("NFKD", raw)
+            raw = "".join(ch for ch in raw if not unicodedata.combining(ch))
+            return re.sub(r"\s+", " ", raw)
+
         drop = {
             "nekompletni vytezeni",
         }
         out: List[str] = []
         for r in reasons or []:
-            rr = str(r or "")
+            rr = _norm(str(r or ""))
             if rr in drop:
                 continue
             out.append(r)
@@ -1692,11 +1766,18 @@ class Processor:
             self._validate_extracted(extracted)
 
             api_key = sanitize_openai_api_key(openai_cfg.get("api_key") or os.getenv("KAJOVOSPEND_OPENAI_API_KEY", ""))
-            auto_enable = bool(openai_cfg.get("auto_enable", True))
             features = (self.cfg.get("features") or {}) if isinstance(self.cfg, dict) else {}
-            openai_feature_enabled = bool((features.get("openai_fallback", {}) or {}).get("enabled", False))
-            openai_enabled = bool((openai_feature_enabled or openai_only) and (OpenAIConfig is not None) and api_key and (openai_cfg.get("enabled") or auto_enable))
-            primary_enabled = bool(openai_cfg.get("primary_enabled", True))
+            openai_flags = self._resolve_openai_runtime_flags(
+                openai_cfg,
+                features,
+                api_key=api_key,
+                backend_available=OpenAIConfig is not None and extract_with_openai is not None and extract_with_openai_fallback is not None,
+            )
+            openai_enabled = bool(openai_flags["openai_available"])
+            primary_enabled = bool(openai_flags["primary_enabled"])
+            fallback_enabled = bool(openai_flags["fallback_enabled"])
+            primary_allowed = bool(openai_flags["primary_allowed"])
+            fallback_allowed = bool(openai_flags["fallback_allowed"])
             openai_model = str(openai_cfg.get("model") or "auto").strip() or "auto"
             fallback_model = str(openai_cfg.get("fallback_model") or "").strip() or None
             use_json_schema = bool(openai_cfg.get("use_json_schema", True))
@@ -1709,31 +1790,35 @@ class Processor:
 
             try:
                 self.log.info(
-                    "OpenAI cfg | only=%s enabled=%s primary=%s fallback_flag=%s api=%s… env=%s…",
+                    "OpenAI cfg | only=%s openai_enabled=%s explicit=%s auto=%s feature_legacy=%s primary=%s fallback=%s api=%s… env=%s…",
                     openai_only,
-                    openai_cfg.get("enabled"),
+                    openai_enabled,
+                    openai_flags["explicit_enabled"],
+                    openai_flags["auto_enable"],
+                    openai_flags["legacy_feature_enabled"],
                     primary_enabled,
-                    openai_feature_enabled,
+                    fallback_enabled,
                     (openai_cfg.get("api_key") or "")[:6],
                     (os.getenv("KAJOVOSPEND_OPENAI_API_KEY") or "")[:6],
                 )
             except Exception:
                 pass
 
-            if openai_only and not api_key:
-                reasons.append("OpenAI only režim: chybí API key – online extrakce přeskočena")
+            openai_only_notes = self._openai_only_mode_notes(
+                openai_only=openai_only,
+                has_api_key=bool(openai_flags["has_api_key"]),
+                openai_enabled=openai_enabled,
+                primary_enabled=primary_enabled,
+                fallback_enabled=fallback_enabled,
+            )
+            for note in openai_only_notes:
+                reasons.append(note)
                 try:
-                    self.log.warning("OpenAI only mode aktivován, ale API key chybí – online extrakce vynechána")
-                except Exception:
-                    pass
-            if openai_only and api_key and not openai_enabled:
-                reasons.append("OpenAI only režim: OpenAI není povoleno (feature flag nebo nastavení)")
-                try:
-                    self.log.warning("OpenAI only mode aktivován, ale openai_enabled=False (feature flag?) – online extrakce vynechána")
+                    self.log.warning(note)
                 except Exception:
                     pass
 
-            if not template_used and openai_enabled and primary_enabled:
+            if not template_used and primary_allowed:
                 need_primary = (
                     openai_only
                     or (doc_type == "receipt")
@@ -1766,6 +1851,11 @@ class Processor:
                             use_json_schema=use_json_schema,
                             temperature=temperature,
                             max_output_tokens=max_output_tokens,
+                            forensic_fields={
+                                k: v
+                                for k, v in get_forensic_fields().items()
+                                if k in {"correlation_id", "document_id", "file_sha256", "job_id"} and v is not None
+                            },
                         )
                         with forensic_scope(phase="openai_primary", mode="primary"):
                             obj, raw, used_model = extract_with_openai(
@@ -1797,8 +1887,8 @@ class Processor:
                             self.log.exception("OpenAI primary selhal: %s", e)
                         except Exception:
                             pass
-            elif openai_only and not openai_enabled:
-                reasons.append("OpenAI only režim: chybí API key nebo povolení")
+            elif openai_only and not primary_allowed and primary_enabled and not openai_enabled:
+                reasons.append("OpenAI only režim: primary větev není dostupná (chybí API key nebo OpenAI není povoleno)")
 
             # Pokud chybí IČO, zkus heuristiku: najít 8-místné číslo a ověřit v ARES.
             if not template_used and not extracted.supplier_ico:
@@ -1857,7 +1947,7 @@ class Processor:
                     and sum_ok
                 )
 
-            if not template_used and openai_enabled and (need_openai or openai_only):
+            if not template_used and fallback_allowed and need_openai:
                 try:
                     if status_cb:
                         status_cb("OpenAI fallback: doplnuji polozky...")
@@ -1882,6 +1972,11 @@ class Processor:
                         use_json_schema=use_json_schema,
                         temperature=temperature,
                         max_output_tokens=max_output_tokens,
+                        forensic_fields={
+                            k: v
+                            for k, v in get_forensic_fields().items()
+                            if k in {"correlation_id", "document_id", "file_sha256", "job_id"} and v is not None
+                        },
                     )
                     with forensic_scope(phase="openai_fallback", mode="fallback"):
                         obj, raw, used_model = extract_with_openai_fallback(
@@ -2104,11 +2199,11 @@ class Processor:
                 self._update_processing_status(id_in, status="QUARANTINE", last_error=file_record.last_error, path_current=file_record.current_path, sha256=sha)
                 continue
 
-            supplier_ok, missing_supplier_details = self._supplier_details_complete(supplier_rec)
+            supplier_ok, missing_supplier_blockers, missing_supplier_soft = self._supplier_details_complete(supplier_rec)
             if not supplier_ok:
                 requires_review = True
                 reasons.append(
-                    "dodavatel není kompletně vytěžen: " + ", ".join(missing_supplier_details)
+                    "dodavatel blokován: chybí kritická pole: " + ", ".join(missing_supplier_blockers)
                 )
                 any_requires_review = True
                 try:
@@ -2124,6 +2219,12 @@ class Processor:
                     sha256=sha,
                 )
                 continue
+
+            if missing_supplier_soft:
+                reasons.append(
+                    "dodavatel nekompletní (neblokující): " + ", ".join(missing_supplier_soft)
+                )
+                reasons = list(dict.fromkeys(reasons))
 
             last_error_msg = "; ".join(dict.fromkeys(reasons)) if reasons else "nekompletní vytěžení"
             if requires_review:
