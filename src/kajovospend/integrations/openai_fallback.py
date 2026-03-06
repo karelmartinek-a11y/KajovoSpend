@@ -406,6 +406,124 @@ def _extract_output_text(data: Dict[str, Any]) -> str:
     return text
 
 
+def _parse_json_first_last_brace(text: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    start = text.find("{")
+    end = text.rfind("}")
+    meta: Dict[str, Any] = {
+        "strategy": "first_last_brace",
+        "start": start,
+        "end": end,
+        "length": len(text or ""),
+        "error": None,
+    }
+    if start == -1 or end == -1 or end <= start:
+        meta["error"] = "no_braces"
+        return None, meta
+    fragment = text[start:end + 1]
+    try:
+        parsed = json.loads(fragment)
+    except Exception as exc:
+        meta["error"] = str(exc)
+        return None, meta
+    if not isinstance(parsed, dict):
+        meta["error"] = "json_not_object"
+        return None, meta
+    return parsed, meta
+
+
+def _iter_balanced_object_fragments(text: str) -> List[Tuple[int, int, str]]:
+    fragments: List[Tuple[int, int, str]] = []
+    if not text:
+        return fragments
+    in_string = False
+    escape = False
+    depth = 0
+    start_idx: Optional[int] = None
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start_idx = idx
+            depth += 1
+            continue
+        if ch == "}":
+            if depth <= 0:
+                continue
+            depth -= 1
+            if depth == 0 and start_idx is not None:
+                end_idx = idx
+                fragment = text[start_idx:end_idx + 1]
+                fragments.append((start_idx, end_idx, fragment))
+                start_idx = None
+    # try larger fragments first
+    fragments.sort(key=lambda item: (item[1] - item[0]), reverse=True)
+    return fragments
+
+
+def _parse_json_balanced_objects(text: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    last_error = "no_balanced_object"
+    for start, end, fragment in _iter_balanced_object_fragments(text):
+        try:
+            parsed = json.loads(fragment)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        if isinstance(parsed, dict):
+            return parsed, {
+                "strategy": "balanced_object_scan",
+                "start": start,
+                "end": end,
+                "length": len(text or ""),
+                "error": None,
+            }
+        last_error = "json_not_object"
+    return None, {
+        "strategy": "balanced_object_scan",
+        "start": -1,
+        "end": -1,
+        "length": len(text or ""),
+        "error": last_error,
+    }
+
+
+def _parse_openai_output_json(text: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    parsed, meta = _parse_json_first_last_brace(text)
+    if parsed is not None:
+        return parsed, meta
+    parsed2, meta2 = _parse_json_balanced_objects(text)
+    if parsed2 is not None:
+        return parsed2, meta2
+    return None, meta2
+
+
+def _should_retry_after_parse_fail(*, usage: Dict[str, Any], max_output_tokens: int, parse_status: str) -> bool:
+    if parse_status != "fail":
+        return False
+    try:
+        out_tokens = int((usage or {}).get("output_tokens") or 0)
+    except Exception:
+        return False
+    if max_output_tokens <= 0:
+        return False
+    return out_tokens >= max_output_tokens
+
+
+def _next_max_output_tokens(current: int) -> int:
+    base = max(1, int(current or 1))
+    # conservative step-up to limit costs while avoiding immediate truncation repeats
+    return min(8000, max(base + 1000, int(base * 1.5)))
+
+
 def ensure_schema_defaults(obj: Dict[str, Any]) -> Dict[str, Any]:
     """
     Doplňuje chybějící klíče dle _JSON_SCHEMA na výchozí hodnoty (null/{} / [] podle typu).
@@ -791,33 +909,68 @@ def _run_responses_flow(
     if not text:
         text = str(data)
     len_raw = len(text or "")
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    req_max_output_tokens = int(payload.get("max_output_tokens") or int(cfg.max_output_tokens or 2000))
+    parse_retry_used = False
 
-    start = text.find("{")
-    end = text.rfind("}")
-    obj = None
-    parse_status = "fail"
-    parse_error = None
-    if start != -1 and end != -1 and end > start:
-        fragment = text[start:end + 1]
-        try:
-            obj = json.loads(fragment)
-            parse_status = "ok"
-        except Exception as e:
-            parse_error = str(e)
-    else:
-        parse_error = "no_braces"
+    obj, parse_meta = _parse_openai_output_json(text)
+    parse_status = "ok" if isinstance(obj, dict) else "fail"
+    parse_strategy = str(parse_meta.get("strategy") or "unknown")
+    parse_error = parse_meta.get("error")
+    parse_start_raw = parse_meta.get("start", -1)
+    parse_end_raw = parse_meta.get("end", -1)
+    parse_start = int(parse_start_raw if isinstance(parse_start_raw, int) else -1)
+    parse_end = int(parse_end_raw if isinstance(parse_end_raw, int) else -1)
+
+    if _should_retry_after_parse_fail(usage=usage, max_output_tokens=req_max_output_tokens, parse_status=parse_status):
+        next_tokens = _next_max_output_tokens(req_max_output_tokens)
+        if next_tokens > req_max_output_tokens:
+            log_event(
+                log,
+                "openai.retry",
+                "OpenAI retry after parse fail on output token cap",
+                attempt_from=attempt,
+                attempt_to=attempt + 1,
+                reason="parse_fail_output_token_cap",
+                backoff_ms=0,
+                old_max_output_tokens=req_max_output_tokens,
+                new_max_output_tokens=next_tokens,
+            )
+            payload["max_output_tokens"] = next_tokens
+            attempt += 1
+            parse_retry_used = True
+            resp, latency_ms, resp_hash, openai_request_id, req_id_client, attempt = _openai_post_with_retry(
+                payload, timeout=timeout, log=log, mode=mode, api_key=cfg.api_key, attempt_start=attempt
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = _extract_output_text(data)
+            if not text:
+                text = str(data)
+            len_raw = len(text or "")
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+            obj, parse_meta = _parse_openai_output_json(text)
+            parse_status = "ok" if isinstance(obj, dict) else "fail"
+            parse_strategy = str(parse_meta.get("strategy") or "unknown")
+            parse_error = parse_meta.get("error")
+            parse_start_raw = parse_meta.get("start", -1)
+            parse_end_raw = parse_meta.get("end", -1)
+            parse_start = int(parse_start_raw if isinstance(parse_start_raw, int) else -1)
+            parse_end = int(parse_end_raw if isinstance(parse_end_raw, int) else -1)
+            req_max_output_tokens = int(payload.get("max_output_tokens") or req_max_output_tokens)
 
     log_event(
         log,
         "structured_output.parse",
         "Structured output parse",
         status=parse_status,
-        strategy="first_last_brace",
-        start=start,
-        end=end,
+        strategy=parse_strategy,
+        start=parse_start,
+        end=parse_end,
         length=len_raw,
         error=parse_error,
-        json_extract_strategy="first_last_brace",
+        json_extract_strategy=parse_strategy,
+        parse_retry_used=parse_retry_used,
     )
 
     validation_errors: List[str] = []
@@ -845,8 +998,11 @@ def _run_responses_flow(
         openai_request_id_client=req_id_client,
         extracted_output_text_length=len(text or ""),
         len_raw=len_raw,
-        usage=data.get("usage"),
+        usage=usage,
         parse_status=parse_status,
+        parse_strategy=parse_strategy,
+        parse_retry_used=parse_retry_used,
+        request_max_output_tokens=req_max_output_tokens,
     )
     if status_cb:
         try:
