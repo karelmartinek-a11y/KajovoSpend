@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import traceback
+from multiprocessing import freeze_support
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -104,4 +105,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    freeze_support()
     raise SystemExit(main())

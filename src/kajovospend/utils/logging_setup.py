@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import os
 import platform
 import socket
 import sys
 import threading
 import traceback
-from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict
@@ -24,10 +24,7 @@ else:
 
 
 class _InterProcessLock:
-    """
-    Cross-process file lock using a dedicated lock-file.
-    Keeps kajovospend.log safe when GUI + service write concurrently.
-    """
+    """Cross-process file lock using a dedicated lock-file."""
 
     def __init__(self, lock_path: Path):
         self._lock_path = lock_path
@@ -38,7 +35,6 @@ class _InterProcessLock:
         self._fh = open(self._lock_path, "a+b")
         try:
             if os.name == "nt":
-                # lock 1 byte at the beginning (ensure file is at least 1 byte)
                 if self._fh.tell() == 0 and self._fh.seek(0, os.SEEK_END) == 0:
                     self._fh.write(b"\0")
                     self._fh.flush()
@@ -75,110 +71,45 @@ class _InterProcessLock:
             self._fh = None
 
 
-class LineCappedFileHandler(logging.Handler):
-    """
-    Single log file with "ring buffer" behavior:
-    - appends normally
-    - once it grows beyond max_lines (+ small chunk), it truncates to last max_lines
+class SafeTimedRotatingFileHandler(TimedRotatingFileHandler):
+    """Daily rotating handler with cross-process lock."""
 
-    This keeps one file (kajovospend.log) and effectively overwrites old lines.
-    """
-
-    def __init__(
-        self,
-        filename: Path,
-        *,
-        max_lines: int = 5000,
-        encoding: str = "utf-8",
-    ):
-        super().__init__()
+    def __init__(self, filename: Path, *, backup_count: int = 7, encoding: str = "utf-8"):
         self._filename = Path(filename)
-        self._encoding = encoding
-        self.max_lines = int(max_lines)
-        # trim every N extra lines to avoid rewriting on every emit
-        self._trim_chunk = max(10, self.max_lines // 100)  # 5000 -> 50
+        self._filename.parent.mkdir(parents=True, exist_ok=True)
         self._lock_path = self._filename.parent / (self._filename.name + ".lock")
         self._mtx = threading.RLock()
-        self._stream = None
-        self._line_count = 0
-        self._open_and_count()
-
-    def _open_and_count(self) -> None:
-        self._filename.parent.mkdir(parents=True, exist_ok=True)
-        # keep "errors" tolerant so no log write ever crashes the app
-        self._stream = open(self._filename, "a", encoding=self._encoding, errors="backslashreplace")
-        try:
-            if self._filename.exists():
-                with open(self._filename, "r", encoding=self._encoding, errors="ignore") as rf:
-                    self._line_count = sum(1 for _ in rf)
-            else:
-                self._line_count = 0
-        except Exception:
-            self._line_count = 0
+        super().__init__(
+            filename=str(self._filename),
+            when="midnight",
+            interval=1,
+            backupCount=int(max(1, backup_count)),
+            encoding=encoding,
+            utc=True,
+            delay=False,
+            errors="backslashreplace",
+        )
 
     def emit(self, record: logging.LogRecord) -> None:
-        try:
-            msg = self.format(record)
-            if not msg.endswith("\n"):
-                msg += "\n"
-            with self._mtx:
-                with _InterProcessLock(self._lock_path):
-                    if self._stream is None:
-                        self._open_and_count()
-                    assert self._stream is not None
-                    self._stream.write(msg)
-                    self._stream.flush()
-                    self._line_count += 1
-                    if self._line_count >= (self.max_lines + self._trim_chunk):
-                        self._trim_to_last_max_lines()
-        except Exception:
-            self.handleError(record)
-
-    def _trim_to_last_max_lines(self) -> None:
-        # stream already locked by _InterProcessLock in emit()
-        try:
-            if self._stream is not None:
-                try:
-                    self._stream.close()
-                except Exception:
-                    pass
-                self._stream = None
-
-            tail = deque(maxlen=self.max_lines)
-            try:
-                with open(self._filename, "r", encoding=self._encoding, errors="ignore") as rf:
-                    for line in rf:
-                        tail.append(line)
-            except FileNotFoundError:
-                tail = deque(maxlen=self.max_lines)
-
-            with open(self._filename, "w", encoding=self._encoding, errors="backslashreplace") as wf:
-                wf.writelines(tail)
-
-            self._line_count = len(tail)
-        finally:
-            # reopen for append
-            self._stream = open(self._filename, "a", encoding=self._encoding, errors="backslashreplace")
-
-    def close(self) -> None:
         with self._mtx:
-            try:
-                if self._stream is not None:
-                    self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
-        super().close()
+            with _InterProcessLock(self._lock_path):
+                super().emit(record)
+
+    def doRollover(self) -> None:
+        with self._mtx:
+            with _InterProcessLock(self._lock_path):
+                super().doRollover()
 
 
 _ROOT_CONFIGURED = False
 _ROOT_CONFIG_LOCK = threading.Lock()
+_ROOT_LOG_DIR: Path | None = None
 _FORENSIC_HOOKS_INSTALLED = False
 _FAULT_HANDLER_STREAM = None
 
 
 class ForensicContextFilter(logging.Filter):
-    """Doplní do každého záznamu detailní forenzní metadata."""
+    """Attach forensic runtime metadata to every log record."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -201,7 +132,7 @@ class ForensicContextFilter(logging.Filter):
 
 
 class JsonLineFormatter(logging.Formatter):
-    """Serializuje log record do JSONL pro strojové forenzní čtení."""
+    """Serialize record to JSONL for forensic processing."""
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -249,11 +180,11 @@ def _install_forensic_runtime_hooks(log: logging.Logger, log_dir: Path) -> None:
     _FORENSIC_HOOKS_INSTALLED = True
 
     def _sys_excepthook(exc_type, exc, tb):
-        log.critical("Nezachycená výjimka v hlavním vlákně", exc_info=(exc_type, exc, tb))
+        log.critical("Unhandled exception in main thread", exc_info=(exc_type, exc, tb))
 
     def _threading_excepthook(args: threading.ExceptHookArgs) -> None:
         log.critical(
-            "Nezachycená výjimka ve vlákně name=%s ident=%s",
+            "Unhandled exception in thread name=%s ident=%s",
             getattr(args.thread, "name", "unknown"),
             getattr(args.thread, "ident", "unknown"),
             exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
@@ -268,56 +199,81 @@ def _install_forensic_runtime_hooks(log: logging.Logger, log_dir: Path) -> None:
         _FAULT_HANDLER_STREAM = open(crash_file, "a", encoding="utf-8", errors="backslashreplace")
         faulthandler.enable(_FAULT_HANDLER_STREAM, all_threads=True)
     except Exception:
-        log.exception("Nepodařilo se aktivovat faulthandler")
+        log.exception("Failed to enable faulthandler")
 
     log.info(
-        "Forenzní runtime hooky aktivní; cmdline=%s env_debug=%s",
+        "Forensic runtime hooks active; cmdline=%s env_debug=%s",
         sys.argv,
         os.environ.get("KAJOVOSPEND_DEBUG", ""),
     )
 
 
+def _compute_retention_days() -> int:
+    raw = str(os.environ.get("KAJOVOSPEND_LOG_RETENTION_DAYS", "")).strip()
+    try:
+        val = int(raw) if raw else 7
+    except Exception:
+        val = 7
+    return max(1, min(val, 365))
+
+
 def _compute_max_lines() -> int:
     """
-    Určí max_lines podle priority:
-    1) KAJOVOSPEND_LOG_MAX_LINES
-    2) KAJOVOSPEND_LOG_RETENTION_DAYS * KAJOVOSPEND_LOG_LINES_PER_DAY_ESTIMATE
+    Backward-compatible helper for tests and legacy code paths.
+    Daily rotating logs now use retention days directly, but callers may still
+    rely on a computed line budget.
     """
-    env_max = os.environ.get("KAJOVOSPEND_LOG_MAX_LINES")
-    if env_max:
+    raw_max = str(os.environ.get("KAJOVOSPEND_LOG_MAX_LINES", "")).strip()
+    if raw_max:
         try:
-            val = int(env_max)
-            if val > 0:
-                return val
+            max_lines = int(raw_max)
+            if max_lines > 0:
+                return max_lines
         except Exception:
             pass
-    retention_days = int(os.environ.get("KAJOVOSPEND_LOG_RETENTION_DAYS", "7") or 7)
-    lines_per_day = int(os.environ.get("KAJOVOSPEND_LOG_LINES_PER_DAY_ESTIMATE", "200000") or 200000)
-    return max(1000, retention_days * lines_per_day)
+
+    raw_lines = str(os.environ.get("KAJOVOSPEND_LOG_LINES_PER_DAY_ESTIMATE", "")).strip()
+    try:
+        per_day = int(raw_lines) if raw_lines else 20000
+    except Exception:
+        per_day = 20000
+    per_day = max(100, per_day)
+    return int(_compute_retention_days() * per_day)
+
+
+def _remove_owned_handlers(root: logging.Logger) -> None:
+    for handler in list(root.handlers):
+        if not getattr(handler, "_kajovospend_owned", False):
+            continue
+        try:
+            root.removeHandler(handler)
+        except Exception:
+            pass
+        try:
+            handler.close()
+        except Exception:
+            pass
 
 
 def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
-    """
-    Configures one shared log file:
-      <log_dir>/kajovospend.log
-    capped to the last ~5000 lines in a "ring" (old lines are overwritten).
+    """Configure shared text + forensic logs with daily rotation."""
+    global _ROOT_CONFIGURED, _ROOT_LOG_DIR
 
-    Console logging is OFF by default to keep "1 log". Enable via:
-      KAJOVOSPEND_LOG_CONSOLE=1
-    """
-    global _ROOT_CONFIGURED
-
+    log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
+    resolved_log_dir = log_dir.resolve()
     logger = logging.getLogger(name)
 
-    max_lines = _compute_max_lines()
+    retention_days = _compute_retention_days()
+    detail = str(os.environ.get("KAJOVOSPEND_LOG_DETAIL", "1")).strip() not in {
+        "0", "false", "False", "FALSE", "no", "NO"
+    }
 
     with _ROOT_CONFIG_LOCK:
-        if not _ROOT_CONFIGURED:
-            log_file = log_dir / "kajovospend.log"
-            detail = str(os.environ.get("KAJOVOSPEND_LOG_DETAIL", "1")).strip() not in {"0", "false", "False", "FALSE", "no", "NO"}
-
-            root = logging.getLogger()
+        root = logging.getLogger()
+        need_reconfigure = (not _ROOT_CONFIGURED) or (_ROOT_LOG_DIR is None) or (_ROOT_LOG_DIR != resolved_log_dir)
+        if need_reconfigure:
+            _remove_owned_handlers(root)
             root.setLevel(logging.DEBUG)
 
             fmt = logging.Formatter(
@@ -330,52 +286,59 @@ def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
 
             forensic_filter = ForensicContextFilter()
 
-            fh = LineCappedFileHandler(log_file, max_lines=max_lines, encoding="utf-8")
-            fh.setLevel(logging.DEBUG)
-            fh.setFormatter(fmt)
-            fh.addFilter(forensic_filter)
-            root.addHandler(fh)
+            text_handler = SafeTimedRotatingFileHandler(
+                log_dir / "kajovospend.log",
+                backup_count=retention_days,
+                encoding="utf-8",
+            )
+            text_handler.setLevel(logging.DEBUG)
+            text_handler.setFormatter(fmt)
+            text_handler.addFilter(forensic_filter)
+            setattr(text_handler, "_kajovospend_owned", True)
+            root.addHandler(text_handler)
 
-            forensic_file = log_dir / "kajovospend_forensic.jsonl"
-            fh_json = LineCappedFileHandler(forensic_file, max_lines=int(max_lines * 2), encoding="utf-8")
-            fh_json.setLevel(logging.DEBUG)
-            fh_json.setFormatter(JsonLineFormatter())
-            fh_json.addFilter(forensic_filter)
-            root.addHandler(fh_json)
+            forensic_handler = SafeTimedRotatingFileHandler(
+                log_dir / "kajovospend_forensic.jsonl",
+                backup_count=retention_days,
+                encoding="utf-8",
+            )
+            forensic_handler.setLevel(logging.DEBUG)
+            forensic_handler.setFormatter(JsonLineFormatter())
+            forensic_handler.addFilter(forensic_filter)
+            setattr(forensic_handler, "_kajovospend_owned", True)
+            root.addHandler(forensic_handler)
 
             if os.environ.get("KAJOVOSPEND_LOG_CONSOLE", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
-                ch = logging.StreamHandler()
-                ch.setLevel(logging.DEBUG)
-                ch.setFormatter(fmt)
-                ch.addFilter(forensic_filter)
-                root.addHandler(ch)
+                console_handler = logging.StreamHandler()
+                console_handler.setLevel(logging.DEBUG)
+                console_handler.setFormatter(fmt)
+                console_handler.addFilter(forensic_filter)
+                setattr(console_handler, "_kajovospend_owned", True)
+                root.addHandler(console_handler)
 
-            setattr(root, "_kajovospend_log_detail", detail)
             _ROOT_CONFIGURED = True
+            _ROOT_LOG_DIR = resolved_log_dir
 
-    # let everything propagate into the single root handler
+        setattr(root, "_kajovospend_log_detail", detail)
+
     logger.setLevel(logging.DEBUG)
     logger.propagate = True
     _install_forensic_runtime_hooks(logger, log_dir)
-    retention_days = int(os.environ.get("KAJOVOSPEND_LOG_RETENTION_DAYS", "7") or 7)
-    lines_per_day = int(os.environ.get("KAJOVOSPEND_LOG_LINES_PER_DAY_ESTIMATE", "200000") or 200000)
-    detail_flag = str(os.environ.get("KAJOVOSPEND_LOG_DETAIL", "1")).strip() not in {"0", "false", "False", "FALSE", "no", "NO"}
     logger.info(
-        "Logging inicializov?n: log_dir=%s pid=%s ppid=%s retention_days=%s max_lines=%s lines_per_day_estimate=%s detail=%s",
+        "Logging initialized: log_dir=%s pid=%s ppid=%s retention_days=%s rotate=%s detail=%s",
         log_dir,
         os.getpid(),
         os.getppid() if hasattr(os, "getppid") else "n/a",
         retention_days,
-        max_lines,
-        lines_per_day,
-        int(detail_flag),
+        "daily",
+        int(detail),
         extra={
             "event_name": "logging.start",
             "extra_payload": {
                 "retention_days": retention_days,
-                "max_lines": max_lines,
-                "lines_per_day_estimate": lines_per_day,
-                "detail": int(detail_flag),
+                "rotation": "daily",
+                "detail": int(detail),
+                "log_dir": str(log_dir),
             },
         },
     )
@@ -384,12 +347,11 @@ def setup_logging(log_dir: Path, name: str = "kajovospend") -> logging.Logger:
 
 def log_event(logger: logging.Logger, event_name: str, message: str, **extra: Any) -> None:
     """
-    Helper pro strukturované logování:
-    - doplní event_name a extra_payload
-    - do textového logu přidá čitelný suffix key=value
+    Structured log helper:
+    - adds event_name and extra_payload
+    - appends key=value suffix to text log for readability
     """
     extra_payload: Dict[str, Any] = extra or {}
-    # respektuj detail flag (pokud je root logger bez detailu, omez velké hodnoty)
     detail_enabled = True
     try:
         root = logging.getLogger()
@@ -414,6 +376,7 @@ def log_event(logger: logging.Logger, event_name: str, message: str, **extra: An
             suffix = " | " + " ".join(f"{k}={extra_payload[k]!r}" for k in sorted(extra_payload.keys()))
         except Exception:
             suffix = ""
+
     logger.info(
         f"{message}{suffix}",
         extra={

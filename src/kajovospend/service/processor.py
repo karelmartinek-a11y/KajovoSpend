@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import time
 
 from kajovospend.utils.time import utc_now_naive
 import os
@@ -847,6 +848,7 @@ class Processor:
         rotations: List[int],
         include_reconstructed: bool,
         max_candidates_per_page: int = 4,
+        max_runtime_sec: float | None = None,
         status_cb=None,
     ) -> List[Tuple[str, float, Dict[str, Any]]]:
         """Vygeneruje více OCR kandidátů pro rozsah stránek (různá DPI + rotace + rekonstrukce řádků)."""
@@ -858,7 +860,14 @@ class Processor:
             max_pages = 1
 
         out: List[Tuple[str, float, Dict[str, Any]]] = []
+        t0 = time.perf_counter()
         for dpi in dpis:
+            if max_runtime_sec is not None and (time.perf_counter() - t0) >= float(max_runtime_sec):
+                try:
+                    self.log.warning("OCR ensemble time budget reached; skipping remaining DPI variants")
+                except Exception:
+                    pass
+                break
             if status_cb:
                 status_cb(f"OCR ensemble: rendruji stránky (dpi={dpi})…")
             imgs = render_pdf_to_images(pdf_path, dpi=int(dpi), max_pages=max_pages, start_page=max(0, int(page_from) - 1))
@@ -939,6 +948,12 @@ class Processor:
             rotations = [0, 90, 180, 270]
         rotations = [int(r) for r in rotations if isinstance(r, (int, float, str))]
         include_reconstructed = bool(ens.get("include_reconstructed", True))
+        try:
+            max_runtime_sec = float(ens.get("max_runtime_sec", 20) or 20)
+        except Exception:
+            max_runtime_sec = 20.0
+        if max_runtime_sec <= 0:
+            max_runtime_sec = 20.0
 
         # candidate pool: baseline + OCR variants
         best_text = baseline_text
@@ -956,6 +971,7 @@ class Processor:
                     dpis=list(dpis),
                     rotations=list(rotations),
                     include_reconstructed=include_reconstructed,
+                    max_runtime_sec=max_runtime_sec,
                     status_cb=status_cb,
                 )
             )
@@ -1270,6 +1286,9 @@ class Processor:
         openai_only = bool(cfg.get("only_openai", False))
         primary_enabled = bool(cfg.get("primary_enabled", True))
         fallback_enabled = bool(cfg.get("fallback_enabled", True))
+        # Hard safety: in OpenAI-only mode we must keep at least one online branch enabled.
+        if openai_only and not (primary_enabled or fallback_enabled):
+            primary_enabled = True
         auto_enable = bool(cfg.get("auto_enable", True))
         explicit_enabled = bool(cfg.get("enabled"))
         legacy_feature_enabled = bool((features.get("openai_fallback", {}) or {}).get("enabled", False))

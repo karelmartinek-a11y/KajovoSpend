@@ -37,7 +37,7 @@ from shiboken6 import Shiboken
 from kajovospend.utils.config import load_yaml, save_yaml, deep_set
 import requests
 from kajovospend.utils.paths import resolve_app_paths
-from kajovospend.utils.logging_setup import setup_logging
+from kajovospend.utils.logging_setup import setup_logging, log_event
 from kajovospend.db.session import make_session_factory
 from kajovospend.db.working_session import create_working_engine
 from kajovospend.db.production_session import create_production_engine
@@ -46,7 +46,7 @@ from kajovospend.db.migrate import init_working_db, init_production_db
 from kajovospend.db.working_models import Supplier, Document, DocumentFile, LineItem, ImportJob
 from kajovospend.db.production_models import Document as ProdDocument, LineItem as ProdLineItem, Supplier as ProdSupplier
 from kajovospend.db.working_queries import upsert_supplier, rebuild_fts_for_document, create_file_record, add_document
-from kajovospend.db.processing_session import create_processing_session_factory
+from kajovospend.db.processing_session import create_processing_session_factory, dispose_processing_session_factory
 from kajovospend.db.processing_models import IngestFile
 from kajovospend.integrations.ares import fetch_by_ico, normalize_ico
 from kajovospend.integrations.openai_fallback import (
@@ -586,7 +586,7 @@ class _Worker(QObject):
         try:
             res = self._fn()
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(str(e).strip() or e.__class__.__name__)
             return
         self.done.emit(res)
 
@@ -731,13 +731,14 @@ class _SilentRunner:
     """
 
     @staticmethod
-    def run(window: "MainWindow", fn, on_done, on_error=None, *, timeout_ms: int | None = None):
+    def run(window: "MainWindow", fn, on_done, on_error=None, *, timeout_ms: int | None = None, cancel_state: dict | None = None):
         th = QThread(window)
         wk = _Worker(fn)
         wk.moveToThread(th)
         th.started.connect(wk.run)
 
         completed = False
+        canceled = False
         timer: QTimer | None = None
 
         window._workers.append(wk)
@@ -764,6 +765,19 @@ class _SilentRunner:
                 return False
             completed = True
             return True
+
+        def _cancel_now() -> None:
+            nonlocal canceled
+            canceled = True
+            try:
+                if timer is not None:
+                    timer.stop()
+            except Exception:
+                pass
+            window._force_stop_thread(th)
+
+        if cancel_state is not None:
+            cancel_state["cancel"] = _cancel_now
 
         def _cleanup():
             try:
@@ -794,6 +808,9 @@ class _SilentRunner:
             def _impl():
                 if not _finish_once():
                     return
+                if canceled:
+                    _cleanup()
+                    return
                 _cleanup()
                 try:
                     on_done(res)
@@ -804,6 +821,9 @@ class _SilentRunner:
         def _err(msg: str):
             def _impl():
                 if not _finish_once():
+                    return
+                if canceled:
+                    _cleanup()
                     return
                 _cleanup()
                 if on_error:
@@ -919,9 +939,17 @@ class MainWindow(QMainWindow):
         # background RUN stats refresh
         self._dash_refresh_inflight = False
         self._dash_last_counts: Dict[str, Any] | None = None
+        self._next_dash_refresh_ts = 0.0
+        self._next_ops_refresh_ts = 0.0
+        self._next_unproc_refresh_ts = 0.0
+        self._next_runstate_refresh_ts = 0.0
+        self._last_fs_scan_ts = 0.0
+        self._cached_fs_counts: Dict[str, int] = {"in_waiting": 0, "quarantine_fs": 0, "duplicates_fs": 0}
         self._import_running = False
         self._import_status = "Připraveno."
         self._import_stop_event = threading.Event()
+        self._import_thread: QThread | None = None
+        self._import_worker: _ImportWorker | None = None
         self._last_run_error: str | None = None
         self._last_run_success: str | None = None
         self._ops_last_snapshot: Optional[Tuple[Tuple[str, ...], ...]] = None
@@ -978,6 +1006,15 @@ class MainWindow(QMainWindow):
         self.sf_production = make_session_factory(self.engine_production)  # business reads
         self.pf = create_processing_session_factory(self.cfg)
         self.processor = Processor(self.cfg, self.paths, self.log, self.sf, self.sf_production)
+        self._audit_event(
+            "app.start",
+            "Application started",
+            config_path=str(self.config_path),
+            data_dir=str(self.paths.data_dir),
+            log_dir=str(self.paths.log_dir),
+            working_db=str(self.paths.working_db_path),
+            production_db=str(self.paths.production_db_path),
+        )
 
         self.setWindowTitle("KájovoSpend")
         ico = self.assets_dir / "app.ico"
@@ -1066,6 +1103,44 @@ class MainWindow(QMainWindow):
         cfg.setdefault("performance", {})
         return cfg
 
+    def _audit_event(self, event_name: str, message: str, **extra: Any) -> None:
+        try:
+            log_event(self.log, event_name, message, **extra)
+        except Exception:
+            try:
+                self.log.exception("audit_event failed: %s", event_name)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _settings_audit_snapshot(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        paths_cfg = cfg.get("paths", {}) if isinstance(cfg, dict) else {}
+        app_cfg = cfg.get("app", {}) if isinstance(cfg, dict) else {}
+        openai_cfg = cfg.get("openai", {}) if isinstance(cfg, dict) else {}
+        return {
+            "paths.input_dir": str(paths_cfg.get("input_dir", "") or ""),
+            "paths.output_dir": str(paths_cfg.get("output_dir", "") or ""),
+            "app.data_dir": str(app_cfg.get("data_dir", "") or ""),
+            "app.log_dir": str(app_cfg.get("log_dir", "") or ""),
+            "openai.primary_enabled": bool(openai_cfg.get("primary_enabled", True)),
+            "openai.fallback_enabled": bool(openai_cfg.get("fallback_enabled", True)),
+            "openai.only_openai": bool(openai_cfg.get("only_openai", False)),
+            "openai.model": str(openai_cfg.get("model", "") or ""),
+            "openai.fallback_model": str(openai_cfg.get("fallback_model", "") or ""),
+            "openai.timeout_sec": int(openai_cfg.get("timeout_sec", 60) or 60),
+            "openai.image_dpi": int(openai_cfg.get("image_dpi", 300) or 300),
+            "openai.image_max_pages": int(openai_cfg.get("image_max_pages", 3) or 3),
+        }
+
+    @staticmethod
+    def _settings_changes(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
+        changed: Dict[str, Any] = {}
+        for key, old_val in before.items():
+            new_val = after.get(key)
+            if old_val != new_val:
+                changed[key] = {"old": old_val, "new": new_val}
+        return changed
+
     def _run_with_busy(self, title: str, message: str, fn, on_done, on_error=None, timeout_ms: int | None = None):
         """
         Run fn() in background thread with a single-instance, non-modal progress dialog.
@@ -1073,16 +1148,22 @@ class MainWindow(QMainWindow):
         if not getattr(self, "progress", None) or not self.progress.can_start():
             QMessageBox.warning(self, "Probíhá akce", "Nelze spustit novou akci, protože už běží jiná.")
             return
-        self.progress.start(title=title, step=message, total=None)
-
         th = QThread(self)
         wk = _Worker(fn)
         wk.moveToThread(th)
         th.started.connect(wk.run)
         completed = False
+        canceled = False
         timer = None
 
         self._workers.append(wk)
+
+        def _cancel_now() -> None:
+            nonlocal canceled
+            canceled = True
+            self._force_stop_thread(th)
+
+        self.progress.start(title=title, step=message, total=None, cancel_cb=_cancel_now)
 
         def _dispatch_ui(fn) -> None:
             try:
@@ -1135,6 +1216,9 @@ class MainWindow(QMainWindow):
             def _impl():
                 if not _finish_once():
                     return
+                if canceled:
+                    _cleanup()
+                    return
                 try:
                     self.progress.finish("Dokončeno.")
                 except Exception:
@@ -1149,6 +1233,9 @@ class MainWindow(QMainWindow):
         def _err(msg: str):
             def _impl():
                 if not _finish_once():
+                    return
+                if canceled:
+                    _cleanup()
                     return
                 try:
                     self.progress.finish("Chyba.")
@@ -1202,27 +1289,14 @@ class MainWindow(QMainWindow):
         combo.setCurrentText(val)
 
     def _normalize_openai_settings(self) -> List[str]:
-        """Upraví kolidující nastavení OpenAI a vrátí poznámky k zobrazení uživateli."""
+        """Normalize OpenAI settings and return user notes."""
         notes: List[str] = []
-        # dovolena je vždy jen jedna volba z triady; zadna = OpenAI vypnuto
+        # OpenAI-only must still have at least one online branch enabled,
+        # otherwise processor quarantines every file immediately.
         if self.cb_openai_only.isChecked():
-            if self.cb_openai_primary.isChecked():
-                self.cb_openai_primary.setChecked(False)
-            if self.cb_openai_fallback.isChecked():
-                self.cb_openai_fallback.setChecked(False)
-            notes.append("Zvolen režim jen OpenAI – ostatní volby vypnuty.")
-        elif self.cb_openai_primary.isChecked():
-            if self.cb_openai_fallback.isChecked():
-                self.cb_openai_fallback.setChecked(False)
-            if self.cb_openai_only.isChecked():
-                self.cb_openai_only.setChecked(False)
-            notes.append("Zvolena primární online extrakce – ostatní volby vypnuty.")
-        elif self.cb_openai_fallback.isChecked():
-            if self.cb_openai_primary.isChecked():
-                self.cb_openai_primary.setChecked(False)
-            if self.cb_openai_only.isChecked():
-                self.cb_openai_only.setChecked(False)
-            notes.append("Zvolen OpenAI fallback – ostatní volby vypnuty.")
+            if not (self.cb_openai_primary.isChecked() or self.cb_openai_fallback.isChecked()):
+                self.cb_openai_primary.setChecked(True)
+                notes.append("Rezim jen OpenAI: automaticky zapnuta primarni online extrakce.")
         return notes
 
     def _recommend_model(self, models: List[str], *, fallback: bool = False) -> str:
@@ -1756,6 +1830,8 @@ class MainWindow(QMainWindow):
         self.btn_pick_output = QPushButton("Vybrat")
         self.ed_db_dir = QLineEdit(str(self.paths.data_dir))
         self.btn_pick_db_dir = QPushButton("Vybrat")
+        self.ed_log_dir = QLineEdit(str(self.cfg.get("app", {}).get("log_dir") or self.paths.log_dir))
+        self.btn_pick_log_dir = QPushButton("Vybrat")
         self.btn_new_db = QPushButton("Inicializovat novou DB")
 
         row_in = QWidget(); r3 = QHBoxLayout(row_in); r3.setContentsMargins(0,0,0,0)
@@ -1768,8 +1844,12 @@ class MainWindow(QMainWindow):
 
         row_db = QWidget(); r5 = QHBoxLayout(row_db); r5.setContentsMargins(0,0,0,0)
         r5.addWidget(self.ed_db_dir, 1); r5.addWidget(self.btn_pick_db_dir); r5.addWidget(self.btn_new_db)
-        form.addRow("Adresář databáze", row_db)
+        form.addRow("Adresar databaze", row_db)
 
+        row_log = QWidget(); r6 = QHBoxLayout(row_log); r6.setContentsMargins(0,0,0,0)
+        r6.addWidget(self.ed_log_dir, 1); r6.addWidget(self.btn_pick_log_dir)
+        form.addRow("Adresar logu", row_log)
+        
         # OpenAI nastaveni
         openai_cfg = self.cfg.get("openai", {}) if isinstance(self.cfg, dict) else {}
         if not isinstance(openai_cfg, dict):
@@ -1886,6 +1966,12 @@ class MainWindow(QMainWindow):
             "Doporuceno oddelit od vstupni slozky."
         )
         self.btn_pick_output.setToolTip("Vyber slozku pro vystupy zpracovani.")
+        self.ed_log_dir.setToolTip(
+            "Slozka pro textovy log a forensic JSONL log.\n"
+            "Logy se rotuji denne a drzi se poslednich 7 dni.\n"
+            "Doporuceno mit lokalni zapisovatelnou cestu."
+        )
+        self.btn_pick_log_dir.setToolTip("Vyber slozku pro logy aplikace.")
         self.ed_api_key.setToolTip(
             "OpenAI API key pro online extrakci.\n"
             "Ulozi se do lokalniho configu. Bez klice se online rezimy nespousti.\n"
@@ -1934,19 +2020,8 @@ class MainWindow(QMainWindow):
             "Preskoci vsechny offline metody (OCR/ensemble) a pouzije jen OpenAI Responses.\n"
             "Vyuzij, pokud mas spolehlivy API key a chces striktne cloud vytahovani."
         )
-        # vzajemne vylouceni voleb (primarni/fallback/only)
-        def _exclusive_toggle(changed: QCheckBox) -> None:
-            if not changed.isChecked():
-                return
-            for other in (self.cb_openai_primary, self.cb_openai_fallback, self.cb_openai_only):
-                if other is changed:
-                    continue
-                other.blockSignals(True)
-                other.setChecked(False)
-                other.blockSignals(False)
-        self.cb_openai_primary.toggled.connect(lambda _v: _exclusive_toggle(self.cb_openai_primary))
-        self.cb_openai_fallback.toggled.connect(lambda _v: _exclusive_toggle(self.cb_openai_fallback))
-        self.cb_openai_only.toggled.connect(lambda _v: _exclusive_toggle(self.cb_openai_only))
+        # Intentionally allow combinations of primary/fallback/only.
+        # _normalize_openai_settings() handles invalid combos safely.
         self.cb_use_json_schema.setToolTip(
             "Vynuti striktni JSON schema pro vystup.\n"
             "Zlepsuje spolehlivost struktury, ale muze byt prisnejsi."
@@ -2128,7 +2203,7 @@ class MainWindow(QMainWindow):
         spl.addWidget(right, 1)
         self.tabs.addTab(self.tab_suppliers, "DODAVATELÉ")
         self.tab_standard_receipts = StandardReceiptsTab(
-            self.sf,
+            self.sf_production,
             self.cfg,
             self.paths,
             runner_host=self,
@@ -2354,6 +2429,7 @@ class MainWindow(QMainWindow):
         self.btn_pick_input.clicked.connect(lambda: self._pick_dir(self.ed_input_dir))
         self.btn_pick_output.clicked.connect(lambda: self._pick_dir(self.ed_output_dir))
         self.btn_pick_db_dir.clicked.connect(lambda: self._pick_dir(self.ed_db_dir))
+        self.btn_pick_log_dir.clicked.connect(lambda: self._pick_dir(self.ed_log_dir))
         self.btn_new_db.clicked.connect(self._on_new_db)
         self.btn_save_settings.clicked.connect(self.on_save_settings)
         self.btn_backup_program.clicked.connect(self._on_backup_program)
@@ -2441,27 +2517,63 @@ class MainWindow(QMainWindow):
 
     def _wire_timers(self):
         self.timer = QTimer(self)
-        # Periodic lightweight refresh for RUN tab.
-        interval = int(self.cfg.get("performance", {}).get("ui_refresh_ms") or 1000)
-        # keep it reasonable even if config is too aggressive
-        interval = max(1000, interval)
+        # Keep UI heartbeat responsive, but gate heavy refreshes in _refresh_from_queue.
+        interval = int(self.cfg.get("performance", {}).get("ui_refresh_ms") or 500)
+        interval = max(300, interval)
         self.timer.setInterval(interval)
         self.timer.timeout.connect(self._refresh_from_queue)
         self.timer.start()
 
-    def _refresh_from_queue(self):
+    def _is_current_tab(self, widget: QWidget) -> bool:
         try:
-            # never block UI thread here
-            self._refresh_dashboard_async()
+            return bool(getattr(self, "tabs", None) and self.tabs.currentWidget() is widget)
+        except Exception:
+            return False
+
+    def _now_monotonic(self) -> float:
+        try:
+            return float(time.monotonic())
+        except Exception:
+            return 0.0
+
+    def _refresh_from_queue(self):
+        now = self._now_monotonic()
+        run_tab_active = self._is_current_tab(getattr(self, "tab_run", None))
+        ops_tab_active = self._is_current_tab(getattr(self, "tab_ops", None))
+        unproc_tab_active = self._is_current_tab(getattr(self, "tab_unprocessed", None))
+        import_running = bool(getattr(self, "_import_running", False))
+
+        # Dashboard stats are expensive; refresh only when relevant.
+        try:
+            if run_tab_active or import_running:
+                if now >= float(self._next_dash_refresh_ts or 0.0):
+                    self._next_dash_refresh_ts = now + (1.2 if import_running else 3.0)
+                    self._refresh_dashboard_async()
         except Exception:
             pass
-        for fn in (self.refresh_run_state, self.refresh_ops):
-            try:
-                fn()
-            except Exception:
-                pass
+
+        # Lightweight run state indicator.
         try:
-            self.refresh_unprocessed(force=False)
+            if run_tab_active or import_running:
+                if now >= float(self._next_runstate_refresh_ts or 0.0):
+                    self._next_runstate_refresh_ts = now + 1.0
+                    self.refresh_run_state()
+        except Exception:
+            pass
+
+        # Heavy tables: refresh only when tab is visible or import is active.
+        try:
+            if ops_tab_active or import_running:
+                if now >= float(self._next_ops_refresh_ts or 0.0):
+                    self._next_ops_refresh_ts = now + (1.0 if import_running else 4.0)
+                    self.refresh_ops()
+        except Exception:
+            pass
+        try:
+            if unproc_tab_active or import_running:
+                if now >= float(self._next_unproc_refresh_ts or 0.0):
+                    self._next_unproc_refresh_ts = now + (1.0 if import_running else 4.0)
+                    self.refresh_unprocessed(force=False)
         except Exception:
             pass
 
@@ -3358,6 +3470,7 @@ class MainWindow(QMainWindow):
                 pass
 
     def on_save_settings(self):
+        before_snapshot = self._settings_audit_snapshot(copy.deepcopy(self.cfg))
         notes = self._normalize_openai_settings()
         deep_set(self.cfg, ["paths", "input_dir"], self.ed_input_dir.text().strip())
         deep_set(self.cfg, ["paths", "output_dir"], self.ed_output_dir.text().strip())
@@ -3367,16 +3480,19 @@ class MainWindow(QMainWindow):
             return
         deep_set(self.cfg, ["app", "data_dir"], db_dir_txt)
         deep_set(self.cfg, ["app", "db_path"], str(Path(db_dir_txt) / "kajovospend.sqlite"))
+        log_dir_txt = self.ed_log_dir.text().strip()
+        deep_set(self.cfg, ["app", "log_dir"], log_dir_txt)
         deep_set(self.cfg, ["openai", "api_key"], "")  # API klíč se nikdy neukládá do YAML; použijte ENV KAJOVOSPEND_OPENAI_API_KEY
         deep_set(self.cfg, ["openai", "enabled"], True)
         deep_set(self.cfg, ["openai", "auto_enable"], False)
         deep_set(self.cfg, ["openai", "primary_enabled"], self.cb_openai_primary.isChecked())
         deep_set(self.cfg, ["openai", "fallback_enabled"], self.cb_openai_fallback.isChecked())
-        # vzájemné vyloučení: only_openai = True -> fallback vypnuto
+        # only_openai must keep at least one online branch enabled.
         only = self.cb_openai_only.isChecked()
         deep_set(self.cfg, ["openai", "only_openai"], only)
         if only:
-            deep_set(self.cfg, ["openai", "fallback_enabled"], False)
+            if not (self.cb_openai_primary.isChecked() or self.cb_openai_fallback.isChecked()):
+                deep_set(self.cfg, ["openai", "primary_enabled"], True)
         deep_set(self.cfg, ["openai", "model"], self.cmb_primary_model.currentText().strip())
         deep_set(self.cfg, ["openai", "fallback_model"], self.cmb_fallback_model.currentText().strip())
         deep_set(self.cfg, ["openai", "use_json_schema"], True)
@@ -3392,6 +3508,7 @@ class MainWindow(QMainWindow):
         save_yaml(self.config_path, self.cfg)
         # refresh paths and engine if db moved
         old_db = self.paths.working_db_path
+        old_log_dir = Path(self.paths.log_dir)
         self.paths = resolve_app_paths(
             self.cfg["app"].get("data_dir"),
             self.cfg["app"].get("db_path"),
@@ -3408,6 +3525,10 @@ class MainWindow(QMainWindow):
             init_production_db(self.engine_production)
             self.sf = make_session_factory(self.engine)
             self.sf_production = make_session_factory(self.engine_production)
+
+        if Path(self.paths.log_dir) != old_log_dir:
+            self.log = setup_logging(self.paths.log_dir, name="kajovospend_gui")
+            self.processor.log = self.log
         # Upozorni, pokud je zapnut jen OpenAI, ale není klíč ani v poli ani v ENV.
         if self.cb_openai_only.isChecked():
             api_inline = self.ed_api_key.text().strip()
@@ -3417,15 +3538,31 @@ class MainWindow(QMainWindow):
         msg = "Uloženo."
         if notes:
             msg += "\n\nÚpravy:\n- " + "\n- ".join(notes)
+        after_snapshot = self._settings_audit_snapshot(self.cfg)
+        changes = self._settings_changes(before_snapshot, after_snapshot)
+        self._audit_event(
+            "settings.save",
+            "Settings saved",
+            changed_fields=changes,
+            changed_count=len(changes),
+            config_path=str(self.config_path),
+        )
         QMessageBox.information(self, "Nastavení", msg)
 
     def _on_new_db(self) -> None:
-        """Vytvoří novou DB dle výběru a uloží nastavení."""
+        """Vytvori novou DB dle vyberu a ulozi nastaveni."""
+        self._audit_event("db.reinit.request", "Initialize new database requested")
         init_new_db(self)
         try:
             save_yaml(self.config_path, self.cfg)
         except Exception:
             pass
+        self._audit_event(
+            "db.reinit.done",
+            "Database initialized",
+            working_db=str(self.paths.working_db_path),
+            production_db=str(self.paths.production_db_path),
+        )
 
     # --- Backup / restore / reset ---
 
@@ -3439,6 +3576,34 @@ class MainWindow(QMainWindow):
             cand = self.paths.db_path.with_suffix(self.paths.db_path.suffix + suf)
             files.append(cand)
         return files
+
+    def _processing_db_file(self) -> Optional[Path]:
+        try:
+            eng = getattr(self.pf, "_engine", None) or getattr(self.pf, "bind", None)
+            if eng is None:
+                return None
+            db_path = getattr(getattr(eng, "url", None), "database", None)
+            if not db_path:
+                return None
+            return Path(str(db_path))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _sqlite_family_files(db_file: Path) -> List[Path]:
+        return [
+            db_file,
+            db_file.with_suffix(db_file.suffix + ".wal"),
+            db_file.with_suffix(db_file.suffix + ".shm"),
+        ]
+
+    def _delete_sqlite_family(self, db_file: Path, errors: List[str], label: str) -> None:
+        for cand in self._sqlite_family_files(db_file):
+            try:
+                if cand.exists():
+                    cand.unlink()
+            except Exception as exc:
+                errors.append(f"{label} {cand}: {exc}")
 
     def _clear_dir(self, path_str: str, errors: List[str]) -> None:
         if not path_str:
@@ -3588,6 +3753,7 @@ class MainWindow(QMainWindow):
                 init_production_db(self.engine_production)
                 self.sf = make_session_factory(self.engine)
                 self.sf_production = make_session_factory(self.engine_production)
+                self.pf = create_processing_session_factory(self.cfg)
                 self.processor = Processor(self.cfg, self.paths, self.log, self.sf, self.sf_production)
             except Exception as exc:
                 errors.append(f"Reinit po obnově: {exc}")
@@ -3608,6 +3774,8 @@ class MainWindow(QMainWindow):
         openai_cfg = self.cfg.get("openai", {}) if isinstance(self.cfg, dict) else {}
         self.ed_input_dir.setText(str(paths_cfg.get("input_dir", "")))
         self.ed_output_dir.setText(str(paths_cfg.get("output_dir", "")))
+        self.ed_db_dir.setText(str(self.paths.data_dir))
+        self.ed_log_dir.setText(str(self.cfg.get("app", {}).get("log_dir") or self.paths.log_dir))
 
         # Prefer registry/env key, pak config pole
         reg_api = sanitize_openai_api_key(load_user_env_var("KAJOVOSPEND_OPENAI_API_KEY") or "")
@@ -3639,6 +3807,7 @@ class MainWindow(QMainWindow):
         # vyrovnej kolize rovnou v UI
         self._normalize_openai_settings()
     def _on_reset_program(self):
+        self._audit_event("reset.request", "Program reset requested")
         if self._import_running:
             QMessageBox.warning(self, "RESET PROGRAMU", "Nejprve dokonči probíhající import.")
             return
@@ -3673,6 +3842,7 @@ class MainWindow(QMainWindow):
             QMessageBox.No,
         )
         if confirm != QMessageBox.Yes:
+            self._audit_event("reset.cancel", "Program reset canceled")
             return
 
         errors: list[str] = []
@@ -3687,12 +3857,33 @@ class MainWindow(QMainWindow):
             self.engine.dispose()
         except Exception as exc:
             errors.append(f"DB dispose: {exc}")
+        try:
+            self.engine_production.dispose()
+        except Exception as exc:
+            errors.append(f"DB dispose production: {exc}")
+        try:
+            dispose_processing_session_factory(self.pf)
+        except Exception as exc:
+            errors.append(f"DB dispose processing: {exc}")
 
         try:
             if self.paths.db_path.exists():
                 self.paths.db_path.unlink()
         except Exception as exc:
             errors.append(f"Smazání DB souboru: {exc}")
+
+        self._delete_sqlite_family(self.paths.db_path, errors, "Smazani DB")
+        self._delete_sqlite_family(self.paths.working_db_path, errors, "Smazani working DB")
+        self._delete_sqlite_family(self.paths.production_db_path, errors, "Smazani production DB")
+        processing_db = self._processing_db_file()
+        if processing_db is not None:
+            self._delete_sqlite_family(processing_db, errors, "Smazani processing DB")
+        templates_dir = self.paths.data_dir / "templates"
+        try:
+            if templates_dir.exists():
+                shutil.rmtree(templates_dir)
+        except Exception as exc:
+            errors.append(f"Smazani sablon {templates_dir}: {exc}")
 
         try:
             self.paths.working_db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3703,6 +3894,7 @@ class MainWindow(QMainWindow):
             init_production_db(self.engine_production)
             self.sf = make_session_factory(self.engine)
             self.sf_production = make_session_factory(self.engine_production)
+            self.pf = create_processing_session_factory(self.cfg)
             self.processor = Processor(self.cfg, self.paths, self.log, self.sf, self.sf_production)
         except Exception as exc:
             errors.append(f"Init nové DB: {exc}")
@@ -3719,24 +3911,31 @@ class MainWindow(QMainWindow):
             errors.append(f"Refresh UI: {exc}")
 
         if errors:
+            self._audit_event("reset.done", "Program reset finished with issues", errors=errors)
             QMessageBox.warning(self, "RESET PROGRAMU", "Hotovo s výjimkami:\n" + "\n".join(errors))
         else:
+            self._audit_event("reset.done", "Program reset finished")
             QMessageBox.information(self, "RESET PROGRAMU", "Program byl vyresetován.")
 
     def _on_backup_program(self):
+        self._audit_event("backup.request", "Backup requested")
         if self._import_running:
             QMessageBox.warning(self, "ZÁLOHOVAT PROGRAM", "Nejprve dokonči probíhající import.")
             return
         dest = self._ask_backup_save_path()
         if not dest:
+            self._audit_event("backup.cancel", "Backup canceled")
             return
         ok, msg = self._backup_to_archive(dest)
         if ok:
+            self._audit_event("backup.done", "Backup finished", archive=str(dest))
             QMessageBox.information(self, "ZÁLOHOVAT PROGRAM", msg)
         else:
+            self._audit_event("backup.error", "Backup failed", archive=str(dest), error=msg)
             QMessageBox.critical(self, "ZÁLOHOVAT PROGRAM", f"Záloha selhala: {msg}")
 
     def _on_restore_program(self):
+        self._audit_event("restore.request", "Restore requested")
         if self._import_running:
             QMessageBox.warning(self, "OBNOVIT PROGRAM", "Nejprve dokonči probíhající import.")
             return
@@ -3746,6 +3945,7 @@ class MainWindow(QMainWindow):
 
         path_str, _ = QFileDialog.getOpenFileName(self, "Vyber zálohu", "", "Záloha (*.zip)")
         if not path_str:
+            self._audit_event("restore.cancel", "Restore canceled")
             return
         archive = Path(path_str)
 
@@ -3782,8 +3982,10 @@ class MainWindow(QMainWindow):
             errors.append(f"Refresh UI: {exc}")
 
         if errors:
+            self._audit_event("restore.done", "Restore completed with issues", archive=str(archive), errors=errors)
             QMessageBox.warning(self, "OBNOVIT PROGRAM", "Obnova hotova s výjimkami:\n" + "\n".join(errors))
         else:
+            self._audit_event("restore.done", "Restore completed", archive=str(archive))
             QMessageBox.information(self, "OBNOVIT PROGRAM", "Program byl obnoven ze zálohy.")
 
     def _on_api_show_toggle(self):
@@ -3796,6 +3998,7 @@ class MainWindow(QMainWindow):
 
     def _on_api_clear(self):
         self.ed_api_key.clear()
+        self._audit_event("settings.openai.api_key_clear", "API key field cleared")
 
     def _resolve_api_key(self, *, update_field: bool = True) -> str:
         """
@@ -3833,6 +4036,7 @@ class MainWindow(QMainWindow):
             os.environ["KAJOVOSPEND_OPENAI_API_KEY"] = api_key
             ok = set_user_env_var("KAJOVOSPEND_OPENAI_API_KEY", api_key)
             if ok:
+                self._audit_event("settings.openai.api_key_save", "API key saved to user environment")
                 QMessageBox.information(self, "OpenAI", "API key uložen do uživatelských proměnných systému (a načten do běžící aplikace).")
             else:
                 QMessageBox.warning(self, "OpenAI", "API key se nepodařilo zapsat do systémových proměnných. Hodnota je dostupná jen pro aktuální spuštění.")
@@ -3846,6 +4050,7 @@ class MainWindow(QMainWindow):
             return
         os.environ["KAJOVOSPEND_OPENAI_API_KEY"] = env_api
         self.ed_api_key.setText(env_api)
+        self._audit_event("settings.openai.api_key_load", "API key loaded from environment")
         QMessageBox.information(self, "OpenAI", "API key načten z prostředí.")
 
     def _on_api_test(self):
@@ -3865,6 +4070,7 @@ class MainWindow(QMainWindow):
         if not getattr(self, "progress", None) or not self.progress.can_start():
             QMessageBox.warning(self, "Probíhá akce", "Nelze spustit ověření API key, protože už běží jiná akce.")
             return
+        self._audit_event("settings.openai.api_key_test", "OpenAI API key test started")
         self.progress.start(title="OpenAI", step="Online: ověřuji API key…", total=None)
         self.progress.set_openai_phase("OpenAI API: odesílám požadavek")
         QApplication.processEvents()
@@ -3883,9 +4089,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         if not ok:
+            self._audit_event("settings.openai.api_key_test", "OpenAI API key test finished with empty model list")
             QMessageBox.warning(self, "OpenAI", "API key je platny, ale seznam modelu je prazdny.")
             return
         rec = self._recommend_model(ids)
+        self._audit_event("settings.openai.api_key_test", "OpenAI API key test passed", model_count=len(ids), recommended=rec)
         self.cb_openai_enabled.setChecked(True)
         QMessageBox.information(self, "OpenAI", f"API key OK.\nDoporuceny model: {rec}")
         # neprepisuj uzivatelsky vyber, ale nabidni modely v dropdownu
@@ -3898,6 +4106,7 @@ class MainWindow(QMainWindow):
         if not getattr(self, "progress", None) or not self.progress.can_start():
             QMessageBox.warning(self, "Probíhá akce", "Nelze načíst modely, protože už běží jiná akce.")
             return
+        self._audit_event("settings.openai.models_load", "OpenAI model list load started")
         self.progress.start(title="OpenAI", step="Online: načítám modely…", total=None)
         self.progress.set_openai_phase("OpenAI API: odesílám požadavek")
         QApplication.processEvents()
@@ -3914,12 +4123,13 @@ class MainWindow(QMainWindow):
             self.progress.finish("Hotovo.")
         except Exception:
             pass
-        dlg.close()
         if not ids:
+            self._audit_event("settings.openai.models_load", "OpenAI model list empty")
             QMessageBox.information(self, "Modely OpenAI", "Zadne modely nenalezeny.")
             return
 
         rec_primary, rec_fallback = self._populate_model_combos(ids, auto_fill=True)
+        self._audit_event("settings.openai.models_load", "OpenAI model list loaded", model_count=len(ids), recommended_primary=rec_primary, recommended_fallback=rec_fallback)
         self.cb_openai_enabled.setChecked(True)
         msg = (
             "Modely nacteny.\n"
@@ -3993,6 +4203,7 @@ class MainWindow(QMainWindow):
                 self.progress.finish(self._import_status)
         except Exception:
             pass
+        self._audit_event("import.done", "Import finished", imported=imported, total=total, status=self._import_status)
         try:
             self.refresh_ops()
             self.refresh_unprocessed()
@@ -4010,6 +4221,7 @@ class MainWindow(QMainWindow):
             self.lbl_run_status.setText(self._import_status)
         except Exception:
             pass
+        self._audit_event("import.error", "Import failed", error=msg)
         QMessageBox.critical(self, "IMPORTUJ", msg)
         try:
             if getattr(self, "progress", None) and self.progress.active:
@@ -4052,6 +4264,7 @@ class MainWindow(QMainWindow):
             # If the check fails for any reason, continue with normal import flow.
             pass
 
+        self._audit_event("import.start", "Import started", input_dir=input_dir_val, output_dir=output_dir_val)
         self._import_running = True
         self._import_stop_event.clear()
         self._import_status = "Načítám INPUT…"
@@ -4063,10 +4276,12 @@ class MainWindow(QMainWindow):
             pass
 
         # One progress dialog for the whole import run.
-        self.progress.start(title="IMPORT", step=self._import_status, total=None, batch_total=0, cancel_cb=self._import_stop_event.set)
+        self.progress.start(title="IMPORT", step=self._import_status, total=None, batch_total=0, cancel_cb=self._cancel_import_now)
 
         th = QThread(self)
         wk = _ImportWorker(self.cfg, self.sf, self.processor, self._import_stop_event.is_set)
+        self._import_thread = th
+        self._import_worker = wk
         wk.moveToThread(th)
         th.started.connect(wk.run)
         wk.progress.connect(self._on_import_progress)
@@ -4097,6 +4312,8 @@ class MainWindow(QMainWindow):
                 self._workers.remove(wk)
             except Exception:
                 pass
+            self._import_thread = None
+            self._import_worker = None
             # Failsafe: if the worker finishes but the UI didn't get a done/error
             # signal for any reason, ensure the progress dialog is closed.
             try:
@@ -4119,6 +4336,7 @@ class MainWindow(QMainWindow):
     def on_import_stop(self) -> None:
         if not self._import_running:
             return
+        self._audit_event("import.stop.request", "Import stop requested")
         self._import_stop_event.set()
         self._import_status = "Zastavuji import…"
         try:
@@ -4128,6 +4346,43 @@ class MainWindow(QMainWindow):
             pass
         self.processor.log.info("Import stop requested by user.")
 
+    def _force_stop_thread(self, th: QThread | None, *, wait_ms: int = 1200) -> None:
+        if th is None:
+            return
+        try:
+            if not th.isRunning():
+                return
+        except Exception:
+            return
+        try:
+            th.requestInterruption()
+        except Exception:
+            pass
+        try:
+            th.quit()
+            if th.wait(wait_ms):
+                return
+        except Exception:
+            pass
+        try:
+            th.terminate()
+            th.wait(wait_ms)
+        except Exception:
+            pass
+
+    def _cancel_import_now(self) -> None:
+        self._audit_event("import.cancel", "Import canceled by user")
+        self._import_stop_event.set()
+        self._force_stop_thread(self._import_thread)
+        self._import_running = False
+        self._import_status = "Zastaveno uživatelem."
+        try:
+            self.btn_import.setEnabled(True)
+            self.btn_import_stop.setEnabled(False)
+            self.lbl_run_status.setText(self._import_status)
+        except Exception:
+            pass
+
     def _retry_extract(self, file_id: int, use_openai: bool) -> None:
         """Opakované vytěžení konkrétního souboru (offline nebo OpenAI) s průběhem."""
 
@@ -4135,7 +4390,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Probíhá akce", "Nelze spustit opakované vytěžení, protože už běží jiná akce.")
             return
         mode = "Online" if use_openai else "Offline"
-        self.progress.start(title="Opakovat vytěžení", step=f"{mode}: připravuji…", total=None)
+        try:
+            self._audit_event("retry.single.start", "Single retry started", mode=mode.lower(), file_id=int(file_id))
+        except Exception:
+            pass
+        self.progress.start(title="Opakovat vytezeni", step=f"{mode}: pripravuji...", total=None, cancel_cb=lambda: None)
 
         def status_cb(msg: str) -> None:
             try:
@@ -4179,6 +4438,17 @@ class MainWindow(QMainWindow):
                             "only_openai": True,
                         }
                     )
+                    # Keep retry strictly online and skip expensive offline ensemble passes.
+                    ocr_cfg = cfg.get("ocr", {})
+                    if not isinstance(ocr_cfg, dict):
+                        ocr_cfg = {}
+                    ocr_cfg["force_ocr_on_parse_failure"] = False
+                    ens_cfg = ocr_cfg.get("ensemble", {})
+                    if not isinstance(ens_cfg, dict):
+                        ens_cfg = {}
+                    ens_cfg["enabled"] = False
+                    ocr_cfg["ensemble"] = ens_cfg
+                    cfg["ocr"] = ocr_cfg
                     key = self._resolve_api_key(update_field=False)
                     if not key:
                         raise ValueError("OpenAI API key není k dispozici.")
@@ -4194,7 +4464,7 @@ class MainWindow(QMainWindow):
                     )
                 cfg["openai"] = openai_cfg
 
-                proc = Processor(cfg, self.paths, self.log)
+                proc = Processor(cfg, self.paths, self.log, self.sf, self.sf_production)
                 res = proc.process_path(session, p, status_cb=status_cb, force=True, job_id=None)
                 session.commit()
                 return res
@@ -4225,7 +4495,11 @@ class MainWindow(QMainWindow):
                 pass
             QMessageBox.warning(self, "Opakovat vytěžení", str(msg))
 
-        _SilentRunner.run(self, fn, ok, err, timeout_ms=120_000)
+        cancel_state: dict[str, Any] = {}
+        _SilentRunner.run(self, fn, ok, err, timeout_ms=120_000, cancel_state=cancel_state)
+        cancel_cb = cancel_state.get("cancel")
+        if callable(cancel_cb):
+            self.progress.set_cancel_callback(cancel_cb)
 
     def _open_ops_file(self, path: str | None) -> None:
         """Otevře soubor asociovanou aplikací OS (best-effort)."""
@@ -4271,7 +4545,32 @@ class MainWindow(QMainWindow):
         if not ids:
             QMessageBox.information(self, "Provozní panel", "Nejdříve zaškrtněte soubory v prvním sloupci.")
             return
-        self._retry_extract_many(ids, use_openai=False)
+        self._retry_extract_many(ids, use_openai=self._default_retry_use_openai())
+
+    def _default_retry_use_openai(self) -> bool:
+        """Resolve retry mode from live UI first, then persisted config."""
+        try:
+            # Prefer live controls (user may not have pressed Save yet).
+            if hasattr(self, "cb_openai_only") and bool(self.cb_openai_only.isChecked()):
+                return True
+            if hasattr(self, "cb_openai_primary") and bool(self.cb_openai_primary.isChecked()):
+                return True
+            if hasattr(self, "cb_openai_fallback") and bool(self.cb_openai_fallback.isChecked()):
+                return True
+        except Exception:
+            pass
+        try:
+            openai_cfg = self.cfg.get("openai", {}) if isinstance(self.cfg, dict) else {}
+            if not isinstance(openai_cfg, dict):
+                return False
+            return bool(
+                openai_cfg.get("only_openai", False)
+                or openai_cfg.get("primary_enabled", False)
+                or openai_cfg.get("fallback_enabled", False)
+                or openai_cfg.get("enabled", False)
+            )
+        except Exception:
+            return False
 
     def _process_retry_extract(
         self,
@@ -4304,6 +4603,17 @@ class MainWindow(QMainWindow):
                     "only_openai": True,
                 }
             )
+            # Keep retry strictly online and skip expensive offline ensemble passes.
+            ocr_cfg = cfg.get("ocr", {})
+            if not isinstance(ocr_cfg, dict):
+                ocr_cfg = {}
+            ocr_cfg["force_ocr_on_parse_failure"] = False
+            ens_cfg = ocr_cfg.get("ensemble", {})
+            if not isinstance(ens_cfg, dict):
+                ens_cfg = {}
+            ens_cfg["enabled"] = False
+            ocr_cfg["ensemble"] = ens_cfg
+            cfg["ocr"] = ocr_cfg
             key = self._resolve_api_key(update_field=False)
             if not key:
                 raise ValueError("OpenAI API key není k dispozici.")
@@ -4319,7 +4629,7 @@ class MainWindow(QMainWindow):
             )
         cfg["openai"] = openai_cfg
 
-        proc = Processor(cfg, self.paths, self.log)
+        proc = Processor(cfg, self.paths, self.log, self.sf, self.sf_production)
         res = proc.process_path(session, p, status_cb=status_cb, force=True, job_id=None)
         session.commit()
         return res
@@ -4335,7 +4645,11 @@ class MainWindow(QMainWindow):
 
         total = len(ids)
         mode = "Online" if use_openai else "Offline"
-        self.progress.start(title="Opakovat vytěžení", step=f"{mode}: připravuji ({total} souborů)…", total=total, batch_total=total)
+        try:
+            self._audit_event("retry.batch.start", "Batch retry started", mode=mode.lower(), total=total)
+        except Exception:
+            pass
+        self.progress.start(title="Opakovat vytěžení", step=f"{mode}: připravuji ({total} souborů)…", total=total, batch_total=total, cancel_cb=lambda: None)
 
         def set_progress(done: int, message: str) -> None:
             done_count = max(0, min(int(done), total))
@@ -4374,6 +4688,7 @@ class MainWindow(QMainWindow):
                     ok_count += 1
                     set_progress(idx, f"[{idx}/{total}] Hotovo (ID {fid}).")
                 except Exception as exc:
+                    self.log.exception("Retry extract failed for file_id=%s (mode=%s)", fid, "online" if use_openai else "offline")
                     failed_ids.append(fid)
                     QTimer.singleShot(0, self, lambda: (self.progress.mark_batch_done("ERROR") if getattr(self, "progress", None) and self.progress.active else None))
                     set_progress(idx, f"[{idx}/{total}] Chyba (ID {fid}): {exc}")
@@ -4413,7 +4728,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Opakovat vytěžení", str(msg))
 
         timeout_ms = max(120_000, 120_000 * total)
-        _SilentRunner.run(self, fn, ok, err, timeout_ms=timeout_ms)
+        cancel_state: dict[str, Any] = {}
+        _SilentRunner.run(self, fn, ok, err, timeout_ms=timeout_ms, cancel_state=cancel_state)
+        cancel_cb = cancel_state.get("cancel")
+        if callable(cancel_cb):
+            self.progress.set_cancel_callback(cancel_cb)
 
     def _ops_delete_selected(self) -> None:
         ids = self._ops_selected_file_ids()
@@ -4456,7 +4775,7 @@ class MainWindow(QMainWindow):
         if not ids:
             QMessageBox.information(self, "Provozní panel", "Není co opakovat – nevytěžené soubory nebyly nalezeny.")
             return
-        self._retry_extract_many(ids, use_openai=False)
+        self._retry_extract_many(ids, use_openai=self._default_retry_use_openai())
 
     def refresh_suppliers(self):
         q = self.sup_filter.text()
@@ -5718,14 +6037,47 @@ class MainWindow(QMainWindow):
             return False, str(exc), ""
 
     def closeEvent(self, event):
-        # Make sure background threads are stopped to avoid PySide warnings.
-        for th in list(self._threads):
+        self._audit_event("app.close", "Application closing")
+        # Make sure all Qt worker threads are fully stopped before window destruction.
+        try:
+            self._import_stop_event.set()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "progress", None) and self.progress.active:
+                self.progress.abort("Zavírám aplikaci…")
+        except Exception:
+            pass
+        threads: list[QThread] = []
+        for th in list(getattr(self, "_threads", [])):
+            if th is not None:
+                threads.append(th)
+        try:
+            if self._import_thread is not None:
+                threads.append(self._import_thread)
+        except Exception:
+            pass
+        try:
+            for th in self.findChildren(QThread):
+                if th is not None:
+                    threads.append(th)
+        except Exception:
+            pass
+        seen: set[int] = set()
+        for th in threads:
+            tid = id(th)
+            if tid in seen:
+                continue
+            seen.add(tid)
             try:
-                if th.isRunning():
-                    th.quit()
-                    th.wait(2000)
+                self._force_stop_thread(th, wait_ms=4000)
             except Exception:
                 pass
+        try:
+            self._import_thread = None
+            self._import_worker = None
+        except Exception:
+            pass
         super().closeEvent(event)
 
     
@@ -5986,20 +6338,35 @@ class MainWindow(QMainWindow):
                 out_base = Path(paths_cfg.get("output_dir", "") or "")
                 qdir = out_base / paths_cfg.get("quarantine_dir_name", "KARANTENA")
                 ddir = out_base / paths_cfg.get("duplicate_dir_name", "DUPLICITY")
-
-                try:
-                    if input_dir.exists():
-                        in_waiting = len([p for p in input_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
-                except Exception:
-                    in_waiting = 0
-                try:
-                    if qdir.exists():
-                        quarantine_fs = len([p for p in qdir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
-                    if ddir.exists():
-                        duplicates_fs = len([p for p in ddir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
-                except Exception:
-                    quarantine_fs = quarantine_fs or 0
-                    duplicates_fs = duplicates_fs or 0
+                now = self._now_monotonic()
+                scan_period_sec = float(self.cfg.get("performance", {}).get("fs_scan_interval_sec") or 20.0)
+                scan_period_sec = max(5.0, scan_period_sec)
+                if now - float(self._last_fs_scan_ts or 0.0) >= scan_period_sec:
+                    in_waiting_local = 0
+                    quarantine_local = 0
+                    duplicates_local = 0
+                    try:
+                        if input_dir.exists():
+                            in_waiting_local = len([p for p in input_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
+                    except Exception:
+                        in_waiting_local = 0
+                    try:
+                        if qdir.exists():
+                            quarantine_local = len([p for p in qdir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
+                        if ddir.exists():
+                            duplicates_local = len([p for p in ddir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
+                    except Exception:
+                        quarantine_local = quarantine_local or 0
+                        duplicates_local = duplicates_local or 0
+                    self._cached_fs_counts = {
+                        "in_waiting": int(in_waiting_local or 0),
+                        "quarantine_fs": int(quarantine_local or 0),
+                        "duplicates_fs": int(duplicates_local or 0),
+                    }
+                    self._last_fs_scan_ts = now
+                in_waiting = int(self._cached_fs_counts.get("in_waiting", 0) or 0)
+                quarantine_fs = int(self._cached_fs_counts.get("quarantine_fs", 0) or 0)
+                duplicates_fs = int(self._cached_fs_counts.get("duplicates_fs", 0) or 0)
                 # Processing DB (ingest) pro přesnější čísla karantény/duplikátů
                 try:
                     with self.pf() as ps:
@@ -6124,6 +6491,8 @@ class MainWindow(QMainWindow):
             self._dash_refresh_inflight = False
 
         _SilentRunner.run(self, work, done, err, timeout_ms=12000)
+
+
 
 
 

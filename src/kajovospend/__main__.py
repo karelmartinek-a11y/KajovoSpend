@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from importlib import import_module
+from multiprocessing import freeze_support
 from pathlib import Path
 
 
@@ -37,4 +38,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Prevent accidental second full GUI instance when spawned by multiprocessing on Windows.
+    freeze_support()
     raise SystemExit(main())

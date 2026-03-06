@@ -244,6 +244,14 @@ class ProgressController:
     ) -> bool:
         if self.active:
             return False
+        # Defensive cleanup for any stale dialog instance.
+        if self.dlg is not None:
+            try:
+                self.dlg.allow_close()
+                self.dlg.close()
+            except Exception:
+                pass
+            self.dlg = None
         self.active = True
         self.batch = BatchSummary(total=int(batch_total or 0), done=0)
         self._cancel_cb = cancel_cb
@@ -284,6 +292,9 @@ class ProgressController:
             self.dlg.set_batch_text(self.batch.as_text())
         self._update_mini()
 
+    def set_cancel_callback(self, cancel_cb) -> None:
+        self._cancel_cb = cancel_cb
+
     def mark_batch_done(self, status: str) -> None:
         if self.batch.total <= 0:
             return
@@ -301,36 +312,49 @@ class ProgressController:
 
     def cancel(self) -> None:
         # Called from UI (cancel button or window close).
+        cb = self._cancel_cb
+        self.abort("Zastaveno.")
         try:
-            if callable(self._cancel_cb):
-                self._cancel_cb()
-        except Exception:
-            pass
-        # Keep progress visible but indicate stop requested.
-        try:
-            if self.active and self.dlg:
-                self.update(step="Zastavuji…")
+            if callable(cb):
+                cb()
         except Exception:
             pass
 
-    def finish(self, final_step: str) -> None:
+    def abort(self, final_step: str = "Zastaveno.") -> None:
         if not self.active:
             return
         try:
             if self.dlg:
                 self.dlg.set_step(final_step)
+                self.dlg.allow_close()
+                self.dlg.close()
+        except Exception:
+            pass
+        self.active = False
+        self._set_openai_andon(False)
+        self.mini.hide()
+        self.dlg = None
+        self._cancel_cb = None
+
+    def finish(self, final_step: str) -> None:
+        if not self.active:
+            return
+        dlg = self.dlg
+        try:
+            if dlg:
+                dlg.set_step(final_step)
                 # Make determinate and full if possible
                 try:
-                    if self.dlg.bar.maximum() > self.dlg.bar.minimum():
-                        self.dlg.set_value(self.dlg.bar.maximum())
+                    if dlg.bar.maximum() > dlg.bar.minimum():
+                        dlg.set_value(dlg.bar.maximum())
                 except Exception:
                     pass
                 # Allow closing now; otherwise closeEvent would emit cancel and ignore.
                 try:
-                    self.dlg.allow_close()
+                    dlg.allow_close()
                 except Exception:
                     pass
-                QTimer.singleShot(300, self.dlg.close)
+                dlg.close()
         except Exception:
             pass
         self.active = False
@@ -392,3 +416,4 @@ class ProgressController:
             self.andon.update()
         except Exception:
             pass
+
