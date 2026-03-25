@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -51,7 +52,7 @@ class ProgressDialog(QDialog):
         self.setWindowModality(Qt.NonModal)
         self.setModal(False)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        self.setMinimumWidth(520)
+        self.setMinimumSize(640, 280)
 
         self._t0 = time.monotonic()
         self._last_heartbeat = 0
@@ -61,42 +62,55 @@ class ProgressDialog(QDialog):
 
         self.lbl_title = QLabel("Pracuji…")
         self.lbl_title.setObjectName("ProgressTitle")
+        self.lbl_title.setWordWrap(True)
+        self.lbl_title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.lbl_step = QLabel("")
         self.lbl_step.setWordWrap(True)
+        self.lbl_step.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.lbl_time = QLabel("00:00")
         self.lbl_time.setObjectName("ProgressTime")
+        self.lbl_time.setMinimumWidth(92)
+        self.lbl_time.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.lbl_heartbeat = QLabel("●")
         self.lbl_heartbeat.setObjectName("ProgressHeartbeat")
         self.lbl_heartbeat.setToolTip("Indikace živosti")
+        self.lbl_heartbeat.setMinimumWidth(18)
+        self.lbl_heartbeat.setAlignment(Qt.AlignCenter)
 
         self.bar = QProgressBar()
         self.bar.setRange(0, 0)
         self.bar.setValue(0)
+        self.bar.setMinimumHeight(28)
 
         self.batch_box = QLabel("")
         self.batch_box.setObjectName("ProgressBatch")
         self.batch_box.setWordWrap(True)
+        self.batch_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.batch_box.hide()
 
         self.btn_min = QPushButton("Minimalizovat")
         self.btn_min.clicked.connect(self._on_minimize)
+        self.btn_min.setMinimumWidth(128)
 
         self.btn_cancel = QPushButton("Zastavit")
         self.btn_cancel.clicked.connect(self._on_cancel)
+        self.btn_cancel.setMinimumWidth(128)
 
         top = QHBoxLayout()
+        top.setSpacing(12)
         top.addWidget(self.lbl_title, 1)
         top.addWidget(self.lbl_heartbeat)
 
         mid = QHBoxLayout()
+        mid.setSpacing(12)
         mid.addWidget(self.lbl_time)
         mid.addStretch(1)
         mid.addWidget(self.btn_min)
         mid.addWidget(self.btn_cancel)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(8)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
         lay.addLayout(top)
         lay.addWidget(self.lbl_step)
         lay.addWidget(self.bar)

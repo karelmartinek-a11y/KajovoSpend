@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from typing import Set
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -279,22 +278,7 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
             con.execute(text("ALTER TABLE items ADD COLUMN id_receipt INTEGER"))
         if "id_supplier" not in item_col_names:
             con.execute(text("ALTER TABLE items ADD COLUMN id_supplier INTEGER"))
-        if "group_id" not in item_col_names:
-            con.execute(text("ALTER TABLE items ADD COLUMN group_id INTEGER"))
-
-        # Item groups table
-        con.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS item_groups (
-                    id_group INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE NOT NULL,
-                    color TEXT NULL,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-        )
+        _ensure_item_groups_schema(con, item_col_names)
 
         # Standard receipt templates
         con.execute(
@@ -392,6 +376,27 @@ def _ensure_columns_and_indexes(engine: Engine) -> None:
             )
 
 
+def _ensure_item_groups_schema(con, item_col_names: set[str] | None = None) -> None:
+    cols_items = item_col_names
+    if cols_items is None:
+        cols = con.execute(text("PRAGMA table_info('items')")).fetchall()
+        cols_items = {row[1] for row in cols}
+    if "group_id" not in cols_items:
+        con.execute(text("ALTER TABLE items ADD COLUMN group_id INTEGER"))
+    con.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS item_groups (
+                id_group INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                color TEXT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+
+
 def init_db(engine: Engine) -> None:
     # ensure tables exist
     Base.metadata.create_all(engine)
@@ -414,6 +419,8 @@ def init_working_db(engine: Engine) -> None:
     """Create working DB schema (workflow/operational)."""
     BaseWorking.metadata.create_all(engine)
     # working DB intentionally omits FTS; keep lean for workflow.
+    with engine.begin() as con:
+        _ensure_item_groups_schema(con)
 
 
 def init_production_db(engine: Engine) -> None:

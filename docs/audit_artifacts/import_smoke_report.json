@@ -1,0 +1,111 @@
+{
+  "workspace": "C:\\Users\\provo\\AppData\\Local\\Temp\\kajovospend-import-smoke-ulo8yf1_",
+  "config_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\kajovospend-import-smoke-ulo8yf1_\\config.yaml",
+  "fixture_pdf": "C:\\Users\\provo\\AppData\\Local\\Temp\\kajovospend-import-smoke-ulo8yf1_\\fixture.pdf",
+  "processed_pdf": "C:\\Users\\provo\\AppData\\Local\\Temp\\kajovospend-import-smoke-ulo8yf1_\\input\\smoke_invoice.pdf",
+  "log_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\kajovospend-import-smoke-ulo8yf1_\\logs\\import_smoke.log",
+  "processor_result": {
+    "status": "PROCESSED",
+    "sha256": "5c1bbaa50fe01a6ca1d8ccbecdf72b9b8091cf5b0e9d899be540c59c48c2041d",
+    "file_id": 1,
+    "document_ids": [
+      1
+    ],
+    "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\kajovospend-import-smoke-ulo8yf1_\\output\\smoke_invoice.pdf",
+    "text_method": "embedded",
+    "text_debug": {
+      "path": "C:\\Users\\provo\\AppData\\Local\\Temp\\kajovospend-import-smoke-ulo8yf1_\\input\\smoke_invoice.pdf",
+      "embedded_scores": [
+        0.7342272727272726
+      ],
+      "embedded": {
+        "pages": 1,
+        "pages_nonempty": 1,
+        "chars_total": 96,
+        "chars_non_ws": 84,
+        "ratio_printable": 0.9583333333333334,
+        "ratio_non_ws": 0.875,
+        "ratio_letters": 0.5238095238095238,
+        "ratio_digits": 0.39285714285714285,
+        "ratio_replacement": 0.0,
+        "avg_line_len": 18.4
+      },
+      "embedded_pages_with_text": 1,
+      "weak_pages": 0,
+      "dpi": 300,
+      "method": "embedded",
+      "page_audit": [
+        {
+          "page_no": 1,
+          "chosen_mode": "embedded",
+          "chosen_score": 0.7342272727272726,
+          "embedded_score": 0.7342272727272726,
+          "ocr_score": 0.0,
+          "embedded_len": 96,
+          "ocr_len": 0,
+          "ocr_conf": 0.0,
+          "token_groups": 4
+        }
+      ],
+      "ensemble": {
+        "baseline_score": [
+          1,
+          4,
+          1,
+          1,
+          1000
+        ],
+        "candidates": [
+          {
+            "score": [
+              1,
+              4,
+              1,
+              1,
+              1000
+            ],
+            "meta": {
+              "dpi": 200,
+              "rotations": [
+                0,
+                90,
+                180,
+                270
+              ],
+              "include_reconstructed": true
+            },
+            "conf": 0.9210256353687056,
+            "len": 96
+          },
+          {
+            "score": [
+              1,
+              4,
+              1,
+              1,
+              1000
+            ],
+            "meta": {
+              "dpi": 300,
+              "rotations": [
+                0,
+                90,
+                180,
+                270
+              ],
+              "include_reconstructed": true
+            },
+            "conf": 0.9099912456757779,
+            "len": 96
+          }
+        ]
+      }
+    },
+    "forensic_bundle": "C:\\Users\\provo\\AppData\\Local\\Temp\\kajovospend-import-smoke-ulo8yf1_\\output\\FORENSIC\\smoke_invoice__5c1bbaa50fe0__processed.forensic.json",
+    "id_in": null
+  },
+  "status": "PROCESSED",
+  "document_ids": [
+    1
+  ]
+}

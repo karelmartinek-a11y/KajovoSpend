@@ -14,6 +14,10 @@ QWidget {
   color: #111827;
   font-size: 12px;
 }
+QScrollArea {
+  border: none;
+  background: transparent;
+}
 
 /* Header */
 QWidget#HeaderBar {
@@ -41,6 +45,29 @@ QWidget#DashTile {
 QLabel#CardTitle, QLabel#DashTitle { color: #111827; font-weight: 700; }
 QLabel#CardValue, QLabel#DashValue { color: #2F8FE5; font-weight: 900; font-size: 20px; }
 QLabel#DashHeadline { color: #111827; font-size: 14px; font-weight: 800; }
+QLabel#SummaryKey {
+  color: #6B7280;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+QLabel#SummaryValue {
+  color: #111827;
+  font-size: 13px;
+  font-weight: 700;
+}
+QWidget#SummaryPanel {
+  background: #F9FAFB;
+  border: 1px solid #E5E7EB;
+  border-radius: 12px;
+}
+QLabel#DocSupplierInfo {
+  background: #F9FAFB;
+  border: 1px solid #E5E7EB;
+  border-radius: 12px;
+  padding: 10px 12px;
+  color: #111827;
+}
 QFrame#DashSeparator {
   background: #111827;
   border: none;

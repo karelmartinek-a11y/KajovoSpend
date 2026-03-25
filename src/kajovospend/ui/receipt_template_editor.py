@@ -51,6 +51,7 @@ from kajovospend.extract.standard_receipts import (
 )
 from kajovospend.ocr.pdf_render import render_pdf_to_images
 from kajovospend.utils.hashing import sha256_file
+from kajovospend.ui.layout_utils import FlowLayout, set_button_min_widths, set_editor_char_width, tune_form_layout
 
 log = logging.getLogger(__name__)
 
@@ -518,6 +519,7 @@ class ReceiptTemplateEditorDialog(QDialog):
         body.addWidget(left, 0)
 
         self.ed_name = QLineEdit(self._template.get("name") or "")
+        set_editor_char_width(self.ed_name, 32, floor=360)
         self.chk_enabled = QCheckBox("Aktivní")
         self.chk_enabled.setChecked(bool(self._template.get("enabled", True)))
 
@@ -532,6 +534,7 @@ class ReceiptTemplateEditorDialog(QDialog):
         sample_row.addWidget(self.btn_open_pdf)
 
         top_form = QFormLayout()
+        tune_form_layout(top_form, label_width=130)
         top_form.addRow("Název", self.ed_name)
         top_form.addRow(self.chk_enabled)
         top_form.addRow("Vzorový PDF", self.lbl_sample)
@@ -555,11 +558,12 @@ class ReceiptTemplateEditorDialog(QDialog):
         self.lbl_draw_hint.setWordWrap(True)
         left_layout.addWidget(self.lbl_draw_hint)
 
-        row_actions = QHBoxLayout()
+        row_actions = FlowLayout(h_spacing=8, v_spacing=8)
         self.btn_delete_selected_roi = QPushButton("Smazat vybranou oblast")
         self.btn_delete_selected_roi.clicked.connect(self._delete_selected_roi)
         self.btn_reassign_selected_roi = QPushButton("Přiřadit vybranou oblast k poli")
         self.btn_reassign_selected_roi.clicked.connect(self._reassign_selected_roi)
+        set_button_min_widths(self.btn_delete_selected_roi, self.btn_reassign_selected_roi)
         row_actions.addWidget(self.btn_delete_selected_roi)
         row_actions.addWidget(self.btn_reassign_selected_roi)
         left_layout.addLayout(row_actions)
@@ -611,10 +615,14 @@ class ReceiptTemplateEditorDialog(QDialog):
         self.btn_zoom_out = QPushButton("-")
         self.btn_zoom_in = QPushButton("+")
         self.btn_fit_width = QPushButton("Na šířku")
+        set_button_min_widths(self.btn_fit_width)
+        self.btn_prev_page.setMinimumWidth(44)
+        self.btn_next_page.setMinimumWidth(44)
+        self.btn_zoom_out.setMinimumWidth(44)
+        self.btn_zoom_in.setMinimumWidth(44)
+        self.lbl_page.setMinimumWidth(160)
         self.btn_prev_page.clicked.connect(self._go_prev_page)
         self.btn_next_page.clicked.connect(self._go_next_page)
-        self.btn_zoom_out.clicked.connect(lambda: self.canvas.scale(0.85, 0.85))
-        self.btn_zoom_in.clicked.connect(lambda: self.canvas.scale(1.2, 1.2))
         for w in (self.btn_prev_page, self.btn_next_page, self.lbl_page, self.btn_zoom_out, self.btn_zoom_in, self.btn_fit_width):
             toolbar.addWidget(w)
         toolbar.addStretch(1)
@@ -625,6 +633,8 @@ class ReceiptTemplateEditorDialog(QDialog):
         self.canvas.roi_changed.connect(self._on_roi_changed)
         self.canvas.roi_selected.connect(self._on_roi_selected)
         self.canvas.roi_cleared.connect(self._on_roi_cleared)
+        self.btn_zoom_out.clicked.connect(lambda: self.canvas.scale(0.85, 0.85))
+        self.btn_zoom_in.clicked.connect(lambda: self.canvas.scale(1.2, 1.2))
         self.btn_fit_width.clicked.connect(self.canvas.fit_to_width)
         right_layout.addWidget(self.canvas, 1)
 

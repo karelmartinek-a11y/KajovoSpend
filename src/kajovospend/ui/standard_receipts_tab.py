@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -91,11 +92,17 @@ class StandardReceiptsTab(QWidget):
         self._templates: List[Dict[str, Any]] = []
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
         top_label = QLabel("Správa standardních účtenek")
         top_label.setWordWrap(True)
+        top_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         layout.addWidget(top_label)
 
         self.table = QTableView()
+        self.table.setMinimumHeight(280)
+        self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.verticalHeader().setVisible(False)
@@ -105,20 +112,41 @@ class StandardReceiptsTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table)
 
-        btn_layout = QHBoxLayout()
+        def _fit_button(btn: QPushButton, minimum: int = 120) -> None:
+            btn.setMinimumWidth(max(minimum, btn.fontMetrics().horizontalAdvance(btn.text()) + 28))
+            btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+
         self.btn_add = QPushButton("Přidat")
         self.btn_add.clicked.connect(self._add_template)
+        _fit_button(self.btn_add, 96)
         self.btn_edit = QPushButton("Editovat")
         self.btn_edit.clicked.connect(self._edit_template)
+        _fit_button(self.btn_edit, 104)
         self.btn_delete = QPushButton("Smazat")
         self.btn_delete.clicked.connect(self._delete_template)
+        _fit_button(self.btn_delete, 96)
         self.btn_open = QPushButton("Otevřít vzor")
         self.btn_open.clicked.connect(self._open_sample)
+        _fit_button(self.btn_open, 132)
         self.btn_copy_legend = QPushButton("Zkopírovat legendu")
         self.btn_copy_legend.clicked.connect(self._copy_legend)
-        for btn in (self.btn_add, self.btn_edit, self.btn_delete, self.btn_open, self.btn_copy_legend):
-            btn_layout.addWidget(btn)
-        layout.addLayout(btn_layout)
+        _fit_button(self.btn_copy_legend, 160)
+
+        actions_top = QHBoxLayout()
+        actions_top.setSpacing(10)
+        actions_top.addWidget(self.btn_add)
+        actions_top.addWidget(self.btn_edit)
+        actions_top.addWidget(self.btn_delete)
+        actions_top.addStretch(1)
+
+        actions_bottom = QHBoxLayout()
+        actions_bottom.setSpacing(10)
+        actions_bottom.addWidget(self.btn_open)
+        actions_bottom.addWidget(self.btn_copy_legend)
+        actions_bottom.addStretch(1)
+
+        layout.addLayout(actions_top)
+        layout.addLayout(actions_bottom)
 
         self.table.selectionModel().selectionChanged.connect(self._update_action_state)
         self._update_action_state()

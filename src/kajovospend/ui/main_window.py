@@ -61,6 +61,7 @@ from kajovospend.utils.env import load_user_env_var, set_user_env_var, sanitize_
 
 from .styles import QSS
 from .standard_receipts_tab import StandardReceiptsTab
+from .layout_utils import FlowLayout, set_button_min_widths, set_editor_char_width, style_as_panel, tune_form_layout
 from . import db_api
 from .main_window_newdb import init_new_db
 
@@ -274,7 +275,8 @@ class DashboardTile(QWidget):
         self.setObjectName("DashTile")
 
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        self.setMinimumHeight(80 if compact else 150)
+        self.setMinimumWidth(180 if compact else 220)
+        self.setMinimumHeight(116 if compact else 164)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
@@ -294,23 +296,56 @@ class DashboardTile(QWidget):
 
         self.lbl_value = QLabel("-")
         f: QFont = self.lbl_value.font()
-        f.setPointSize(24 if compact else 36)
+        f.setPointSize(20 if compact else 28)
         f.setBold(True)
         self.lbl_value.setFont(f)
         self.lbl_value.setAlignment(Qt.AlignCenter)
         self.lbl_value.setObjectName("DashValue")
         self.lbl_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.lbl_value.setSizePolicy(self.lbl_value.sizePolicy().horizontalPolicy(), QSizePolicy.Fixed)
+        self.lbl_value.setMinimumHeight(34 if compact else 44)
         lay.addWidget(self.lbl_value)
 
         lbl_title = QLabel(title)
         lbl_title.setAlignment(Qt.AlignCenter)
         lbl_title.setObjectName("DashTitle")
         lbl_title.setWordWrap(True)
+        lbl_title.setMinimumHeight(32 if compact else 40)
         lay.addWidget(lbl_title)
+        lay.addStretch(1)
 
     def set_value(self, text: str) -> None:
         self.lbl_value.setText(text)
+
+
+class SummaryPanel(QWidget):
+    def __init__(self, fields: list[tuple[str, str]], parent=None):
+        super().__init__(parent)
+        self.setObjectName("SummaryPanel")
+        style_as_panel(self)
+        self._value_labels: dict[str, QLabel] = {}
+
+        grid = QGridLayout(self)
+        grid.setContentsMargins(12, 10, 12, 10)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(8)
+
+        for index, (key, title) in enumerate(fields):
+            row = (index // 2) * 2
+            col = index % 2
+            title_label = QLabel(title)
+            title_label.setObjectName("SummaryKey")
+            value_label = QLabel("-")
+            value_label.setObjectName("SummaryValue")
+            value_label.setWordWrap(True)
+            grid.addWidget(title_label, row, col)
+            grid.addWidget(value_label, row + 1, col)
+            grid.setColumnStretch(col, 1)
+            self._value_labels[key] = value_label
+
+    def set_values(self, values: dict[str, str]) -> None:
+        for key, label in self._value_labels.items():
+            label.setText(values.get(key) or "-")
 
 
 class TableModel(QAbstractTableModel):
@@ -853,9 +888,12 @@ class SupplierDialog(QDialog):
     def __init__(self, parent=None, initial: Optional[Dict[str, Any]] = None):
         super().__init__(parent)
         self.setWindowTitle("Dodavatel")
+        self.resize(760, 520)
+        self.setMinimumWidth(680)
         self._initial = initial or {}
         lay = QVBoxLayout(self)
         form = QFormLayout()
+        tune_form_layout(form, label_width=190)
 
         self.ed_ico = QLineEdit(self._initial.get("ico", "") or "")
         self.ed_name = QLineEdit(self._initial.get("name", "") or "")
@@ -1033,13 +1071,18 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(QSS)
         self.setStyleSheet(QSS)
 
-        # start maximized on primary monitor
-        primary = QGuiApplication.primaryScreen()
-        if primary is not None:
-            geom = primary.availableGeometry()
-            self.setGeometry(geom)
-            self.move(geom.topLeft())
-        self.showMaximized()
+        # V headless/offscreen běhu potřebujeme fixní velké plátno pro audit a screenshoty.
+        qt_platform = str(os.environ.get("QT_QPA_PLATFORM", "")).strip().lower()
+        if qt_platform == "offscreen":
+            self.resize(1680, 1200)
+            self.show()
+        else:
+            primary = QGuiApplication.primaryScreen()
+            if primary is not None:
+                geom = primary.availableGeometry()
+                self.setGeometry(geom)
+                self.move(geom.topLeft())
+            self.showMaximized()
 
         # build UI and timers
         self._build_ui()
@@ -1502,6 +1545,7 @@ class MainWindow(QMainWindow):
             self.logo.setPixmap(px)
         title = QLabel("KájovoSpend")
         title.setObjectName("TitleLabel")
+        title.setMinimumWidth(240)
 
         left = QWidget()
         left.setProperty("panel", True)
@@ -1525,6 +1569,7 @@ class MainWindow(QMainWindow):
 
         self.btn_exit = QPushButton("EXIT")
         self.btn_exit.setObjectName("ExitButton")
+        set_button_min_widths(self.btn_exit)
 
         hl.addStretch(1)
         hl.addWidget(self.btn_exit)
@@ -1532,8 +1577,11 @@ class MainWindow(QMainWindow):
         v.addWidget(header)
 
         self.tabs = QTabWidget()
-        self.tabs.setMinimumSize(QSize(640, 480))
-        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+        self.tabs.setMinimumSize(QSize(1120, 720))
+        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.tabBar().setElideMode(Qt.ElideNone)
+        self.tabs.tabBar().setExpanding(False)
         v.addWidget(self.tabs, 1)
 
                 
@@ -1554,6 +1602,7 @@ class MainWindow(QMainWindow):
         self.btn_import_stop = QPushButton("ZASTAVIT IMPORT")
         self.btn_import_stop.setToolTip("Okamžitě zastaví aktuální import ze složky IN. Nedokončené soubory se ztratí.")
         self.btn_import_stop.setEnabled(False)
+        set_button_min_widths(self.btn_import, self.btn_import_stop)
 
         self.lbl_run_status = QLabel(self._import_status)
         self.lbl_run_status.setWordWrap(True)
@@ -1580,30 +1629,25 @@ class MainWindow(QMainWindow):
         dash_vbox.addWidget(lbl_sect1)
 
         sect1 = QWidget()
-        sect1_grid = QGridLayout(sect1)
-        sect1_grid.setContentsMargins(0, 0, 0, 0)
-        sect1_grid.setHorizontalSpacing(12)
-        sect1_grid.setVerticalSpacing(8)
+        sect1_layout = FlowLayout(sect1, h_spacing=12, v_spacing=12)
         dash_vbox.addWidget(sect1)
 
-        def add_tile1(key: str, title: str, icon: str, r: int, c: int, rs: int = 1, cs: int = 1):
+        def add_tile1(key: str, title: str, icon: str):
             t = DashboardTile(title, icon=None, pixmap=None, compact=True)
-            sect1_grid.addWidget(t, r, c, rs, cs)
+            sect1_layout.addWidget(t)
             self._dash_tiles[key] = t
             return t
 
-        # Řada 0: Počty souborů dle výsledku
-        add_tile1("in_waiting", "Čeká v IN", "inbox", 0, 0)
-        add_tile1("processed_total", "Zpracováno", "check", 0, 1)
-        add_tile1("quarantine_total", "Karanténa", "quarantine", 0, 2)
-        add_tile1("quarantine_dup", "Duplicity", "duplicate", 0, 3)
+        add_tile1("in_waiting", "Čeká v IN", "inbox")
+        add_tile1("processed_total", "Zpracováno", "check")
+        add_tile1("quarantine_total", "Karanténa", "quarantine")
+        add_tile1("quarantine_dup", "Duplicity", "duplicate")
 
-        # Řada 1: Procentuální úspěšnost ze všech zpracovaných souborů
-        t_pct_off = add_tile1("pct_offline", "% Offline extrakce", "percent", 1, 0)
-        t_pct_ai = add_tile1("pct_openai", "% OpenAI extrakce", "percent", 1, 1)
-        t_pct_template = add_tile1("pct_template", "% Šablonová extrakce", "percent", 1, 2)
-        t_pct_q = add_tile1("pct_quarantine", "% Karanténa", "percent", 1, 3)
-        t_pct_d = add_tile1("pct_duplicate", "% Duplicita", "percent", 1, 4)
+        t_pct_off = add_tile1("pct_offline", "% Offline extrakce", "percent")
+        t_pct_ai = add_tile1("pct_openai", "% OpenAI extrakce", "percent")
+        t_pct_template = add_tile1("pct_template", "% Šablonová extrakce", "percent")
+        t_pct_q = add_tile1("pct_quarantine", "% Karanténa", "percent")
+        t_pct_d = add_tile1("pct_duplicate", "% Duplicita", "percent")
 
         self._stat_labels["pct_offline"] = t_pct_off.lbl_value
         self._stat_labels["pct_openai"] = t_pct_ai.lbl_value
@@ -1611,10 +1655,9 @@ class MainWindow(QMainWindow):
         self._stat_labels["pct_quarantine"] = t_pct_q.lbl_value
         self._stat_labels["pct_duplicate"] = t_pct_d.lbl_value
 
-        # Řada 2: Stav služby
-        t_power = add_tile1("import_power", "Stav služby", "status", 2, 0)
-        t_activity = add_tile1("import_activity", "Co se děje teď", "status", 2, 1)
-        t_eta = add_tile1("import_eta", "Odhad dokončení", "clock", 2, 2)
+        t_power = add_tile1("import_power", "Stav služby", "status")
+        t_activity = add_tile1("import_activity", "Co se děje teď", "status")
+        t_eta = add_tile1("import_eta", "Odhad dokončení", "clock")
 
         self._stat_labels["import_power"] = t_power.lbl_value
         self._stat_labels["import_activity"] = t_activity.lbl_value
@@ -1632,40 +1675,34 @@ class MainWindow(QMainWindow):
         dash_vbox.addWidget(lbl_sect2)
 
         sect2 = QWidget()
-        sect2_grid = QGridLayout(sect2)
-        sect2_grid.setContentsMargins(0, 0, 0, 0)
-        sect2_grid.setHorizontalSpacing(12)
-        sect2_grid.setVerticalSpacing(8)
+        sect2_layout = FlowLayout(sect2, h_spacing=12, v_spacing=12)
         dash_vbox.addWidget(sect2)
 
-        def add_tile2(key: str, title: str, icon: str, r: int, c: int, rs: int = 1, cs: int = 1):
+        def add_tile2(key: str, title: str, icon: str):
             t = DashboardTile(title, icon=None, pixmap=None)
-            sect2_grid.addWidget(t, r, c, rs, cs)
+            sect2_layout.addWidget(t)
             self._dash_tiles[key] = t
             return t
 
-        # Řada 0: Základní počty
-        t_items = add_tile2("items", "Položky celkem", "list", 0, 0)
-        t_docs = add_tile2("receipts", "Účtenky", "check", 0, 1)
-        t_sups = add_tile2("suppliers", "Dodavatelé", "factory", 0, 2)
+        t_items = add_tile2("items", "Položky celkem", "list")
+        t_docs = add_tile2("receipts", "Účtenky", "check")
+        t_sups = add_tile2("suppliers", "Dodavatelé", "factory")
 
         self._stat_labels["items"] = t_items.lbl_value
         self._stat_labels["receipts"] = t_docs.lbl_value
         self._stat_labels["suppliers"] = t_sups.lbl_value
 
-        # Řada 1: Finanční statistiky
-        t_sum_wo = add_tile2("sum_items_wo_vat", "Celková suma bez DPH", "db", 1, 0)
-        t_avg_item = add_tile2("avg_item", "Prům. cena položky", "avg", 1, 1)
-        t_avg_ipp = add_tile2("avg_items_per_receipt", "Prům. položek / účtenka", "avg", 1, 2)
+        t_sum_wo = add_tile2("sum_items_wo_vat", "Celková suma bez DPH", "db")
+        t_avg_item = add_tile2("avg_item", "Prům. cena položky", "avg")
+        t_avg_ipp = add_tile2("avg_items_per_receipt", "Prům. položek / účtenka", "avg")
+        t_avg_r = add_tile2("avg_receipt_wo_vat", "Prům. hodnota účtenky bez DPH", "avg")
 
         self._stat_labels["sum_items_wo_vat"] = t_sum_wo.lbl_value
         self._stat_labels["avg_item"] = t_avg_item.lbl_value
         self._stat_labels["avg_items_per_receipt"] = t_avg_ipp.lbl_value
-
-        # Řada 2: Průměrná hodnota účtenky bez DPH (span 3 sloupce)
-        t_avg_r = add_tile2("avg_receipt_wo_vat", "Prům. hodnota účtenky bez DPH", "avg", 2, 0, 1, 3)
         self._stat_labels["avg_receipt_wo_vat"] = t_avg_r.lbl_value
 
+        rl.addWidget(dash_wrap, 2)
         rl.addWidget(dash_wrap, 2)
 
         # Přehled klíčových nastavení
@@ -1687,8 +1724,13 @@ class MainWindow(QMainWindow):
         ol = QVBoxLayout(self.tab_ops)
 
         ops_top = QWidget()
-        ops_top_l = QHBoxLayout(ops_top)
+        ops_top_l = QVBoxLayout(ops_top)
         ops_top_l.setContentsMargins(0, 0, 0, 0)
+        ops_top_l.setSpacing(8)
+        ops_search_row = QHBoxLayout()
+        ops_search_row.setContentsMargins(0, 0, 0, 0)
+        ops_actions = QWidget()
+        ops_actions_l = FlowLayout(ops_actions, h_spacing=8, v_spacing=8)
         self.ops_filter = QLineEdit()
         self.ops_filter.setPlaceholderText("Fulltext (název souboru, status, chyba)")
         self.ops_refresh_btn = QPushButton("Obnovit")
@@ -1697,11 +1739,13 @@ class MainWindow(QMainWindow):
         self.btn_ops_bulk_delete = QPushButton("Hromadně: smazat soubory")
         self.ops_filter.textChanged.connect(self.refresh_ops)
         self.ops_refresh_btn.clicked.connect(self.refresh_ops)
-        ops_top_l.addWidget(self.ops_filter, 1)
-        ops_top_l.addWidget(self.ops_refresh_btn)
-        ops_top_l.addWidget(self.btn_ops_retry_all)
-        ops_top_l.addWidget(self.btn_ops_bulk_retry)
-        ops_top_l.addWidget(self.btn_ops_bulk_delete)
+        set_button_min_widths(self.ops_refresh_btn, self.btn_ops_retry_all, self.btn_ops_bulk_retry, self.btn_ops_bulk_delete)
+        ops_search_row.addWidget(self.ops_filter, 1)
+        ops_search_row.addWidget(self.ops_refresh_btn)
+        ops_top_l.addLayout(ops_search_row)
+        for widget in (self.btn_ops_retry_all, self.btn_ops_bulk_retry, self.btn_ops_bulk_delete):
+            ops_actions_l.addWidget(widget)
+        ops_top_l.addWidget(ops_actions)
         ol.addWidget(ops_top)
 
         self.ops_table = QTableView()
@@ -1739,8 +1783,13 @@ class MainWindow(QMainWindow):
         lul.addWidget(self.unproc_table)
 
         row_actions = QWidget()
-        rah = QHBoxLayout(row_actions)
+        rah = QVBoxLayout(row_actions)
         rah.setContentsMargins(0, 0, 0, 0)
+        rah.setSpacing(8)
+        row_filters = QHBoxLayout()
+        row_filters.setContentsMargins(0, 0, 0, 0)
+        row_actions_flow = QWidget()
+        row_actions_layout = FlowLayout(row_actions_flow, h_spacing=8, v_spacing=8)
         self.unproc_filter = QLineEdit()
         self.unproc_filter.setPlaceholderText("Fulltext název souboru…")
         self.unproc_counts = QLabel("Karanténa: 0 | Duplicity: 0")
@@ -1752,15 +1801,16 @@ class MainWindow(QMainWindow):
         self.btn_unproc_save = QPushButton("Uložit ručně")
         self.btn_unproc_retry_ai = QPushButton("OpenAI znovu (vybraný)")
         self.btn_unproc_retry_ai_all = QPushButton("OpenAI znovu (výběr)")
-        rah.addWidget(self.unproc_filter, 1)
-        rah.addWidget(self.unproc_counts)
-        rah.addWidget(self.btn_unproc_refresh)
-        rah.addWidget(self.cb_unproc_q)
-        rah.addWidget(self.cb_unproc_d)
-        rah.addWidget(self.btn_unproc_save)
-        rah.addWidget(self.btn_unproc_retry_ai)
-        rah.addWidget(self.btn_unproc_retry_ai_all)
-        rah.addStretch(1)
+        set_button_min_widths(self.btn_unproc_refresh, self.btn_unproc_save, self.btn_unproc_retry_ai, self.btn_unproc_retry_ai_all)
+        row_filters.addWidget(self.unproc_filter, 1)
+        row_filters.addWidget(self.unproc_counts)
+        row_filters.addWidget(self.btn_unproc_refresh)
+        row_filters.addWidget(self.cb_unproc_q)
+        row_filters.addWidget(self.cb_unproc_d)
+        rah.addLayout(row_filters)
+        for widget in (self.btn_unproc_save, self.btn_unproc_retry_ai, self.btn_unproc_retry_ai_all):
+            row_actions_layout.addWidget(widget)
+        rah.addWidget(row_actions_flow)
         lul.addWidget(row_actions)
 
         self.unproc_split.addWidget(left_un)
@@ -1821,8 +1871,28 @@ class MainWindow(QMainWindow):
         # Nastavení
         # Nastavení
         self.tab_settings = QWidget()
-        stl = QVBoxLayout(self.tab_settings)
+        st_root = QVBoxLayout(self.tab_settings)
+        st_root.setContentsMargins(0, 0, 0, 0)
+        st_root.setSpacing(0)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_wrap = QWidget()
+        stl = QVBoxLayout(settings_wrap)
+        stl.setContentsMargins(12, 12, 12, 12)
+        stl.setSpacing(12)
+        settings_scroll.setWidget(settings_wrap)
+        st_root.addWidget(settings_scroll)
+
+        paths_box = QWidget()
+        style_as_panel(paths_box)
+        paths_layout = QVBoxLayout(paths_box)
+        paths_layout.setContentsMargins(12, 12, 12, 12)
+        paths_layout.setSpacing(10)
+        paths_title = QLabel("Cesty a databáze")
+        paths_title.setObjectName("DashHeadline")
+        paths_layout.addWidget(paths_title)
         form = QFormLayout()
+        tune_form_layout(form, label_width=210)
 
         self.ed_input_dir = QLineEdit(self.cfg["paths"].get("input_dir", ""))
         self.btn_pick_input = QPushButton("Vybrat")
@@ -1833,28 +1903,40 @@ class MainWindow(QMainWindow):
         self.ed_log_dir = QLineEdit(str(self.cfg.get("app", {}).get("log_dir") or self.paths.log_dir))
         self.btn_pick_log_dir = QPushButton("Vybrat")
         self.btn_new_db = QPushButton("Inicializovat novou DB")
+        set_button_min_widths(self.btn_pick_input, self.btn_pick_output, self.btn_pick_db_dir, self.btn_pick_log_dir, self.btn_new_db)
 
-        row_in = QWidget(); r3 = QHBoxLayout(row_in); r3.setContentsMargins(0,0,0,0)
+        row_in = QWidget(); r3 = QHBoxLayout(row_in); r3.setContentsMargins(0,0,0,0); r3.setSpacing(8)
         r3.addWidget(self.ed_input_dir, 1); r3.addWidget(self.btn_pick_input)
         form.addRow("Input adresář", row_in)
 
-        row_out = QWidget(); r4 = QHBoxLayout(row_out); r4.setContentsMargins(0,0,0,0)
+        row_out = QWidget(); r4 = QHBoxLayout(row_out); r4.setContentsMargins(0,0,0,0); r4.setSpacing(8)
         r4.addWidget(self.ed_output_dir, 1); r4.addWidget(self.btn_pick_output)
         form.addRow("Output adresář", row_out)
 
-        row_db = QWidget(); r5 = QHBoxLayout(row_db); r5.setContentsMargins(0,0,0,0)
+        row_db = QWidget(); r5 = QHBoxLayout(row_db); r5.setContentsMargins(0,0,0,0); r5.setSpacing(8)
         r5.addWidget(self.ed_db_dir, 1); r5.addWidget(self.btn_pick_db_dir); r5.addWidget(self.btn_new_db)
-        form.addRow("Adresar databaze", row_db)
+        form.addRow("Adresář databáze", row_db)
 
-        row_log = QWidget(); r6 = QHBoxLayout(row_log); r6.setContentsMargins(0,0,0,0)
+        row_log = QWidget(); r6 = QHBoxLayout(row_log); r6.setContentsMargins(0,0,0,0); r6.setSpacing(8)
         r6.addWidget(self.ed_log_dir, 1); r6.addWidget(self.btn_pick_log_dir)
-        form.addRow("Adresar logu", row_log)
-        
-        # OpenAI nastaveni
+        form.addRow("Adresář logů", row_log)
+        paths_layout.addLayout(form)
+        stl.addWidget(paths_box)
+
+        openai_box = QWidget()
+        style_as_panel(openai_box)
+        openai_layout = QVBoxLayout(openai_box)
+        openai_layout.setContentsMargins(12, 12, 12, 12)
+        openai_layout.setSpacing(10)
+        openai_title = QLabel("OpenAI a online extrakce")
+        openai_title.setObjectName("DashHeadline")
+        openai_layout.addWidget(openai_title)
+        openai_form = QFormLayout()
+        tune_form_layout(openai_form, label_width=210)
+
         openai_cfg = self.cfg.get("openai", {}) if isinstance(self.cfg, dict) else {}
         if not isinstance(openai_cfg, dict):
             openai_cfg = {}
-        # odebrané přepínače, ale necháme je jako skryté dummy kvůli stávajícímu kódu
         self.cb_openai_enabled = QCheckBox("Zapnout OpenAI")
         self.cb_openai_enabled.setChecked(True)
         self.cb_openai_enabled.hide()
@@ -1869,17 +1951,15 @@ class MainWindow(QMainWindow):
         self.btn_api_load = QPushButton("Načíst z prostředí")
         self.btn_api_test = QPushButton("Otestovat API key")
         self.btn_api_models = QPushButton("Načíst modely")
-        api_row = QWidget(); ar = QHBoxLayout(api_row); ar.setContentsMargins(0,0,0,0)
-        ar.addWidget(self.ed_api_key, 1)
-        ar.addWidget(self.btn_api_show)
-        ar.addWidget(self.btn_api_clear)
-        ar.addWidget(self.btn_api_save)
-        ar.addWidget(self.btn_api_load)
-        ar.addWidget(self.btn_api_test)
-        ar.addWidget(self.btn_api_models)
-        form.addRow("OpenAI API key", api_row)
+        set_button_min_widths(self.btn_api_show, self.btn_api_clear, self.btn_api_save, self.btn_api_load, self.btn_api_test, self.btn_api_models)
+        api_row = QWidget(); ar = FlowLayout(api_row, h_spacing=8, v_spacing=8)
+        self.ed_api_key.setMinimumWidth(320)
+        ar.addWidget(self.ed_api_key)
+        for widget in (self.btn_api_show, self.btn_api_clear, self.btn_api_save, self.btn_api_load, self.btn_api_test, self.btn_api_models):
+            ar.addWidget(widget)
+        openai_form.addRow("OpenAI API key", api_row)
 
-        self.cb_openai_primary = QCheckBox("Primarni online extrakce (OpenAI)")
+        self.cb_openai_primary = QCheckBox("Primární online extrakce (OpenAI)")
         self.cb_openai_primary.setChecked(bool(openai_cfg.get("primary_enabled", True)))
         self.cb_openai_fallback = QCheckBox("Povolit OpenAI (fallback / online)")
         self.cb_openai_fallback.setChecked(bool(openai_cfg.get("fallback_enabled", True)))
@@ -1892,6 +1972,7 @@ class MainWindow(QMainWindow):
         self.cmb_primary_model.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.cmb_primary_model.addItem(openai_cfg.get("model", "auto") or "auto")
         self.cmb_primary_model.setCurrentText(openai_cfg.get("model", "auto") or "auto")
+        set_editor_char_width(self.cmb_primary_model, 18, floor=220)
 
         self.cmb_fallback_model = QComboBox()
         self.cmb_fallback_model.setEditable(True)
@@ -1899,8 +1980,8 @@ class MainWindow(QMainWindow):
         self.cmb_fallback_model.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.cmb_fallback_model.addItem(openai_cfg.get("fallback_model", "") or "")
         self.cmb_fallback_model.setCurrentText(openai_cfg.get("fallback_model", ""))
+        set_editor_char_width(self.cmb_fallback_model, 18, floor=220)
 
-        # JSON schema je povinné, ale necháme skrytý checkbox kvůli stávajícímu kódu (tooltips, save)
         self.cb_use_json_schema = QCheckBox("Vynutit JSON schema (strict)")
         self.cb_use_json_schema.setChecked(True)
         self.cb_use_json_schema.hide()
@@ -1910,27 +1991,31 @@ class MainWindow(QMainWindow):
         self.sp_temperature.setSingleStep(0.05)
         self.sp_temperature.setRange(0.0, 2.0)
         self.sp_temperature.setValue(float(openai_cfg.get("temperature", 0.0) or 0.0))
+        set_editor_char_width(self.sp_temperature, 6, floor=120)
 
         self.sp_max_tokens = QSpinBox()
         self.sp_max_tokens.setRange(200, 16000)
         self.sp_max_tokens.setSingleStep(100)
         self.sp_max_tokens.setValue(int(openai_cfg.get("max_output_tokens", 2000) or 2000))
+        set_editor_char_width(self.sp_max_tokens, 7, floor=120)
 
         self.sp_timeout = QSpinBox()
         self.sp_timeout.setRange(10, 300)
         self.sp_timeout.setSingleStep(5)
         self.sp_timeout.setValue(int(openai_cfg.get("timeout_sec", 60) or 60))
+        set_editor_char_width(self.sp_timeout, 5, floor=120)
 
         self.sp_image_dpi = QSpinBox()
         self.sp_image_dpi.setRange(100, 600)
         self.sp_image_dpi.setSingleStep(50)
         self.sp_image_dpi.setValue(int(openai_cfg.get("image_dpi", 300) or 300))
+        set_editor_char_width(self.sp_image_dpi, 5, floor=120)
 
         self.sp_image_max_pages = QSpinBox()
         self.sp_image_max_pages.setRange(1, 5)
         self.sp_image_max_pages.setValue(int(openai_cfg.get("image_max_pages", 3) or 3))
+        set_editor_char_width(self.sp_image_max_pages, 4, floor=120)
 
-        # skrytý dummy přepínač pro tooltips a save, ale hodnota je vždy True
         self.cb_image_enhance = QCheckBox("Zlepsit obraz pred odeslanim")
         self.cb_image_enhance.setChecked(True)
         self.cb_image_enhance.hide()
@@ -1938,126 +2023,135 @@ class MainWindow(QMainWindow):
         self.sp_image_variants = QSpinBox()
         self.sp_image_variants.setRange(1, 3)
         self.sp_image_variants.setValue(int(openai_cfg.get("image_variants", 2) or 2))
+        set_editor_char_width(self.sp_image_variants, 4, floor=120)
 
+        openai_form.addRow("Primární model", self.cmb_primary_model)
+        openai_form.addRow("Fallback model", self.cmb_fallback_model)
+        openai_form.addRow("Teplota", self.sp_temperature)
+        openai_form.addRow("Max output tokens", self.sp_max_tokens)
+        openai_form.addRow("Timeout (s)", self.sp_timeout)
+        openai_form.addRow("Image DPI", self.sp_image_dpi)
+        openai_form.addRow("Max stránek", self.sp_image_max_pages)
+        openai_form.addRow("Varianta obrazu", self.sp_image_variants)
 
-        form.addRow("Primarni model", self.cmb_primary_model)
-        form.addRow("Fallback model", self.cmb_fallback_model)
-        form.addRow("Teplota", self.sp_temperature)
-        form.addRow("Max output tokens", self.sp_max_tokens)
-        form.addRow("Timeout (s)", self.sp_timeout)
-        form.addRow("Image DPI", self.sp_image_dpi)
-        form.addRow("Max stranky", self.sp_image_max_pages)
-        form.addRow("Varianta obrazu", self.sp_image_variants)
-        # JSON schema je nyní povinné, volba odebrána
-        form.addRow(self.cb_openai_primary)
-        form.addRow(self.cb_openai_fallback)
-        form.addRow(self.cb_openai_only)
+        mode_row = QWidget()
+        mode_layout = FlowLayout(mode_row, h_spacing=10, v_spacing=8)
+        for widget in (self.cb_openai_primary, self.cb_openai_fallback, self.cb_openai_only):
+            mode_layout.addWidget(widget)
+        openai_form.addRow("Režimy", mode_row)
+        openai_layout.addLayout(openai_form)
 
-        # Tooltips (obsahle napovedy pro nastaveni)
         self.ed_input_dir.setToolTip(
-            "Slozka pro nove dokumenty (skeny/uctenky).\n"
-            "Aplikace ji sleduje a nove soubory postupne zpracuje.\n"
-            "Pouzij stabilni cestu s pravem zapisu."
+            "Složka pro nové dokumenty (skeny/účtenky).\n"
+            "Aplikace ji sleduje a nové soubory postupně zpracuje.\n"
+            "Použij stabilní cestu s právem zápisu."
         )
-        self.btn_pick_input.setToolTip("Vyber slozku pro vstupni dokumenty.")
+        self.btn_pick_input.setToolTip("Vyber složku pro vstupní dokumenty.")
         self.ed_output_dir.setToolTip(
-            "Slozka pro vystupy z extrakce (napr. JSON, kopie, logy).\n"
-            "Program do ni zapisuje, musi byt zapisovatelna.\n"
-            "Doporuceno oddelit od vstupni slozky."
+            "Složka pro výstupy z extrakce (např. JSON, kopie, logy).\n"
+            "Program do ní zapisuje, musí být zapisovatelná.\n"
+            "Doporučeno oddělit od vstupní složky."
         )
-        self.btn_pick_output.setToolTip("Vyber slozku pro vystupy zpracovani.")
+        self.btn_pick_output.setToolTip("Vyber složku pro výstupy zpracování.")
         self.ed_log_dir.setToolTip(
-            "Slozka pro textovy log a forensic JSONL log.\n"
-            "Logy se rotuji denne a drzi se poslednich 7 dni.\n"
-            "Doporuceno mit lokalni zapisovatelnou cestu."
+            "Složka pro textový log a forensic JSONL log.\n"
+            "Logy se rotují denně a drží se posledních 7 dní.\n"
+            "Doporučeno mít lokální zapisovatelnou cestu."
         )
-        self.btn_pick_log_dir.setToolTip("Vyber slozku pro logy aplikace.")
+        self.btn_pick_log_dir.setToolTip("Vyber složku pro logy aplikace.")
         self.ed_api_key.setToolTip(
             "OpenAI API key pro online extrakci.\n"
-            "Ulozi se do lokalniho configu. Bez klice se online rezimy nespousti.\n"
-            "Vkladej cely klic, bez mezer."
+            "Uloží se do lokálního configu. Bez klíče se online režimy nespouští.\n"
+            "Vkládej celý klíč, bez mezer."
         )
         self.btn_api_show.setToolTip(
-            "Prepina zobrazeni/skryti API key v poli.\n"
-            "Pozor na sdileni obrazovky."
+            "Přepíná zobrazení/skrytí API key v poli.\n"
+            "Pozor na sdílení obrazovky."
         )
         self.btn_api_clear.setToolTip(
-            "Vymaze API key z pole (a po ulozeni i z configu)."
+            "Vymaže API key z pole (a po uložení i z configu)."
         )
         self.btn_api_save.setToolTip(
-            "Ulozi API key do uzivatelskych promennych Windows (registr)."
+            "Uloží API key do uživatelských proměnných Windows (registr)."
         )
         self.btn_api_load.setToolTip(
-            "Nacte API key z Windows prostredi (KAJOVOSPEND_OPENAI_API_KEY) zpet do pole."
+            "Načte API key z Windows prostředí (KAJOVOSPEND_OPENAI_API_KEY) zpět do pole."
         )
         self.btn_api_test.setToolTip(
             "Otestuje API key proti /v1/models a ověří, že je funkční."
         )
         self.btn_api_models.setToolTip(
-            "Nacte seznam modelu z /v1/models pres zadany API key.\n"
-            "Vybrany model lze ulozit jako primarni nebo fallback."
+            "Načte seznam modelů z /v1/models přes zadaný API key.\n"
+            "Vybraný model lze uložit jako primární nebo fallback."
         )
         self.cmb_primary_model.setToolTip(
-            "Model pro primarni online extrakci.\n"
-            "Hodnota 'auto' vybere nejvhodnejsi dostupny model.\n"
-            "Muzes zadat i presny identifikator modelu."
+            "Model pro primární online extrakci.\n"
+            "Hodnota 'auto' vybere nejvhodnější dostupný model.\n"
+            "Můžeš zadat i přesný identifikátor modelu."
         )
         self.cmb_fallback_model.setToolTip(
-            "Model pro fallback pri nekompletni extrakci.\n"
-            "Prazdne = pouzije se primarni model.\n"
-            "Vhodne je nastavit robustnejsi (ale drazsi) model."
+            "Model pro fallback při nekompletní extrakci.\n"
+            "Prázdné = použije se primární model.\n"
+            "Vhodné je nastavit robustnější (ale dražší) model."
         )
-        # odebrané přepínače openai_enabled/auto_enable
         self.cb_openai_primary.setToolTip(
-            "Primarni online extrakce pred heuristikami.\n"
-            "Zvyssuje presnost u tezko citelnych skenu, ale prodluzuje cas."
+            "Primární online extrakce před heuristikami.\n"
+            "Zvyšuje přesnost u těžko čitelných skenů, ale prodlužuje čas."
         )
         self.cb_openai_fallback.setToolTip(
-            "Druhe kolo OpenAI, kdyz data stale nejsou kompletni.\n"
-            "Typicky kdyz chybi polozky nebo soucty."
+            "Druhé kolo OpenAI, když data stále nejsou kompletní.\n"
+            "Typicky když chybí položky nebo součty."
         )
         self.cb_openai_only.setToolTip(
-            "Preskoci vsechny offline metody (OCR/ensemble) a pouzije jen OpenAI Responses.\n"
-            "Vyuzij, pokud mas spolehlivy API key a chces striktne cloud vytahovani."
+            "Přeskočí všechny offline metody (OCR/ensemble) a použije jen OpenAI Responses.\n"
+            "Využij, pokud máš spolehlivý API key a chceš striktně cloud vytahování."
         )
-        # Intentionally allow combinations of primary/fallback/only.
-        # _normalize_openai_settings() handles invalid combos safely.
         self.cb_use_json_schema.setToolTip(
-            "Vynuti striktni JSON schema pro vystup.\n"
-            "Zlepsuje spolehlivost struktury, ale muze byt prisnejsi."
+            "Vynutí striktní JSON schema pro výstup.\n"
+            "Zlepšuje spolehlivost struktury, ale může být přísnější."
         )
         self.sp_temperature.setToolTip(
-            "Teplota generovani (0.0-2.0).\n"
-            "Nizsi = deterministicke, vyssi = vice variace.\n"
-            "Prilis vysoka teplota muze zvysit riziko halucinaci."
+            "Teplota generování (0.0-2.0).\n"
+            "Nižší = deterministické, vyšší = více variace.\n"
+            "Příliš vysoká teplota může zvýšit riziko halucinací."
         )
         self.sp_max_tokens.setToolTip(
-            "Limit velikosti odpovedi z OpenAI.\n"
-            "Prilis nizky limit muze orezat JSON.\n"
-            "Vyssi limit zvysuje cas i cenu."
+            "Limit velikosti odpovědi z OpenAI.\n"
+            "Příliš nízký limit může ořezat JSON.\n"
+            "Vyšší limit zvyšuje čas i cenu."
         )
         self.sp_timeout.setToolTip(
-            "Maximalni doba cekani na OpenAI odpoved (sekundy).\n"
-            "Po vyprseni timeoutu se pouzije fallback/karantena."
+            "Maximální doba čekání na OpenAI odpověď (sekundy).\n"
+            "Po vypršení timeoutu se použije fallback/karanténa."
         )
         self.sp_image_dpi.setToolTip(
-            "DPI pro rasterizaci PDF/obrazku pred odeslanim.\n"
-            "Vyssi DPI = lepsi cteni drobneho textu, ale vetsi data."
+            "DPI pro rasterizaci PDF/obrázku před odesláním.\n"
+            "Vyšší DPI = lepší čtení drobného textu, ale větší data."
         )
         self.sp_image_max_pages.setToolTip(
-            "Maximalni pocet stranek odeslanych na OpenAI.\n"
-            "Zbytek stran se ignoruje (zrychleni a nizsi cena)."
+            "Maximální počet stránek odeslaných na OpenAI.\n"
+            "Zbytek stran se ignoruje (zrychlení a nižší cena)."
         )
         self.cb_image_enhance.setToolTip(
-            "Aplikovat autokontrast a doostreni pred odeslanim.\n"
-            "Pomaha u bledych nebo zmuchlanych skenu."
+            "Aplikovat autokontrast a doostření před odesláním.\n"
+            "Pomáhá u bledých nebo zmuchlaných skenů."
         )
         self.sp_image_variants.setToolTip(
-            "Kolik variant obrazu poslat (1=jen original).\n"
-            "Vyssi hodnota = vice dat a vyssi sance na uspech."
+            "Kolik variant obrazu poslat (1=jen originál).\n"
+            "Vyšší hodnota = více dat a vyšší šance na úspěch."
         )
-        self.btn_save_settings = QPushButton("Uložit nastavení")
+        stl.addWidget(openai_box)
 
+        maintenance_box = QWidget()
+        style_as_panel(maintenance_box)
+        maintenance_layout = QVBoxLayout(maintenance_box)
+        maintenance_layout.setContentsMargins(12, 12, 12, 12)
+        maintenance_layout.setSpacing(10)
+        maintenance_title = QLabel("Údržba a provozní akce")
+        maintenance_title.setObjectName("DashHeadline")
+        maintenance_layout.addWidget(maintenance_title)
+
+        self.btn_save_settings = QPushButton("Uložit nastavení")
         self.btn_backup_program = QPushButton("ZÁLOHOVAT PROGRAM")
         self.btn_backup_program.setToolTip(
             "Vytvoří kompletní zálohu (IN, OUT, databáze, config) do jednoho souboru."
@@ -2079,20 +2173,31 @@ class MainWindow(QMainWindow):
         )
 
         self.btn_save_settings.setToolTip(
-            "Ulozi nastaveni do configu.\n"
-            "Zmeny se projevi pro nove zpracovani."
+            "Uloží nastavení do configu.\n"
+            "Změny se projeví pro nové zpracování."
         )
-
-        stl.addLayout(form)
-        stl.addWidget(self.btn_save_settings)
-        stl.addWidget(self.btn_backup_program)
-        stl.addWidget(self.btn_restore_program)
-        stl.addWidget(self.btn_reset_program)
+        set_button_min_widths(self.btn_save_settings, self.btn_backup_program, self.btn_restore_program, self.btn_reset_program)
+        maintenance_actions = QWidget()
+        maintenance_actions_layout = FlowLayout(maintenance_actions, h_spacing=8, v_spacing=8)
+        for widget in (self.btn_save_settings, self.btn_backup_program, self.btn_restore_program, self.btn_reset_program):
+            maintenance_actions_layout.addWidget(widget)
+        maintenance_layout.addWidget(maintenance_actions)
+        stl.addWidget(maintenance_box)
         self.tabs.addTab(self.tab_settings, "NASTAVENÍ")
-        # Skupiny položek (správa) – přesunuto do Nastavení
+
+        group_box = QWidget()
+        style_as_panel(group_box)
+        gl = QVBoxLayout(group_box)
+        gl.setContentsMargins(12, 12, 12, 12)
+        gl.setSpacing(10)
+        group_title = QLabel("Skupiny položek")
+        group_title.setObjectName("DashHeadline")
+        gl.addWidget(group_title)
+
         grp_top = QWidget()
         gtl = QHBoxLayout(grp_top)
         gtl.setContentsMargins(0, 0, 0, 0)
+        gtl.setSpacing(12)
         self.groups_table = QTableView()
         self.groups_table.setAlternatingRowColors(True)
         self.groups_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2101,42 +2206,55 @@ class MainWindow(QMainWindow):
 
         grp_form = QWidget()
         gfl = QFormLayout(grp_form)
+        tune_form_layout(gfl, label_width=150)
         self.group_name_input = QLineEdit()
         self.group_color_input = QLineEdit()
         self.btn_group_save = QPushButton("Uložit / vytvořit")
         self.btn_group_delete = QPushButton("Smazat")
+        set_button_min_widths(self.btn_group_save, self.btn_group_delete)
         gfl.addRow("Název skupiny", self.group_name_input)
         gfl.addRow("Barva (volitelné)", self.group_color_input)
-        gfl.addRow(self.btn_group_save)
-        gfl.addRow(self.btn_group_delete)
+        actions_row = QWidget()
+        actions_row_layout = FlowLayout(actions_row, h_spacing=8, v_spacing=8)
+        actions_row_layout.addWidget(self.btn_group_save)
+        actions_row_layout.addWidget(self.btn_group_delete)
+        gfl.addRow("Akce", actions_row)
         gtl.addWidget(grp_form, 1)
 
-        group_box = QWidget()
-        gl = QVBoxLayout(group_box)
-        gl.addWidget(QLabel("Skupiny položek"))
         gl.addWidget(grp_top, 1)
         stl.addWidget(group_box)
+        stl.addStretch(1)
 
         # Dodavatelé
         self.tab_suppliers = QWidget()
         spl = QHBoxLayout(self.tab_suppliers)
+        spl.setContentsMargins(12, 12, 12, 12)
+        spl.setSpacing(12)
 
         # Left side: table and filter
         left = QWidget()
         ll = QVBoxLayout(left)
         top = QWidget()
-        tl = QHBoxLayout(top)
+        tl = QVBoxLayout(top)
         tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(8)
+        sup_filter_row = QHBoxLayout()
+        sup_filter_row.setContentsMargins(0, 0, 0, 0)
+        sup_actions = QWidget()
+        sup_actions_layout = FlowLayout(sup_actions, h_spacing=8, v_spacing=8)
         self.sup_filter = QLineEdit()
         self.sup_filter.setPlaceholderText("Hledat (název, IČO, DIČ, město)...")
         self.btn_sup_refresh = QPushButton("Obnovit")
         self.btn_sup_add = QPushButton("Přidat")
         self.btn_sup_merge = QPushButton("Sloučit")
         self.btn_sup_merge.setEnabled(False)
-        tl.addWidget(self.sup_filter, 1)
-        tl.addWidget(self.btn_sup_refresh)
-        tl.addWidget(self.btn_sup_add)
-        tl.addWidget(self.btn_sup_merge)
+        set_button_min_widths(self.btn_sup_refresh, self.btn_sup_add, self.btn_sup_merge)
+        sup_filter_row.addWidget(self.sup_filter, 1)
+        sup_filter_row.addWidget(self.btn_sup_refresh)
+        for widget in (self.btn_sup_add, self.btn_sup_merge):
+            sup_actions_layout.addWidget(widget)
+        tl.addLayout(sup_filter_row)
+        tl.addWidget(sup_actions)
         ll.addWidget(top)
 
         self.sup_table = QTableView()
@@ -2158,6 +2276,7 @@ class MainWindow(QMainWindow):
         self.lbl_sup_detail = QLabel("Detail dodavatele")
         self.btn_sup_edit = QPushButton("Editovat")
         self.btn_sup_save = QPushButton("Uložit")
+        set_button_min_widths(self.btn_sup_edit, self.btn_sup_save)
         self.btn_sup_save.setEnabled(False)
         hl.addWidget(self.lbl_sup_detail, 1)
         hl.addWidget(self.btn_sup_edit)
@@ -2166,9 +2285,11 @@ class MainWindow(QMainWindow):
 
         formw = QWidget()
         form = QFormLayout(formw)
+        tune_form_layout(form, label_width=210)
         self.sup_id = QLineEdit(); self.sup_id.setReadOnly(True)
         self.sup_ico = QLineEdit(); self.sup_ico.setReadOnly(True)
         self.btn_sup_ares_detail = QPushButton("ARES")
+        set_button_min_widths(self.btn_sup_ares_detail)
         ico_row = QWidget()
         ico_l = QHBoxLayout(ico_row); ico_l.setContentsMargins(0,0,0,0)
         ico_l.addWidget(self.sup_ico, 1)
@@ -2215,25 +2336,35 @@ class MainWindow(QMainWindow):
         # Položky (per-item search)
         self.tab_items = QWidget()
         items_layout = QVBoxLayout(self.tab_items)
+        items_layout.setContentsMargins(12, 12, 12, 12)
+        items_layout.setSpacing(12)
 
-        items_top = QWidget()
-        items_top_l = QHBoxLayout(items_top)
-        items_top_l.setContentsMargins(0, 0, 0, 0)
+        items_search_panel = QWidget()
+        style_as_panel(items_search_panel)
+        items_search_layout = QHBoxLayout(items_search_panel)
+        items_search_layout.setContentsMargins(12, 10, 12, 10)
+        items_search_layout.setSpacing(8)
         self.items_filter = QLineEdit()
         self.items_filter.setPlaceholderText("Fulltext: slova = OR, použij AND pro průnik (název, IČO, číslo dokladu...)")
         self.btn_items_search = QPushButton("Hledat")
         self.btn_items_more = QPushButton("Načíst další")
         self.lbl_items_page = QLabel("0 / 0")
-        items_top_l.addWidget(self.items_filter, 1)
-        items_top_l.addWidget(self.btn_items_search)
-        items_top_l.addWidget(self.btn_items_more)
-        items_top_l.addWidget(self.lbl_items_page)
-        items_layout.addWidget(items_top)
+        set_button_min_widths(self.btn_items_search, self.btn_items_more)
+        items_search_layout.addWidget(self.items_filter, 1)
+        items_search_layout.addWidget(self.btn_items_search)
+        items_search_layout.addWidget(self.btn_items_more)
+        items_search_layout.addWidget(self.lbl_items_page)
+        items_layout.addWidget(items_search_panel)
 
-        # Filtry
         items_filters = QWidget()
-        fl = QHBoxLayout(items_filters)
-        fl.setContentsMargins(0, 0, 0, 0)
+        style_as_panel(items_filters)
+        items_filters_layout = QVBoxLayout(items_filters)
+        items_filters_layout.setContentsMargins(12, 10, 12, 10)
+        items_filters_layout.setSpacing(8)
+        criteria_row = QWidget()
+        criteria_layout = FlowLayout(criteria_row, h_spacing=8, v_spacing=8)
+        actions_row = QWidget()
+        actions_layout = FlowLayout(actions_row, h_spacing=8, v_spacing=8)
         self.items_group_enable = QCheckBox("Skupina")
         self.items_group_filter = QComboBox()
         self.items_group_filter.addItem("Skupina: všechny", None)
@@ -2262,23 +2393,27 @@ class MainWindow(QMainWindow):
         self.btn_items_assign_group = QPushButton("Přiřadit skupinu")
         self.items_group_assign = QLineEdit(); self.items_group_assign.setPlaceholderText("Název nové/existující skupiny")
 
-        fl.addWidget(self.items_group_enable)
-        fl.addWidget(self.items_group_filter)
-        fl.addWidget(self.items_vat_enable)
-        fl.addWidget(self.items_vat_filter)
-        fl.addWidget(QLabel("Cena/ks"))
-        fl.addWidget(self.items_price_enable)
-        fl.addWidget(self.items_price_op)
-        fl.addWidget(self.items_price_val)
-        fl.addWidget(QLabel("od"))
-        fl.addWidget(self.items_price_min)
-        fl.addWidget(QLabel("do"))
-        fl.addWidget(self.items_price_max)
-        fl.addWidget(self.items_ids_receipt)
-        fl.addWidget(self.items_ids_supplier)
-        fl.addWidget(self.btn_items_select_all)
-        fl.addWidget(self.items_group_assign, 1)
-        fl.addWidget(self.btn_items_assign_group)
+        for widget in (self.items_group_filter, self.items_vat_filter, self.items_price_op):
+            set_editor_char_width(widget, 16, floor=180)
+        for widget in (self.items_price_val, self.items_price_min, self.items_price_max):
+            set_editor_char_width(widget, 8, floor=120)
+        for widget in (self.items_ids_receipt, self.items_ids_supplier):
+            set_editor_char_width(widget, 18, floor=180)
+        set_editor_char_width(self.items_group_assign, 22, floor=220)
+        set_button_min_widths(self.btn_items_select_all, self.btn_items_assign_group)
+
+        for widget in (
+            self.items_group_enable, self.items_group_filter,
+            self.items_vat_enable, self.items_vat_filter,
+            QLabel("Cena/ks"), self.items_price_enable, self.items_price_op, self.items_price_val,
+            QLabel("Od"), self.items_price_min, QLabel("Do"), self.items_price_max,
+            self.items_ids_receipt, self.items_ids_supplier,
+        ):
+            criteria_layout.addWidget(widget)
+        for widget in (self.btn_items_select_all, self.items_group_assign, self.btn_items_assign_group):
+            actions_layout.addWidget(widget)
+        items_filters_layout.addWidget(criteria_row)
+        items_filters_layout.addWidget(actions_row)
         items_layout.addWidget(items_filters)
         self._on_price_enable_changed(False)
 
@@ -2307,13 +2442,14 @@ class MainWindow(QMainWindow):
         self.items_src = QLineEdit()
         self.items_src.setReadOnly(True)
         self.btn_items_open = QPushButton("Otevřít doklad")
+        set_button_min_widths(self.btn_items_open)
         sri.addWidget(QLabel("Zdroj:"))
         sri.addWidget(self.items_src, 1)
         sri.addWidget(self.btn_items_open)
         ir.addWidget(src_row_items)
 
-        self.lbl_items_doc = QLabel("")
-        ir.addWidget(self.lbl_items_doc)
+        self.items_doc_summary = SummaryPanel([("datum", "Datum"), ("dodavatel", "Dodavatel"), ("bez_dph", "Celkem bez DPH"), ("polozky", "Položek")])
+        ir.addWidget(self.items_doc_summary)
 
         self.items_doc_items_table = QTableView()
         self.items_doc_items_table.setAlternatingRowColors(True)
@@ -2322,7 +2458,7 @@ class MainWindow(QMainWindow):
         self.items_doc_items_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.items_doc_items_table.verticalHeader().setVisible(False)
         self.items_doc_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.items_doc_items_table.setMaximumWidth(360)
+        self.items_doc_items_table.setMinimumWidth(320)
         ir.addWidget(self.items_doc_items_table, 1)
 
         self.items_preview = PdfPreviewView()
@@ -2337,10 +2473,11 @@ class MainWindow(QMainWindow):
         # Účty
         self.tab_docs = QWidget()
         dl2 = QVBoxLayout(self.tab_docs)
-        filters = QWidget(); filters.setProperty("panel", True)
-        fl = QHBoxLayout(filters); fl.setContentsMargins(10,6,10,6)
+        dl2.setContentsMargins(12, 12, 12, 12)
+        dl2.setSpacing(12)
         doc_toolbar = QWidget()
-        dtb = QHBoxLayout(doc_toolbar); dtb.setContentsMargins(0, 0, 0, 0)
+        style_as_panel(doc_toolbar)
+        dtb = FlowLayout(doc_toolbar, margin=12, h_spacing=8, v_spacing=8)
         self.doc_filter = QLineEdit(); self.doc_filter.setPlaceholderText("Vyhledat v účtech (IČO, číslo dokladu, účet, text, položky)…")
         self.doc_date_from = QDateEdit(); self.doc_date_from.setCalendarPopup(True); self.doc_date_from.setDisplayFormat("dd.MM.yyyy")
         self.doc_date_to = QDateEdit(); self.doc_date_to.setCalendarPopup(True); self.doc_date_to.setDisplayFormat("dd.MM.yyyy")
@@ -2350,15 +2487,12 @@ class MainWindow(QMainWindow):
         self.btn_docs_search = QPushButton("Hledat")
         self.btn_docs_more = QPushButton("Načíst další")
         self.lbl_docs_page = QLabel("0 / 0")
-        dtb.addWidget(self.doc_filter, 1)
-        dtb.addWidget(QLabel("Od:"))
-        dtb.addWidget(self.doc_date_from)
-        dtb.addWidget(QLabel("Do:"))
-        dtb.addWidget(self.doc_date_to)
-        dtb.addWidget(self.cb_all_dates)
-        dtb.addWidget(self.btn_docs_search)
-        dtb.addWidget(self.btn_docs_more)
-        dtb.addWidget(self.lbl_docs_page)
+        set_button_min_widths(self.btn_docs_search, self.btn_docs_more)
+        set_editor_char_width(self.doc_filter, 28, floor=320)
+        self.doc_date_from.setMinimumWidth(210)
+        self.doc_date_to.setMinimumWidth(210)
+        for widget in (self.doc_filter, QLabel("Od"), self.doc_date_from, QLabel("Do"), self.doc_date_to, self.cb_all_dates, self.btn_docs_search, self.btn_docs_more, self.lbl_docs_page):
+            dtb.addWidget(widget)
         dl2.addWidget(doc_toolbar)
 
         splitter = QSplitter()
@@ -2380,13 +2514,14 @@ class MainWindow(QMainWindow):
         self.doc_src_line = QLineEdit(); self.doc_src_line.setReadOnly(True)
         self.btn_open_source = QPushButton("Otevřít soubor")
         self.btn_zoom_in = QPushButton("+"); self.btn_zoom_out = QPushButton("-"); self.btn_zoom_reset = QPushButton("Fit")
+        set_button_min_widths(self.btn_open_source, self.btn_zoom_reset)
+        self.btn_zoom_in.setMinimumWidth(44)
+        self.btn_zoom_out.setMinimumWidth(44)
         sr.addWidget(QLabel("Zdroj:")); sr.addWidget(self.doc_src_line, 1); sr.addWidget(self.btn_open_source)
         sr.addWidget(self.btn_zoom_in); sr.addWidget(self.btn_zoom_out); sr.addWidget(self.btn_zoom_reset)
         rl.addWidget(srcrow)
 
-        self.doc_supplier_info = QLabel("")
-        self.doc_supplier_info.setWordWrap(True)
-        self.doc_supplier_info.setObjectName("DocSupplierInfo")
+        self.doc_supplier_info = SummaryPanel([("dodavatel", "Dodavatel"), ("ico", "IČO"), ("bez_dph", "Celkem bez DPH"), ("polozky", "Položek")])
         rl.addWidget(self.doc_supplier_info)
 
         self.preview_view = PdfPreviewView()
@@ -2401,15 +2536,15 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.doc_items_table, 2)
 
         items_bar = QWidget()
-        ib = QHBoxLayout(items_bar); ib.setContentsMargins(0, 0, 0, 0)
+        ib = FlowLayout(items_bar, h_spacing=8, v_spacing=8)
         self.btn_items_add = QPushButton("Přidat položku")
         self.btn_items_del = QPushButton("Smazat položku")
         self.btn_items_save = QPushButton("Uložit změny")
         for b in (self.btn_items_add, self.btn_items_del, self.btn_items_save):
             b.setEnabled(False)
+        set_button_min_widths(self.btn_items_add, self.btn_items_del, self.btn_items_save)
         ib.addWidget(self.btn_items_add)
         ib.addWidget(self.btn_items_del)
-        ib.addStretch(1)
         ib.addWidget(self.btn_items_save)
         rl.addWidget(items_bar)
 
@@ -2828,7 +2963,7 @@ class MainWindow(QMainWindow):
             if not idxs:
                 self.items_preview.clear()
                 self.items_src.setText("")
-                self.lbl_items_doc.setText("")
+                self.items_doc_summary.set_values({})
                 self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
                 return
             # použij první pro detail, ale zachovej multiselect pro bulk akce
@@ -2859,9 +2994,12 @@ class MainWindow(QMainWindow):
             total_wo_vat_txt = f"{float(doc_total_wo_vat or 0.0):,.2f}".replace(",", " ")
         except Exception:
             total_wo_vat_txt = str(doc_total_wo_vat or "")
-        self.lbl_items_doc.setText(
-            f"{issue_s} | {supplier} | IČO {ico} | Doklad {dn} | Celkem bez DPH {total_wo_vat_txt} | Počet položek {int(meta.get('doc_items_count') or 0)}"
-        )
+        self.items_doc_summary.set_values({
+            "datum": issue_s,
+            "dodavatel": f"{supplier} | IČO {ico} | Doklad {dn}".strip(" |"),
+            "bez_dph": total_wo_vat_txt,
+            "polozky": str(int(meta.get('doc_items_count') or 0)),
+        })
 
         try:
             doc_id = int(meta.get("document_id") or 0)
@@ -3271,10 +3409,12 @@ class MainWindow(QMainWindow):
         total_wo = doc.total_without_vat if getattr(doc, "total_without_vat", None) is not None else None
         total_txt = f"{float(doc.total_without_vat or 0.0):,.2f}".replace(",", " ") if total_wo is not None else "-"
         items_cnt = len(items)
-        self.doc_supplier_info.setText(
-            f"<b>Dodavatel:</b> {supplier_name or '-'} &nbsp;|&nbsp; <b>IČO:</b> {supplier_ico or '-'} "
-            f"&nbsp;|&nbsp; <b>Celkem bez DPH:</b> {total_txt} &nbsp;|&nbsp; <b>Položek:</b> {items_cnt}"
-        )
+        self.doc_supplier_info.set_values({
+            "dodavatel": supplier_name or "-",
+            "ico": supplier_ico or "-",
+            "bez_dph": total_txt,
+            "polozky": str(items_cnt),
+        })
 
         rows = []
         for it in items:
