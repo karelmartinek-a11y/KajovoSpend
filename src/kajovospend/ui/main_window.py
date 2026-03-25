@@ -2424,6 +2424,7 @@ class MainWindow(QMainWindow):
         items_left = QWidget()
         il = QVBoxLayout(items_left)
         self.items_table = QTableView()
+        self.items_table.setObjectName("ItemsTable")
         self.items_table.setAlternatingRowColors(True)
         self.items_table.setShowGrid(True)
         self.items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2431,6 +2432,7 @@ class MainWindow(QMainWindow):
         self.items_table.setSortingEnabled(True)
         self.items_table.verticalHeader().setVisible(False)
         self.items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.items_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         il.addWidget(self.items_table, 1)
         items_split.addWidget(items_left)
 
@@ -2499,13 +2501,15 @@ class MainWindow(QMainWindow):
         splitter.setOrientation(Qt.Horizontal)
         left = QWidget(); ll = QVBoxLayout(left)
         self.docs_table = QTableView()
+        self.docs_table.setObjectName("DocsTable")
         self.docs_table.setAlternatingRowColors(True)
         self.docs_table.setShowGrid(True)
         self.docs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.docs_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.docs_table.setSortingEnabled(True)
         self.docs_table.verticalHeader().setVisible(False)
-        self.docs_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.docs_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.docs_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         ll.addWidget(self.docs_table, 1)
         splitter.addWidget(left)
 
@@ -2848,10 +2852,7 @@ class MainWindow(QMainWindow):
             ])
 
         self.items_table.setModel(TableModel(headers, trows))
-        try:
-            self.items_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        except Exception:
-            pass
+        self._configure_items_table_headers()
         self.lbl_items_page.setText(f"{self._items_offset} / {self._items_total}")
         self.btn_items_more.setEnabled(self._items_offset < self._items_total)
 
@@ -2876,7 +2877,78 @@ class MainWindow(QMainWindow):
                 self.items_table.selectRow(0)
             except Exception:
                 pass
+
+    def _apply_header_width_policy(
+        self,
+        table: QTableView,
+        *,
+        min_section: int = 88,
+        resize_to_contents: set[int] | None = None,
+        explicit_widths: dict[int, int] | None = None,
+    ) -> None:
+        model = table.model()
+        if model is None:
+            return
+
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(min_section)
+        resize_to_contents = resize_to_contents or set()
+        explicit_widths = explicit_widths or {}
+        fm = header.fontMetrics()
+
+        for col in range(model.columnCount()):
+            header_text = str(model.headerData(col, Qt.Horizontal, Qt.DisplayRole) or "").strip()
+            needed_width = fm.horizontalAdvance(header_text) + 34
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+            if col in resize_to_contents:
+                table.resizeColumnToContents(col)
+                needed_width = max(needed_width, table.columnWidth(col))
+            width = max(min_section, needed_width, int(explicit_widths.get(col, 0)))
+            table.setColumnWidth(col, width)
+
+    def _configure_items_table_headers(self) -> None:
+        self._apply_header_width_policy(
+            self.items_table,
+            min_section=96,
+            resize_to_contents={0, 3, 8, 9, 11, 12},
+            explicit_widths={
+                1: 220,
+                2: 190,
+                4: 150,
+                5: 184,
+                6: 190,
+                7: 136,
+                10: 150,
+            },
+        )
         self._items_selection_changed_v2(None, None)
+
+    def _configure_docs_table_headers(self) -> None:
+        self._apply_header_width_policy(
+            self.docs_table,
+            min_section=104,
+            resize_to_contents={0, 1, 8, 9},
+            explicit_widths={
+                2: 154,
+                3: 152,
+                4: 220,
+                5: 154,
+                6: 154,
+                7: 154,
+            },
+        )
+
+    def _configure_line_items_header(self, table: QTableView) -> None:
+        self._apply_header_width_policy(
+            table,
+            min_section=92,
+            resize_to_contents={0},
+            explicit_widths={
+                1: 200,
+                2: 252,
+            },
+        )
 
     def _parse_int_list(self, txt: str | None) -> List[int]:
         out: List[int] = []
@@ -2965,6 +3037,7 @@ class MainWindow(QMainWindow):
                 self.items_src.setText("")
                 self.items_doc_summary.set_values({})
                 self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
+                self._configure_line_items_header(self.items_doc_items_table)
                 return
             # použij první pro detail, ale zachovej multiselect pro bulk akce
             row = int(idxs[0].row())
@@ -3019,9 +3092,10 @@ class MainWindow(QMainWindow):
                     float(getattr(it, "unit_price_net", None) or getattr(it, "unit_price", None) or 0.0),
                 ])
             self.items_doc_items_table.setModel(TableModel(item_headers, item_rows))
-            self.items_doc_items_table.resizeColumnsToContents()
+            self._configure_line_items_header(self.items_doc_items_table)
         else:
             self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
+            self._configure_line_items_header(self.items_doc_items_table)
 
         if path:
             QTimer.singleShot(0, lambda: self._load_preview(self.items_preview, path))
@@ -3350,6 +3424,7 @@ class MainWindow(QMainWindow):
             for r in self._docs_listing
         ]
         self.docs_table.setModel(TableModel(headers, trows))
+        self._configure_docs_table_headers()
         self._doc_offset = len(self._docs_listing)
         self.lbl_docs_page.setText(f"{self._doc_offset} / {self._doc_total}")
 
@@ -5285,7 +5360,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 model = TableModel(headers, new_rows)
         self.docs_table.setModel(model)
-        self.docs_table.resizeColumnsToContents()
+        self._configure_docs_table_headers()
 
         # connect selection change for new model and optionally preselect first row on reset
         try:

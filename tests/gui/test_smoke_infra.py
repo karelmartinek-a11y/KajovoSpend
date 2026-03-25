@@ -3,9 +3,10 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import QApplication, QHeaderView, QTableView
 
-from tests.gui.smoke_support import run_gui_audit, run_import_smoke, write_smoke_fixture_pdf
+from tests.gui.smoke_support import _audit_table_headers, run_gui_audit, run_import_smoke, write_smoke_fixture_pdf
 
 
 class TestGuiSmokeInfra(unittest.TestCase):
@@ -35,6 +36,36 @@ class TestGuiSmokeInfra(unittest.TestCase):
         self.assertTrue(report["screenshots"])
         for shot in report["screenshots"]:
             self.assertTrue(Path(shot).exists())
+
+    def test_header_audit_detects_too_narrow_sections(self) -> None:
+        table = QTableView()
+        table.setObjectName("SyntheticHeaderAuditTable")
+        model = QStandardItemModel(1, 2)
+        model.setHorizontalHeaderLabels(["Velmi dlouhá hlavička sloupce", "Krátká"])
+        model.setItem(0, 0, QStandardItem("hodnota"))
+        model.setItem(0, 1, QStandardItem("x"))
+        table.setModel(model)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        table.setColumnWidth(0, 60)
+        table.setColumnWidth(1, 80)
+        table.resize(220, 120)
+        table.show()
+        self._app.processEvents()
+
+        incidents = _audit_table_headers(table)
+        self.assertTrue(any(incident.kind == "header_overflow" for incident in incidents))
+        self.assertTrue(any("Velmi dlouhá hlavička" in incident.text for incident in incidents))
+
+    def test_gui_audit_reports_no_header_overflow_for_main_window(self) -> None:
+        report = run_gui_audit(workspace_name="kajovospend-test-gui-audit-headers")
+        incidents = [
+            incident
+            for artifact in [*report["tabs"], *report["dialogs"]]
+            for incident in artifact["incidents"]
+            if incident["kind"] in {"header_overflow", "header_viewport_overflow", "header_not_visible"}
+        ]
+        self.assertFalse(incidents, incidents)
 
 
 if __name__ == "__main__":

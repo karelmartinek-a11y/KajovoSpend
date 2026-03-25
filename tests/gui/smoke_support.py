@@ -22,7 +22,7 @@ _ensure_offscreen_qt()
 import yaml
 from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtGui import QFontMetrics
-from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDateEdit, QDoubleSpinBox, QLineEdit, QLabel, QPlainTextEdit, QPushButton, QSpinBox, QTabBar, QTextEdit, QWidget
+from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDateEdit, QDoubleSpinBox, QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox, QTabBar, QTableView, QTextEdit, QWidget
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 ASSETS_DIR = ROOT_DIR / "assets"
@@ -404,12 +404,76 @@ def _text_overflow_incidents(widget: QWidget) -> list[UiIncident]:
     return incidents
 
 
+def _audit_table_headers(table: QTableView) -> list[UiIncident]:
+    incidents: list[UiIncident] = []
+    model = table.model()
+    header = table.horizontalHeader()
+    if model is None or header is None or not isinstance(header, QHeaderView):
+        return incidents
+
+    fm = header.fontMetrics()
+    viewport_width = header.viewport().width()
+    has_horizontal_scroll = table.horizontalScrollBar().maximum() > 0
+
+    for col in range(model.columnCount()):
+        if header.isSectionHidden(col):
+            continue
+        text = str(model.headerData(col, Qt.Horizontal, Qt.DisplayRole) or "").strip()
+        if not text:
+            continue
+
+        section_width = header.sectionSize(col)
+        needed_width = fm.horizontalAdvance(text) + 24
+        if needed_width > section_width + 6:
+            incidents.append(
+                UiIncident(
+                    kind="header_overflow",
+                    widget=table.__class__.__name__,
+                    path=f"{_widget_label(table)}::header[{col}]",
+                    text=text[:140],
+                    geometry=(header.sectionPosition(col), 0, section_width, header.height()),
+                    detail=f"hlavička potřebuje {needed_width} px, sekce má {section_width} px",
+                )
+            )
+
+        if not has_horizontal_scroll:
+            visible_left = header.sectionViewportPosition(col)
+            visible_width = min(section_width, max(0, viewport_width - visible_left))
+            if visible_width <= 0:
+                incidents.append(
+                    UiIncident(
+                        kind="header_not_visible",
+                        widget=table.__class__.__name__,
+                        path=f"{_widget_label(table)}::header[{col}]",
+                        text=text[:140],
+                        geometry=(visible_left, 0, section_width, header.height()),
+                        detail="hlavička nemá žádný viditelný viewport",
+                    )
+                )
+                continue
+            if needed_width > visible_width + 6:
+                incidents.append(
+                    UiIncident(
+                        kind="header_viewport_overflow",
+                        widget=table.__class__.__name__,
+                        path=f"{_widget_label(table)}::header[{col}]",
+                        text=text[:140],
+                        geometry=(visible_left, 0, visible_width, header.height()),
+                        detail=f"hlavička potřebuje {needed_width} px, viditelný viewport má {visible_width} px",
+                    )
+                )
+
+    return incidents
+
+
 def audit_widget_geometry(root: QWidget) -> list[UiIncident]:
     incidents: list[UiIncident] = []
     visible_widgets = list(_iter_visible_widgets(root))
 
     for widget in visible_widgets:
         incidents.extend(_text_overflow_incidents(widget))
+        if isinstance(widget, QTableView):
+            incidents.extend(_audit_table_headers(widget))
 
     by_parent: dict[QWidget, list[QWidget]] = {}
     for widget in visible_widgets:
