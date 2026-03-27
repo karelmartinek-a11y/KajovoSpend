@@ -70,9 +70,15 @@ def insert_document_from_working(
 ) -> Document:
     existing = _find_existing_doc(session, work_doc.supplier_ico, work_doc.doc_number, work_doc.issue_date, work_doc.total_with_vat)
     if existing and not force:
+        # Zachovej a oprav referenci na zdrojový working soubor, pokud chybí.
+        source_file_id = getattr(work_doc, "file_id", None)
+        if existing.file_id is None and source_file_id is not None:
+            existing.file_id = int(source_file_id)
+            session.flush()
         return existing
     d = Document(
-        file_id=None,  # decoupled from working files
+        # Production dokument nese rekonstruovatelnou vazbu na working file.
+        file_id=int(work_doc.file_id) if getattr(work_doc, "file_id", None) is not None else None,
         supplier_id=supplier.id if supplier else None,
         supplier_ico=work_doc.supplier_ico,
         doc_number=work_doc.doc_number,

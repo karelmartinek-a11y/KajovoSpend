@@ -639,6 +639,12 @@ class ReceiptTemplateEditorDialog(QDialog):
         right_layout.addWidget(self.canvas, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        save_btn = buttons.button(QDialogButtonBox.StandardButton.Save)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if save_btn is not None:
+            save_btn.setText("Uložit")
+        if cancel_btn is not None:
+            cancel_btn.setText("Zrušit")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)

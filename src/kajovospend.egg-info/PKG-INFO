@@ -2,7 +2,7 @@ Metadata-Version: 2.4
 Name: kajovospend
 Version: 0.1.0
 Summary: KájovoSpend – evidence and categorization of expenses
-Requires-Python: <3.15,>=3.11
+Requires-Python: <3.14,>=3.11
 Description-Content-Type: text/markdown
 
 # KájovoSpend
@@ -50,11 +50,11 @@ Doporučený postup je spustit připravený skript:
 
 ```bash
 bash scripts/bootstrap_codex_env.sh
-source .venv312/bin/activate
+source .venv/bin/activate
 ```
 
 Skript automaticky:
-- vybere dostupný Python `>=3.11` (preferuje 3.12.12 (kvůli wheel kompatibilitě), pak 3.13.8),
+- vybere dostupný Python `>=3.11` a vezme nejvyšší dostupnou stabilní verzi,
 - vytvoří virtuální prostředí,
 - doinstaluje závislosti z `requirements.txt` včetně modulu `build`,
 - nastaví/aktualizuje `git remote origin` na `https://github.com/karelmartinek-a11y/KajovoSpend.git`.
@@ -74,6 +74,23 @@ copy config.example.yaml config.yaml
 2) Uprav v `config.yaml` cesty `paths.input_dir` a `paths.output_dir`.
 
 3) Inicializace DB proběhne automaticky při startu GUI.
+
+### Dual-DB režim
+- Aplikace používá dva fyzické SQLite soubory: **working DB** pro frontu/import/karanténu a **production DB** pro obchodní data (dashboard, statistiky, seznamy dokladů a položek).
+- Výchozí cesty: `KajovoSpend/kajovospend-working.sqlite` a `kajovospend-working-production.sqlite` (odvozeno z legacy `db_path`). Cesty lze nastavit v `config.yaml` (`app.working_db_path`, `app.production_db_path`).
+- Guard brání tomu, aby oba soubory ukazovaly na stejnou cestu; dashboard/business dotazy čtou vždy z production DB, workflow/ops z working DB.
+
+## Lokální testy
+- Unit testy: `PYTHONPATH=src pytest tests/unit`
+- Integration + migrace: `PYTHONPATH=src pytest tests/integration`
+- Dual-DB/forensic guard: `PYTHONPATH=src pytest tests/integration/test_dual_db_dashboard_reads.py`
+- Receipt/OpenAI regressní guard:
+  - `PYTHONPATH=src pytest tests/unit/test_openai_mode_gating.py`
+  - `PYTHONPATH=src pytest tests/unit/test_openai_fallback_retry.py tests/unit/test_openai_truncation_retry.py tests/unit/test_openai_parse_recovery.py`
+  - `PYTHONPATH=src pytest tests/unit/test_supplier_gate.py tests/unit/test_forensic_openai_linkage.py`
+- `PYTHONPATH=src pytest tests/test_forensic_logging.py tests/test_json_schema_defaults.py tests/test_openai_schema_invariants.py`
+- Kompletní rychlý běh: `PYTHONPATH=src pytest tests`
+- Podporované verze jsou Python 3.11 až 3.13; bootstrap i lokální install jsou nastavené tak, aby na 3.13 používaly wheel-only cestu bez source buildů.
 
 ## Spuštění
 

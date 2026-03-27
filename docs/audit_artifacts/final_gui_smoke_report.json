@@ -1,0 +1,216 @@
+{
+  "workspace": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t",
+  "config_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\config.yaml",
+  "fixture_pdf": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\fixture.pdf",
+  "template_pdf": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\data\\templates\\gui_smoke\\sample.pdf",
+  "import_smoke": {
+    "workspace": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t",
+    "config_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\config.yaml",
+    "fixture_pdf": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\fixture.pdf",
+    "log_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\logs\\import_smoke.log",
+    "cases": [
+      {
+        "name": "embedded_success",
+        "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\embedded_success.pdf",
+        "status": "PROCESSED",
+        "text_method": "embedded",
+        "document_ids": [
+          1
+        ],
+        "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\output\\embedded_success.pdf",
+        "supported": true,
+        "detail": null
+      },
+      {
+        "name": "ocr_path",
+        "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\ocr_success.png",
+        "status": "QUARANTINE",
+        "text_method": "image_ocr",
+        "document_ids": [],
+        "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\output\\KARANTENA\\ocr_success.png",
+        "supported": true,
+        "detail": null
+      },
+      {
+        "name": "template_path",
+        "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\template_success.pdf",
+        "status": "QUARANTINE",
+        "text_method": "template",
+        "document_ids": [],
+        "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\output\\KARANTENA\\template_success.pdf",
+        "supported": true,
+        "detail": null
+      },
+      {
+        "name": "quarantine_case",
+        "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\quarantine_case.pdf",
+        "status": "QUARANTINE",
+        "text_method": "embedded",
+        "document_ids": [],
+        "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\output\\KARANTENA\\quarantine_case.pdf",
+        "supported": true,
+        "detail": null
+      },
+      {
+        "name": "duplicate_case",
+        "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\duplicate_case.pdf",
+        "status": "DUPLICATE",
+        "text_method": null,
+        "document_ids": [],
+        "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\output\\DUPLICITY\\duplicate_case.pdf",
+        "supported": true,
+        "detail": null
+      },
+      {
+        "name": "ares_failure_case",
+        "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\ares_failure_case.pdf",
+        "status": "QUARANTINE",
+        "text_method": "embedded",
+        "document_ids": [],
+        "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\output\\KARANTENA\\ares_failure_case.pdf",
+        "supported": true,
+        "detail": null
+      }
+    ],
+    "document_ids": [
+      1
+    ],
+    "support": {
+      "ocr_engine": true
+    },
+    "summary": {
+      "case_count": 6,
+      "processed_count": 1,
+      "quarantine_count": 4,
+      "duplicate_count": 1,
+      "skipped_count": 0,
+      "document_count": 1
+    },
+    "status": "PASS",
+    "failures": []
+  },
+  "screenshots": [
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_00_DASHBOARD.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_01_PROVOZNÍ_PANEL.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_02_KARANTÉNA_DUPLICITY.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_03_NASTAVENÍ.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_04_DODAVATELÉ.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_05_STANDARDNÍ_ÚČTENKY.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_06_POLOŽKY.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_07_ÚČTENKY.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\supplier_dialog.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\progress_dialog.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\receipt_template_editor_dialog.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\populated_docs.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\populated_items.png"
+  ],
+  "tabs": [
+    {
+      "name": "DASHBOARD",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_00_DASHBOARD.png",
+      "widget_count": 84,
+      "incidents": []
+    },
+    {
+      "name": "PROVOZNÍ PANEL",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_01_PROVOZNÍ_PANEL.png",
+      "widget_count": 20,
+      "incidents": []
+    },
+    {
+      "name": "KARANTÉNA/DUPLICITY",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_02_KARANTÉNA_DUPLICITY.png",
+      "widget_count": 59,
+      "incidents": []
+    },
+    {
+      "name": "NASTAVENÍ",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_03_NASTAVENÍ.png",
+      "widget_count": 96,
+      "incidents": []
+    },
+    {
+      "name": "DODAVATELÉ",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_04_DODAVATELÉ.png",
+      "widget_count": 54,
+      "incidents": []
+    },
+    {
+      "name": "STANDARDNÍ ÚČTENKY",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_05_STANDARDNÍ_ÚČTENKY.png",
+      "widget_count": 21,
+      "incidents": []
+    },
+    {
+      "name": "POLOŽKY",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_06_POLOŽKY.png",
+      "widget_count": 72,
+      "incidents": []
+    },
+    {
+      "name": "ÚČTENKY",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\tab_07_ÚČTENKY.png",
+      "widget_count": 59,
+      "incidents": []
+    }
+  ],
+  "dialogs": [
+    {
+      "name": "supplier_dialog",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\supplier_dialog.png",
+      "widget_count": 24,
+      "incidents": []
+    },
+    {
+      "name": "progress_dialog",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\progress_dialog.png",
+      "widget_count": 8,
+      "incidents": []
+    },
+    {
+      "name": "receipt_template_editor_dialog",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\receipt_template_editor_dialog.png",
+      "widget_count": 44,
+      "incidents": []
+    }
+  ],
+  "populated_state": {
+    "docs": {
+      "scope": "docs",
+      "tab": "ÚČTENKY",
+      "row_index": 0,
+      "backend_id": 1,
+      "backend_file_id": 1,
+      "backend_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\output\\embedded_success.pdf",
+      "ui_source_text": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\output\\embedded_success.pdf",
+      "action_enabled": true,
+      "preview_has_pixmap": true,
+      "preview_has_scene_items": true
+    },
+    "items": {
+      "scope": "items",
+      "tab": "POLOŽKY",
+      "row_index": 0,
+      "backend_id": 1,
+      "backend_file_id": 1,
+      "backend_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\output\\embedded_success.pdf",
+      "ui_source_text": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\output\\embedded_success.pdf",
+      "action_enabled": true,
+      "preview_has_pixmap": true,
+      "preview_has_scene_items": true
+    },
+    "docs_findings": [],
+    "items_findings": [],
+    "screenshots": [
+      "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\populated_docs.png",
+      "C:\\Users\\provo\\AppData\\Local\\Temp\\final-gui-smoke-3kwvnq2t\\artifacts\\populated_items.png"
+    ]
+  },
+  "summary": {
+    "tab_count": 8,
+    "dialog_count": 3,
+    "incident_count": 0,
+    "truth_issue_count": 0,
+    "import_case_count": 6
+  }
+}

@@ -1,10 +1,12 @@
 app:
-  data_dir: C:/Users/provo/OneDrive - Aqua Sport Club s.r.o/KajovoSpendDB
-  db_path: C:\Users\provo\OneDrive - Aqua Sport Club s.r.o\KajovoSpendDB\kajovospend.sqlite
-  log_dir: ''
+  data_dir: C:/GitHub/pol
+  db_path: C:\GitHub\pol\kajovospend.sqlite
+  log_dir: C:\GitHub\KajovoSpend\LOG
+  working_db_path: C:\Users\provo\OneDrive - Aqua Sport Club s.r.o\KajovoSpendDB\kajovospend.sqlite
+  production_db_path: C:\Users\provo\OneDrive - Aqua Sport Club s.r.o\KajovoSpendDB\kajovospend-production.sqlite
 paths:
-  input_dir: C:/Users/provo/OneDrive - Aqua Sport Club s.r.o/KajovoSpendDB/INPUT
-  output_dir: C:/Users/provo/OneDrive - Aqua Sport Club s.r.o/KajovoSpendDB/OUT
+  input_dir: C:/GitHub/pol/in
+  output_dir: C:/GitHub/pol/out
   quarantine_dir_name: KARANTENA
   duplicate_dir_name: DUPLICITY
 service:
@@ -40,9 +42,9 @@ openai:
   enabled: true
   auto_enable: false
   api_key: ''
-  model: auto
+  model: gpt-4.1
   fallback_model: gpt-4.1
-  primary_enabled: false
+  primary_enabled: true
   use_json_schema: true
   only_openai: true
   temperature: 0.0

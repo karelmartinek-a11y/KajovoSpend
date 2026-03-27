@@ -30,10 +30,13 @@ def main() -> int:
         report_path = Path(report["workspace"]) / "artifacts" / "gui_smoke_report.json"
     write_json_report(report_path, report)
     print(f"GUI smoke hotový: {report_path}")
-    print(f"Taby: {report['summary']['tab_count']}, dialogy: {report['summary']['dialog_count']}")
+    print(
+        f"Taby: {report['summary']['tab_count']}, dialogy: {report['summary']['dialog_count']}, "
+        f"truth issues: {report['summary'].get('truth_issue_count', 0)}, "
+        f"import cases: {report['summary'].get('import_case_count', 0)}"
+    )
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

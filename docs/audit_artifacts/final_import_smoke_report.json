@@ -1,0 +1,87 @@
+{
+  "workspace": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth",
+  "config_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\config.yaml",
+  "fixture_pdf": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\fixture.pdf",
+  "log_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\logs\\import_smoke.log",
+  "cases": [
+    {
+      "name": "embedded_success",
+      "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\embedded_success.pdf",
+      "status": "PROCESSED",
+      "text_method": "embedded",
+      "document_ids": [
+        1
+      ],
+      "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\output\\embedded_success.pdf",
+      "supported": true,
+      "detail": null
+    },
+    {
+      "name": "ocr_path",
+      "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\ocr_success.png",
+      "status": "QUARANTINE",
+      "text_method": "image_ocr",
+      "document_ids": [],
+      "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\output\\KARANTENA\\ocr_success.png",
+      "supported": true,
+      "detail": null
+    },
+    {
+      "name": "template_path",
+      "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\template_success.pdf",
+      "status": "QUARANTINE",
+      "text_method": "template",
+      "document_ids": [],
+      "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\output\\KARANTENA\\template_success.pdf",
+      "supported": true,
+      "detail": null
+    },
+    {
+      "name": "quarantine_case",
+      "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\quarantine_case.pdf",
+      "status": "QUARANTINE",
+      "text_method": "embedded",
+      "document_ids": [],
+      "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\output\\KARANTENA\\quarantine_case.pdf",
+      "supported": true,
+      "detail": null
+    },
+    {
+      "name": "duplicate_case",
+      "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\duplicate_case.pdf",
+      "status": "DUPLICATE",
+      "text_method": null,
+      "document_ids": [],
+      "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\output\\DUPLICITY\\duplicate_case.pdf",
+      "supported": true,
+      "detail": null
+    },
+    {
+      "name": "ares_failure_case",
+      "input_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\ares_failure_case.pdf",
+      "status": "QUARANTINE",
+      "text_method": "embedded",
+      "document_ids": [],
+      "moved_to": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\output\\KARANTENA\\ares_failure_case.pdf",
+      "supported": true,
+      "detail": null
+    }
+  ],
+  "document_ids": [
+    1
+  ],
+  "support": {
+    "ocr_engine": true
+  },
+  "summary": {
+    "case_count": 6,
+    "processed_count": 1,
+    "quarantine_count": 4,
+    "duplicate_count": 1,
+    "skipped_count": 0,
+    "document_count": 1
+  },
+  "status": "PASS",
+  "failures": [],
+  "processed_pdf": "C:\\Users\\provo\\AppData\\Local\\Temp\\final-import-smoke-88cxfeth\\input\\embedded_success.pdf"
+}

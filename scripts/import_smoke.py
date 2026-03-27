@@ -30,10 +30,14 @@ def main() -> int:
         report_path = Path(report["workspace"]) / "artifacts" / "import_smoke_report.json"
     write_json_report(report_path, report)
     print(f"Import smoke hotový: {report_path}")
-    print(f"Status: {report['status']}, dokumenty: {len(report['document_ids'])}")
+    print(
+        f"Status: {report['status']}, case count: {report['summary']['case_count']}, "
+        f"dokumenty: {len(report['document_ids'])}"
+    )
+    for case in report.get("cases", []):
+        print(f"- {case['name']}: {case['status']} ({case.get('text_method') or '-'})")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

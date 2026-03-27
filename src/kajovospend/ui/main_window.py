@@ -106,6 +106,19 @@ class PdfPreviewView(QGraphicsView):
         if not self._scene.sceneRect().isEmpty():
             self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
 
+    def set_status_text(self, text: str) -> None:
+        self._scene.clear()
+        self._pix_item = QGraphicsPixmapItem()
+        self._scene.addItem(self._pix_item)
+        label = self._scene.addText(text or "")
+        label.setDefaultTextColor(QColor("#6B7280"))
+        label.setPos(16, 16)
+        bounds = label.boundingRect()
+        self._scene.setSceneRect(0, 0, max(bounds.width() + 32, 240), max(bounds.height() + 32, 120))
+        self._user_zoomed = False
+        self.resetTransform()
+        self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+
     def wheelEvent(self, event):
         # Ctrl+wheel for zoom; plain wheel = scroll/pan default
         if event.modifiers() & Qt.ControlModifier:
@@ -923,6 +936,12 @@ class SupplierDialog(QDialog):
         lay.addLayout(form)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok_btn = bb.button(QDialogButtonBox.Ok)
+        cancel_btn = bb.button(QDialogButtonBox.Cancel)
+        if ok_btn is not None:
+            ok_btn.setText("OK")
+        if cancel_btn is not None:
+            cancel_btn.setText("Zrušit")
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
@@ -1567,7 +1586,7 @@ class MainWindow(QMainWindow):
         hl.addWidget(self.mini_progress)
         hl.addWidget(self.lbl_openai_andon)
 
-        self.btn_exit = QPushButton("EXIT")
+        self.btn_exit = QPushButton("KONEC")
         self.btn_exit.setObjectName("ExitButton")
         set_button_min_widths(self.btn_exit)
 
@@ -1856,6 +1875,8 @@ class MainWindow(QMainWindow):
         self.unproc_items_table = QTableView()
         self.unproc_items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         rur.addWidget(self.unproc_items_table, 3)
+        self.unproc_items_table.setModel(EditableItemsModel([]))
+        self._configure_editable_items_header(self.unproc_items_table)
 
         self.unproc_split.addWidget(right_un)
         self.unproc_split.setStretchFactor(0, 3)
@@ -2341,19 +2362,24 @@ class MainWindow(QMainWindow):
 
         items_search_panel = QWidget()
         style_as_panel(items_search_panel)
-        items_search_layout = QHBoxLayout(items_search_panel)
+        items_search_layout = QVBoxLayout(items_search_panel)
         items_search_layout.setContentsMargins(12, 10, 12, 10)
         items_search_layout.setSpacing(8)
+        items_search_top = QWidget()
+        items_search_top_layout = QHBoxLayout(items_search_top)
+        items_search_top_layout.setContentsMargins(0, 0, 0, 0)
+        items_search_top_layout.setSpacing(8)
         self.items_filter = QLineEdit()
         self.items_filter.setPlaceholderText("Fulltext: slova = OR, použij AND pro průnik (název, IČO, číslo dokladu...)")
         self.btn_items_search = QPushButton("Hledat")
         self.btn_items_more = QPushButton("Načíst další")
         self.lbl_items_page = QLabel("0 / 0")
         set_button_min_widths(self.btn_items_search, self.btn_items_more)
-        items_search_layout.addWidget(self.items_filter, 1)
-        items_search_layout.addWidget(self.btn_items_search)
-        items_search_layout.addWidget(self.btn_items_more)
-        items_search_layout.addWidget(self.lbl_items_page)
+        items_search_top_layout.addWidget(self.items_filter, 1)
+        items_search_top_layout.addWidget(self.btn_items_search)
+        items_search_top_layout.addWidget(self.btn_items_more)
+        items_search_top_layout.addWidget(self.lbl_items_page)
+        items_search_layout.addWidget(items_search_top)
         items_layout.addWidget(items_search_panel)
 
         items_filters = QWidget()
@@ -2361,8 +2387,10 @@ class MainWindow(QMainWindow):
         items_filters_layout = QVBoxLayout(items_filters)
         items_filters_layout.setContentsMargins(12, 10, 12, 10)
         items_filters_layout.setSpacing(8)
-        criteria_row = QWidget()
-        criteria_layout = FlowLayout(criteria_row, h_spacing=8, v_spacing=8)
+        criteria_primary_row = QWidget()
+        criteria_primary_layout = FlowLayout(criteria_primary_row, h_spacing=8, v_spacing=8)
+        criteria_secondary_row = QWidget()
+        criteria_secondary_layout = FlowLayout(criteria_secondary_row, h_spacing=8, v_spacing=8)
         actions_row = QWidget()
         actions_layout = FlowLayout(actions_row, h_spacing=8, v_spacing=8)
         self.items_group_enable = QCheckBox("Skupina")
@@ -2394,12 +2422,12 @@ class MainWindow(QMainWindow):
         self.items_group_assign = QLineEdit(); self.items_group_assign.setPlaceholderText("Název nové/existující skupiny")
 
         for widget in (self.items_group_filter, self.items_vat_filter, self.items_price_op):
-            set_editor_char_width(widget, 16, floor=180)
+            set_editor_char_width(widget, 16, floor=190)
         for widget in (self.items_price_val, self.items_price_min, self.items_price_max):
             set_editor_char_width(widget, 8, floor=120)
         for widget in (self.items_ids_receipt, self.items_ids_supplier):
-            set_editor_char_width(widget, 18, floor=180)
-        set_editor_char_width(self.items_group_assign, 22, floor=220)
+            set_editor_char_width(widget, 20, floor=240)
+        set_editor_char_width(self.items_group_assign, 24, floor=280)
         set_button_min_widths(self.btn_items_select_all, self.btn_items_assign_group)
 
         for widget in (
@@ -2407,12 +2435,16 @@ class MainWindow(QMainWindow):
             self.items_vat_enable, self.items_vat_filter,
             QLabel("Cena/ks"), self.items_price_enable, self.items_price_op, self.items_price_val,
             QLabel("Od"), self.items_price_min, QLabel("Do"), self.items_price_max,
+        ):
+            criteria_primary_layout.addWidget(widget)
+        for widget in (
             self.items_ids_receipt, self.items_ids_supplier,
         ):
-            criteria_layout.addWidget(widget)
+            criteria_secondary_layout.addWidget(widget)
         for widget in (self.btn_items_select_all, self.items_group_assign, self.btn_items_assign_group):
             actions_layout.addWidget(widget)
-        items_filters_layout.addWidget(criteria_row)
+        items_filters_layout.addWidget(criteria_primary_row)
+        items_filters_layout.addWidget(criteria_secondary_row)
         items_filters_layout.addWidget(actions_row)
         items_layout.addWidget(items_filters)
         self._on_price_enable_changed(False)
@@ -2445,6 +2477,7 @@ class MainWindow(QMainWindow):
         self.items_src.setReadOnly(True)
         self.btn_items_open = QPushButton("Otevřít doklad")
         set_button_min_widths(self.btn_items_open)
+        self.btn_items_open.setEnabled(False)
         sri.addWidget(QLabel("Zdroj:"))
         sri.addWidget(self.items_src, 1)
         sri.addWidget(self.btn_items_open)
@@ -2462,9 +2495,12 @@ class MainWindow(QMainWindow):
         self.items_doc_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.items_doc_items_table.setMinimumWidth(320)
         ir.addWidget(self.items_doc_items_table, 1)
+        self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
+        self._configure_line_items_header(self.items_doc_items_table)
 
         self.items_preview = PdfPreviewView()
         ir.addWidget(self.items_preview, 2)
+        self.items_preview.set_status_text("Vyberte položku pro zobrazení zdroje.")
         items_split.addWidget(items_right)
 
         items_split.setStretchFactor(0, 3)
@@ -2517,10 +2553,14 @@ class MainWindow(QMainWindow):
         srcrow = QWidget(); sr = QHBoxLayout(srcrow); sr.setContentsMargins(0, 0, 0, 0)
         self.doc_src_line = QLineEdit(); self.doc_src_line.setReadOnly(True)
         self.btn_open_source = QPushButton("Otevřít soubor")
-        self.btn_zoom_in = QPushButton("+"); self.btn_zoom_out = QPushButton("-"); self.btn_zoom_reset = QPushButton("Fit")
+        self.btn_zoom_in = QPushButton("+"); self.btn_zoom_out = QPushButton("-"); self.btn_zoom_reset = QPushButton("Přizpůsobit")
         set_button_min_widths(self.btn_open_source, self.btn_zoom_reset)
         self.btn_zoom_in.setMinimumWidth(44)
         self.btn_zoom_out.setMinimumWidth(44)
+        self.btn_open_source.setEnabled(False)
+        self.btn_zoom_in.setEnabled(False)
+        self.btn_zoom_out.setEnabled(False)
+        self.btn_zoom_reset.setEnabled(False)
         sr.addWidget(QLabel("Zdroj:")); sr.addWidget(self.doc_src_line, 1); sr.addWidget(self.btn_open_source)
         sr.addWidget(self.btn_zoom_in); sr.addWidget(self.btn_zoom_out); sr.addWidget(self.btn_zoom_reset)
         rl.addWidget(srcrow)
@@ -2530,6 +2570,7 @@ class MainWindow(QMainWindow):
 
         self.preview_view = PdfPreviewView()
         rl.addWidget(self.preview_view, 3)
+        self.preview_view.set_status_text("Vyberte doklad pro zobrazení zdroje.")
 
         self.doc_items_table = QTableView()
         self.doc_items_table.setAlternatingRowColors(True)
@@ -2538,6 +2579,8 @@ class MainWindow(QMainWindow):
         self.doc_items_table.verticalHeader().setVisible(False)
         self.doc_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         rl.addWidget(self.doc_items_table, 2)
+        self.doc_items_table.setModel(TableModel(["#", "Název", "Množství", "DPH %", "Cena (s DPH)"], []))
+        self._configure_line_items_header(self.doc_items_table)
 
         items_bar = QWidget()
         ib = FlowLayout(items_bar, h_spacing=8, v_spacing=8)
@@ -2797,6 +2840,11 @@ class MainWindow(QMainWindow):
             self._items_total = int(total or 0)
             self._items_offset = len(self._items_rows)
             self._render_items_table(reset)
+            if reset and not self._items_rows:
+                self._apply_items_source_state(None, reason="Vyberte položku pro zobrazení zdroje.")
+                self.items_doc_summary.set_values({})
+                self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
+                self._configure_line_items_header(self.items_doc_items_table)
 
         if show_busy:
             self._run_with_busy("Hledám položky", "Vyhledávání…", _query, _apply)
@@ -2910,16 +2958,16 @@ class MainWindow(QMainWindow):
     def _configure_items_table_headers(self) -> None:
         self._apply_header_width_policy(
             self.items_table,
-            min_section=96,
+            min_section=104,
             resize_to_contents={0, 3, 8, 9, 11, 12},
             explicit_widths={
-                1: 220,
-                2: 190,
-                4: 150,
+                1: 240,
+                2: 200,
+                4: 160,
                 5: 184,
-                6: 190,
-                7: 136,
-                10: 150,
+                6: 210,
+                7: 152,
+                10: 156,
             },
         )
         self._items_selection_changed_v2(None, None)
@@ -2947,6 +2995,20 @@ class MainWindow(QMainWindow):
             explicit_widths={
                 1: 200,
                 2: 252,
+            },
+        )
+
+    def _configure_editable_items_header(self, table: QTableView) -> None:
+        self._apply_header_width_policy(
+            table,
+            min_section=108,
+            resize_to_contents={1, 4},
+            explicit_widths={
+                0: 160,
+                2: 272,
+                3: 192,
+                5: 132,
+                6: 168,
             },
         )
 
@@ -3033,8 +3095,7 @@ class MainWindow(QMainWindow):
                 return
             idxs = sm.selectedRows()
             if not idxs:
-                self.items_preview.clear()
-                self.items_src.setText("")
+                self._apply_items_source_state(None, reason="Vyberte položku pro zobrazení zdroje.")
                 self.items_doc_summary.set_values({})
                 self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
                 self._configure_line_items_header(self.items_doc_items_table)
@@ -3046,8 +3107,7 @@ class MainWindow(QMainWindow):
             return
 
         path = meta.get("current_path")
-        self._items_current_path = path
-        self.items_src.setText(path or "")
+        self._apply_items_source_state(path)
 
         issue = meta.get("issue_date")
         if hasattr(issue, "strftime"):
@@ -3096,11 +3156,6 @@ class MainWindow(QMainWindow):
         else:
             self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
             self._configure_line_items_header(self.items_doc_items_table)
-
-        if path:
-            QTimer.singleShot(0, lambda: self._load_preview(self.items_preview, path))
-        else:
-            self.items_preview.clear()
 
     def _group_row_clicked(self, index: QModelIndex):
         try:
@@ -3324,6 +3379,50 @@ class MainWindow(QMainWindow):
             # preview error: do not crash GUI
             self.log.exception("Preview load failed for %s", p)
 
+    def _resolve_existing_source_path(self, path_str: str | None) -> str | None:
+        candidate = (path_str or "").strip()
+        if not candidate:
+            return None
+        try:
+            path = Path(candidate)
+        except Exception:
+            return None
+        if not path.exists() or not path.is_file():
+            return None
+        return str(path)
+
+    def _apply_doc_source_state(self, path_str: str | None, *, reason: str | None = None) -> None:
+        available = self._resolve_existing_source_path(path_str)
+        self._current_doc_path = available
+        self.doc_src_line.setText(
+            available
+            or reason
+            or ("Zdroj není dostupný. Soubor po importu už na očekávané cestě není." if (path_str or "").strip() else "Zdroj není dostupný.")
+        )
+        self.doc_src_line.setToolTip(self.doc_src_line.text())
+        self.btn_open_source.setEnabled(bool(available))
+        for button in (self.btn_zoom_in, self.btn_zoom_out, self.btn_zoom_reset):
+            button.setEnabled(bool(available))
+        if available:
+            QTimer.singleShot(0, lambda p=available: self._load_preview(self.preview_view, p))
+            return
+        self.preview_view.set_status_text(self.doc_src_line.text())
+
+    def _apply_items_source_state(self, path_str: str | None, *, reason: str | None = None) -> None:
+        available = self._resolve_existing_source_path(path_str)
+        self._items_current_path = available
+        self.items_src.setText(
+            available
+            or reason
+            or ("Zdroj dokladu není dostupný. Soubor už na očekávané cestě není." if (path_str or "").strip() else "Zdroj dokladu není dostupný.")
+        )
+        self.items_src.setToolTip(self.items_src.text())
+        self.btn_items_open.setEnabled(bool(available))
+        if available:
+            QTimer.singleShot(0, lambda p=available: self._load_preview(self.items_preview, p))
+            return
+        self.items_preview.set_status_text(self.items_src.text())
+
     def _open_file_path(self, path_str: str | None) -> None:
         if not path_str:
             return
@@ -3430,6 +3529,15 @@ class MainWindow(QMainWindow):
 
         # enable/disable "more"
         self.btn_docs_more.setEnabled(self._doc_offset < self._doc_total)
+        if reset and not self._docs_listing:
+            self._current_doc_id = None
+            self._current_doc_file_id = None
+            self._apply_doc_source_state(None, reason="Vyberte doklad pro zobrazení zdroje.")
+            self.doc_supplier_info.set_values({})
+            self.doc_items_table.setModel(TableModel(["#", "Název", "Množství", "DPH %", "Cena (s DPH)"], []))
+            self._configure_line_items_header(self.doc_items_table)
+            for button in (self.btn_items_add, self.btn_items_del, self.btn_items_save):
+                button.setEnabled(False)
 
         # auto-select first row on reset and hook selection change
         try:
@@ -3464,16 +3572,15 @@ class MainWindow(QMainWindow):
             return
         meta = self._docs_listing[row]
         doc_id = int(meta["doc_id"])
-        with self.sf() as session:
-            det = db_api.get_document_detail(session, doc_id)
+        with self.sf_production() as prod_session, self.sf() as work_session:
+            det = db_api.get_document_detail(prod_session, doc_id, working_session=work_session)
             doc: Document = det["doc"]
             f: DocumentFile = det["file"]
             items: List[LineItem] = det["items"]
 
         self._current_doc_id = int(doc.id)
         self._current_doc_file_id = int(f.id) if f else None
-        self._current_doc_path = f.current_path if f else None
-        self.doc_src_line.setText(self._current_doc_path or "")
+        self._apply_doc_source_state(f.current_path if f else None)
         supplier_name = ""
         supplier_ico = ""
         try:
@@ -3515,13 +3622,12 @@ class MainWindow(QMainWindow):
         self._current_doc_items_model = model
         self.doc_items_table.setModel(model)
         self.doc_items_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._configure_editable_items_header(self.doc_items_table)
 
         for b in (self.btn_items_add, self.btn_items_del, self.btn_items_save):
             b.setEnabled(True)
 
         # load preview after table is ready to avoid blocking UI
-        QTimer.singleShot(0, lambda: self._load_preview(self.preview_view, self._current_doc_path))
-
     def _open_selected_source_v2(self) -> None:
         self._open_file_path(self._current_doc_path)
 
@@ -5382,14 +5488,7 @@ class MainWindow(QMainWindow):
         self._docs_new_search()
 
     def _open_selected_source(self):
-        p = (self.doc_src_line.text() or "").strip()
-        if not p:
-            return
-        fp = Path(p)
-        if not fp.exists():
-            QMessageBox.warning(self, "Soubor", "Soubor neexistuje.")
-            return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(fp)))
+        self._open_file_path(self._current_doc_path)
 
     def _on_doc_selected_fast(self, *_):
         model = self.docs_table.model()
@@ -5408,39 +5507,24 @@ class MainWindow(QMainWindow):
         except Exception:
             return
 
-        with self.sf() as session:
+        with self.sf_production() as prod_session, self.sf() as work_session:
             try:
-                detail = db_api.get_document_detail(session, doc_id)
+                detail = db_api.get_document_detail(prod_session, doc_id, working_session=work_session)
                 d: Document = detail["doc"]
                 f: DocumentFile = detail["file"]
                 items: List[LineItem] = detail["items"]
             except Exception:
                 return
 
-        src = f.current_path if f else ""
-        self.doc_src_line.setText(src or "")
+        src = f.current_path if f else None
+        self._apply_doc_source_state(src)
 
         item_headers = ["#", "Název", "Množství", "DPH %", "Cena (s DPH)"]
         item_rows: List[List[Any]] = []
         for it in items:
             item_rows.append([it.line_no, it.name, it.quantity, it.vat_rate, it.line_total])
         self.doc_items_table.setModel(TableModel(item_headers, item_rows))
-        self.doc_items_table.resizeColumnsToContents()
-
-        self.preview_view.clear()
-        if src and src.lower().endswith(".pdf") and Path(src).exists():
-            key = (src, self._preview_dpi)
-            px = self._preview_cache.get(key)
-            if px is None:
-                try:
-                    imgs = render_pdf_to_images(Path(src), dpi=self._preview_dpi, max_pages=1)
-                    if imgs:
-                        px = pil_to_pixmap(imgs[0])
-                        self._preview_cache[key] = px
-                except Exception:
-                    px = QPixmap()
-            if px and not px.isNull():
-                self.preview_view.set_pixmap(px)
+        self._configure_line_items_header(self.doc_items_table)
 
     def refresh_unprocessed(self, force: bool = True):
         """Seznam karanténních souborů (FS + DB), řádek = jeden soubor."""
@@ -5960,12 +6044,14 @@ class MainWindow(QMainWindow):
         self.unproc_currency.setText("CZK")
         self._current_unproc_items_model = EditableItemsModel([])
         self.unproc_items_table.setModel(self._current_unproc_items_model)
+        self._configure_editable_items_header(self.unproc_items_table)
         self._update_unproc_total_hint()
 
     def _unproc_item_add(self):
         if not hasattr(self, "_current_unproc_items_model") or self._current_unproc_items_model is None:
             self._current_unproc_items_model = EditableItemsModel([])
             self.unproc_items_table.setModel(self._current_unproc_items_model)
+            self._configure_editable_items_header(self.unproc_items_table)
         self._current_unproc_items_model.insertRows(self._current_unproc_items_model.rowCount(), 1)
         self._update_unproc_total_hint()
 

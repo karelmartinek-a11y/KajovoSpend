@@ -10,14 +10,15 @@ python-dateutil==2.9.0.post0
 # Pillow 10.4.0 může na některých kombinacích končit buildem ze zdrojů; na 3.13 je bezpečnější 11+
 pillow>=11.0.0
 
-numpy==2.0.1
+# Na Pythonu 3.13 musí být NumPy dostupný jako wheel bez source buildů.
+numpy==2.1.3
 pypdf==4.3.1
 pypdfium2==4.30.0
 
 # OCR (Varianta B) – onnxruntime/rapidocr; pokud by na tvé platformě chyběl wheel, dočasně to lze vypnout
 rapidocr-onnxruntime; python_version < "3.14"
 
-pandas==2.2.2
+pandas==2.2.3
 openpyxl==3.1.5
 
 # editable install projektu
