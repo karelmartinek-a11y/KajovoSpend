@@ -26,11 +26,28 @@ else:
 class _InterProcessLock:
     """Cross-process file lock using a dedicated lock-file."""
 
+    _local = threading.local()
+
     def __init__(self, lock_path: Path):
         self._lock_path = lock_path
         self._fh = None
+        self._token = str(lock_path.resolve())
+        self._owned_here = False
+
+    @classmethod
+    def _held_tokens(cls) -> set[str]:
+        held = getattr(cls._local, "held_tokens", None)
+        if held is None:
+            held = set()
+            cls._local.held_tokens = held
+        return held
 
     def __enter__(self):
+        held = self._held_tokens()
+        if self._token in held:
+            self._owned_here = False
+            return self
+
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = open(self._lock_path, "a+b")
         try:
@@ -49,9 +66,14 @@ class _InterProcessLock:
                 pass
             self._fh = None
             raise
+        held.add(self._token)
+        self._owned_here = True
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if not self._owned_here:
+            return
+
         if not self._fh:
             return
         try:
@@ -65,10 +87,15 @@ class _InterProcessLock:
                 fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
         finally:
             try:
+                self._held_tokens().discard(self._token)
+            except Exception:
+                pass
+            try:
                 self._fh.close()
             except Exception:
                 pass
             self._fh = None
+            self._owned_here = False
 
 
 class SafeTimedRotatingFileHandler(TimedRotatingFileHandler):

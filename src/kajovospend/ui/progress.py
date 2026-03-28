@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSizePolicy,
@@ -52,10 +53,12 @@ class ProgressDialog(QDialog):
         self.setWindowModality(Qt.NonModal)
         self.setModal(False)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        self.setMinimumSize(640, 280)
+        self.setMinimumSize(760, 420)
 
         self._t0 = time.monotonic()
         self._last_heartbeat = 0
+        self._history_limit = 10
+        self._history_lines: list[str] = []
         # By default, user cannot close the dialog with X; we treat it as a cancel request.
         # When the operation finishes, ProgressController enables closing.
         self._allow_close = False
@@ -67,6 +70,13 @@ class ProgressDialog(QDialog):
         self.lbl_step = QLabel("")
         self.lbl_step.setWordWrap(True)
         self.lbl_step.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_file_caption = QLabel("Aktuálně zpracovávaný soubor")
+        self.lbl_file_caption.setObjectName("ProgressCaption")
+        self.lbl_current_file = QLabel("-")
+        self.lbl_current_file.setObjectName("ProgressCurrentFile")
+        self.lbl_current_file.setWordWrap(True)
+        self.lbl_current_file.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_current_file.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.lbl_time = QLabel("00:00")
         self.lbl_time.setObjectName("ProgressTime")
         self.lbl_time.setMinimumWidth(92)
@@ -87,6 +97,18 @@ class ProgressDialog(QDialog):
         self.batch_box.setWordWrap(True)
         self.batch_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.batch_box.hide()
+
+        self.lbl_history_caption = QLabel("Posledních 10 kroků")
+        self.lbl_history_caption.setObjectName("ProgressCaption")
+        self.history_box = QPlainTextEdit()
+        self.history_box.setObjectName("ProgressHistory")
+        self.history_box.setReadOnly(True)
+        self.history_box.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.history_box.setMinimumHeight(170)
+        try:
+            self.history_box.document().setMaximumBlockCount(self._history_limit)
+        except Exception:
+            pass
 
         self.btn_min = QPushButton("Minimalizovat")
         self.btn_min.clicked.connect(self._on_minimize)
@@ -113,8 +135,12 @@ class ProgressDialog(QDialog):
         lay.setSpacing(10)
         lay.addLayout(top)
         lay.addWidget(self.lbl_step)
+        lay.addWidget(self.lbl_file_caption)
+        lay.addWidget(self.lbl_current_file)
         lay.addWidget(self.bar)
         lay.addWidget(self.batch_box)
+        lay.addWidget(self.lbl_history_caption)
+        lay.addWidget(self.history_box)
         lay.addLayout(mid)
 
         self._timer = QTimer(self)
@@ -128,6 +154,10 @@ class ProgressDialog(QDialog):
 
     def set_step(self, text: str) -> None:
         self.lbl_step.setText(text or "")
+
+    def set_current_file(self, text: str) -> None:
+        txt = str(text or "").strip()
+        self.lbl_current_file.setText(txt or "-")
 
     def set_determinate(self, total: int) -> None:
         total_i = max(1, int(total))
@@ -149,6 +179,23 @@ class ProgressDialog(QDialog):
         else:
             self.batch_box.setText("")
             self.batch_box.hide()
+
+    def clear_history(self) -> None:
+        self._history_lines = []
+        self.history_box.clear()
+
+    def append_history(self, text: str) -> None:
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        if self._history_lines and self._history_lines[-1] == msg:
+            return
+        stamp = _fmt_mmss(time.monotonic() - self._t0)
+        line = f"[{stamp}] {msg}"
+        self._history_lines.append(msg)
+        if len(self._history_lines) > self._history_limit:
+            self._history_lines = self._history_lines[-self._history_limit :]
+        self.history_box.appendPlainText(line)
 
     def _tick(self) -> None:
         elapsed = time.monotonic() - self._t0
@@ -241,6 +288,7 @@ class ProgressController:
         self._openai_on = False
         self._openai_off_timer: Optional[QTimer] = None
         self._cancel_cb = None
+        self._current_file = ""
 
         self.mini.clicked.connect(self.restore)
 
@@ -269,9 +317,13 @@ class ProgressController:
         self.active = True
         self.batch = BatchSummary(total=int(batch_total or 0), done=0)
         self._cancel_cb = cancel_cb
+        self._current_file = ""
         self.dlg = ProgressDialog(self.parent_window)
         self.dlg.set_title(title)
         self.dlg.set_step(step)
+        self.dlg.set_current_file("")
+        self.dlg.clear_history()
+        self.dlg.append_history(step)
         if total is None:
             self.dlg.set_indeterminate()
         else:
@@ -293,9 +345,14 @@ class ProgressController:
         step: Optional[str] = None,
         value: Optional[int] = None,
         total: Optional[int] = None,
+        current_file: Optional[str] = None,
+        history_entry: Optional[str] = None,
     ) -> None:
         if not self.active or not self.dlg:
             return
+        if current_file is not None:
+            self._current_file = str(current_file or "").strip()
+            self.dlg.set_current_file(self._current_file)
         if step is not None:
             self.dlg.set_step(step)
         if total is not None:
@@ -304,6 +361,10 @@ class ProgressController:
             self.dlg.set_value(int(value))
         if self.batch.total > 0:
             self.dlg.set_batch_text(self.batch.as_text())
+        if history_entry is not None:
+            self.dlg.append_history(history_entry)
+        elif step is not None:
+            self.dlg.append_history(step)
         self._update_mini()
 
     def set_cancel_callback(self, cancel_cb) -> None:
@@ -314,7 +375,7 @@ class ProgressController:
             return
         self.batch.done += 1
         st = str(status or "").upper()
-        if st == "PRODUCTION":
+        if st in {"PRODUCTION", "PROCESSED"}:
             self.batch.production += 1
         elif st == "QUARANTINE":
             self.batch.quarantine += 1
@@ -345,6 +406,7 @@ class ProgressController:
         except Exception:
             pass
         self.active = False
+        self._current_file = ""
         self._set_openai_andon(False)
         self.mini.hide()
         self.dlg = None
@@ -372,6 +434,7 @@ class ProgressController:
         except Exception:
             pass
         self.active = False
+        self._current_file = ""
         self._set_openai_andon(False)
         self.mini.hide()
         self.dlg = None
@@ -401,7 +464,9 @@ class ProgressController:
             return
         line1 = self.dlg.windowTitle() or "Pracuji…"
         line2 = self.dlg.lbl_step.text() or ""
-        if self.batch.total > 0:
+        if self._current_file:
+            line2 = self._current_file
+        elif self.batch.total > 0:
             line2 = self.batch.as_text()
         self.mini.set_lines(line1, line2)
         if force_show or (self.dlg and not self.dlg.isVisible()):

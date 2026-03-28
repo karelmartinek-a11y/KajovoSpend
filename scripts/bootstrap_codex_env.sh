@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_URL_DEFAULT="https://github.com/karelmartinek-a11y/KajovoSpend.git"
-VENV_DIR="${1:-.venv}"
+VENV_DIR="${1:-.venv312}"
 REPO_URL="${REPO_URL:-$REPO_URL_DEFAULT}"
 
 if ! command -v pyenv >/dev/null 2>&1; then
@@ -13,6 +13,12 @@ fi
 pick_python_version() {
   local versions
   versions="$(pyenv versions --bare | tr -d ' ')"
+  if grep -qx '3.12.12' <<<"$versions"; then
+    echo '3.12.12'; return
+  fi
+  if grep -qx '3.13.8' <<<"$versions"; then
+    echo '3.13.8'; return
+  fi
   if grep -Eq '^3\.(1[1-9]|[2-9][0-9])\.' <<<"$versions"; then
     grep -E '^3\.(1[1-9]|[2-9][0-9])\.' <<<"$versions" | sort -V | tail -n1
     return

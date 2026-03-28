@@ -106,19 +106,6 @@ class PdfPreviewView(QGraphicsView):
         if not self._scene.sceneRect().isEmpty():
             self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
 
-    def set_status_text(self, text: str) -> None:
-        self._scene.clear()
-        self._pix_item = QGraphicsPixmapItem()
-        self._scene.addItem(self._pix_item)
-        label = self._scene.addText(text or "")
-        label.setDefaultTextColor(QColor("#6B7280"))
-        label.setPos(16, 16)
-        bounds = label.boundingRect()
-        self._scene.setSceneRect(0, 0, max(bounds.width() + 32, 240), max(bounds.height() + 32, 120))
-        self._user_zoomed = False
-        self.resetTransform()
-        self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
-
     def wheelEvent(self, event):
         # Ctrl+wheel for zoom; plain wheel = scroll/pan default
         if event.modifiers() & Qt.ControlModifier:
@@ -639,6 +626,10 @@ class _Worker(QObject):
         self.done.emit(res)
 
 
+class _ImportCancelled(RuntimeError):
+    """Cooperative cancellation for long-running import work."""
+
+
 class _ImportWorker(QObject):
     progress = Signal(str)
     done = Signal(dict)
@@ -657,6 +648,12 @@ class _ImportWorker(QObject):
             reg_api = sanitize_openai_api_key(load_user_env_var("KAJOVOSPEND_OPENAI_API_KEY"))
             if reg_api:
                 os.environ["KAJOVOSPEND_OPENAI_API_KEY"] = reg_api
+
+            def emit_status(message: str) -> None:
+                if self.stop_cb():
+                    raise _ImportCancelled("Zastaveno uživatelem.")
+                self.progress.emit(str(message or "").strip() or "Pracuji…")
+
             input_dir = Path(self.cfg["paths"]["input_dir"])
             if not input_dir.exists():
                 self.done.emit({"imported": 0, "message": "Adresář INPUT neexistuje."})
@@ -668,6 +665,7 @@ class _ImportWorker(QObject):
 
             files: list[Path] = []
             scanned = 0
+            emit_status("Načítám INPUT: prohledávám složky a hledám podporované doklady…")
             # Robustní skenování INPUT (bez zamrznutí UI) + možnost zastavení.
             # Používáme os.walk, protože Path.rglob na Windows může být velmi pomalý
             # na velkých stromových strukturách a nedává průběžný feedback.
@@ -702,8 +700,10 @@ class _ImportWorker(QObject):
                             self.processor.log.exception("Nelze přesunout nepodporovaný soubor %s: %s", p, exc)
 
                     # Průběžný status – aby bylo vidět, že import "žije" i při prázdném nebo velkém stromu.
-                    if scanned % 200 == 0:
-                        self.progress.emit(f"Načítám INPUT… prohledáno {scanned} souborů, nalezeno {len(files)} dokladů")
+                    if scanned <= 5 or scanned % 100 == 0:
+                        emit_status(
+                            f"Načítám INPUT: zkontrolováno {scanned} souborů, k importu připraveno {len(files)} dokladů"
+                        )
 
             files.sort(key=lambda p: (p.stat().st_mtime, p.name, str(p)))
 
@@ -718,14 +718,17 @@ class _ImportWorker(QObject):
                 if self.stop_cb():
                     self.done.emit({"imported": imported, "total": total, "message": "Zastaveno uživatelem."})
                     return
-                self.progress.emit(f"Zpracovávám {i}/{total}: {p.name}")
+                self.progress.emit(f"__CURRENT_FILE__|{i}|{total}|{p.name}|{p}")
+                emit_status(f"Soubor {i}/{total}: zahajuji zpracování {p.name}")
                 try:
                     with self.sf() as session:
                         job = ImportJob(path=str(p), status="RUNNING", started_at=utc_now_naive())
                         session.add(job)
                         session.commit()
 
-                        res = self.processor.process_path(session, p, status_cb=self.progress.emit, job_id=int(job.id))
+                        res = self.processor.process_path(session, p, status_cb=emit_status, job_id=int(job.id))
+                        if self.stop_cb():
+                            raise _ImportCancelled("Zastaveno uživatelem.")
                         job.sha256 = res.get("sha256")
                         job.status = str(res.get("status") or "DONE")
                         job.finished_at = utc_now_naive()
@@ -737,6 +740,9 @@ class _ImportWorker(QObject):
                         except Exception:
                             st = ""
                         self.progress.emit(f"__BATCH_RESULT__|{st}|{p.name}")
+                except _ImportCancelled:
+                    self.done.emit({"imported": imported, "total": total, "message": "Zastaveno uživatelem."})
+                    return
                 except Exception as e:
                     try:
                         with self.sf() as session:
@@ -751,7 +757,7 @@ class _ImportWorker(QObject):
                             session.commit()
                     except Exception:
                         pass
-                    self.progress.emit(f"Chyba: {p.name}: {e}")
+                    emit_status(f"Soubor {p.name}: zpracování skončilo chybou ({e})")
                     self.progress.emit(f"__BATCH_RESULT__|ERROR|{p.name}")
 
             if self.stop_cb():
@@ -768,6 +774,8 @@ class _ImportWorker(QObject):
                     pass
 
             self.done.emit({"imported": imported, "total": total, "message": "Hotovo."})
+        except _ImportCancelled:
+            self.done.emit({"imported": 0, "message": "Zastaveno uživatelem."})
         except Exception as e:
             self.error.emit(str(e))
 
@@ -936,12 +944,6 @@ class SupplierDialog(QDialog):
         lay.addLayout(form)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        ok_btn = bb.button(QDialogButtonBox.Ok)
-        cancel_btn = bb.button(QDialogButtonBox.Cancel)
-        if ok_btn is not None:
-            ok_btn.setText("OK")
-        if cancel_btn is not None:
-            cancel_btn.setText("Zrušit")
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
@@ -1586,7 +1588,7 @@ class MainWindow(QMainWindow):
         hl.addWidget(self.mini_progress)
         hl.addWidget(self.lbl_openai_andon)
 
-        self.btn_exit = QPushButton("KONEC")
+        self.btn_exit = QPushButton("EXIT")
         self.btn_exit.setObjectName("ExitButton")
         set_button_min_widths(self.btn_exit)
 
@@ -1875,8 +1877,6 @@ class MainWindow(QMainWindow):
         self.unproc_items_table = QTableView()
         self.unproc_items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         rur.addWidget(self.unproc_items_table, 3)
-        self.unproc_items_table.setModel(EditableItemsModel([]))
-        self._configure_editable_items_header(self.unproc_items_table)
 
         self.unproc_split.addWidget(right_un)
         self.unproc_split.setStretchFactor(0, 3)
@@ -2362,24 +2362,19 @@ class MainWindow(QMainWindow):
 
         items_search_panel = QWidget()
         style_as_panel(items_search_panel)
-        items_search_layout = QVBoxLayout(items_search_panel)
+        items_search_layout = QHBoxLayout(items_search_panel)
         items_search_layout.setContentsMargins(12, 10, 12, 10)
         items_search_layout.setSpacing(8)
-        items_search_top = QWidget()
-        items_search_top_layout = QHBoxLayout(items_search_top)
-        items_search_top_layout.setContentsMargins(0, 0, 0, 0)
-        items_search_top_layout.setSpacing(8)
         self.items_filter = QLineEdit()
         self.items_filter.setPlaceholderText("Fulltext: slova = OR, použij AND pro průnik (název, IČO, číslo dokladu...)")
         self.btn_items_search = QPushButton("Hledat")
         self.btn_items_more = QPushButton("Načíst další")
         self.lbl_items_page = QLabel("0 / 0")
         set_button_min_widths(self.btn_items_search, self.btn_items_more)
-        items_search_top_layout.addWidget(self.items_filter, 1)
-        items_search_top_layout.addWidget(self.btn_items_search)
-        items_search_top_layout.addWidget(self.btn_items_more)
-        items_search_top_layout.addWidget(self.lbl_items_page)
-        items_search_layout.addWidget(items_search_top)
+        items_search_layout.addWidget(self.items_filter, 1)
+        items_search_layout.addWidget(self.btn_items_search)
+        items_search_layout.addWidget(self.btn_items_more)
+        items_search_layout.addWidget(self.lbl_items_page)
         items_layout.addWidget(items_search_panel)
 
         items_filters = QWidget()
@@ -2387,10 +2382,8 @@ class MainWindow(QMainWindow):
         items_filters_layout = QVBoxLayout(items_filters)
         items_filters_layout.setContentsMargins(12, 10, 12, 10)
         items_filters_layout.setSpacing(8)
-        criteria_primary_row = QWidget()
-        criteria_primary_layout = FlowLayout(criteria_primary_row, h_spacing=8, v_spacing=8)
-        criteria_secondary_row = QWidget()
-        criteria_secondary_layout = FlowLayout(criteria_secondary_row, h_spacing=8, v_spacing=8)
+        criteria_row = QWidget()
+        criteria_layout = FlowLayout(criteria_row, h_spacing=8, v_spacing=8)
         actions_row = QWidget()
         actions_layout = FlowLayout(actions_row, h_spacing=8, v_spacing=8)
         self.items_group_enable = QCheckBox("Skupina")
@@ -2422,12 +2415,12 @@ class MainWindow(QMainWindow):
         self.items_group_assign = QLineEdit(); self.items_group_assign.setPlaceholderText("Název nové/existující skupiny")
 
         for widget in (self.items_group_filter, self.items_vat_filter, self.items_price_op):
-            set_editor_char_width(widget, 16, floor=190)
+            set_editor_char_width(widget, 16, floor=180)
         for widget in (self.items_price_val, self.items_price_min, self.items_price_max):
             set_editor_char_width(widget, 8, floor=120)
         for widget in (self.items_ids_receipt, self.items_ids_supplier):
-            set_editor_char_width(widget, 20, floor=240)
-        set_editor_char_width(self.items_group_assign, 24, floor=280)
+            set_editor_char_width(widget, 18, floor=180)
+        set_editor_char_width(self.items_group_assign, 22, floor=220)
         set_button_min_widths(self.btn_items_select_all, self.btn_items_assign_group)
 
         for widget in (
@@ -2435,16 +2428,12 @@ class MainWindow(QMainWindow):
             self.items_vat_enable, self.items_vat_filter,
             QLabel("Cena/ks"), self.items_price_enable, self.items_price_op, self.items_price_val,
             QLabel("Od"), self.items_price_min, QLabel("Do"), self.items_price_max,
-        ):
-            criteria_primary_layout.addWidget(widget)
-        for widget in (
             self.items_ids_receipt, self.items_ids_supplier,
         ):
-            criteria_secondary_layout.addWidget(widget)
+            criteria_layout.addWidget(widget)
         for widget in (self.btn_items_select_all, self.items_group_assign, self.btn_items_assign_group):
             actions_layout.addWidget(widget)
-        items_filters_layout.addWidget(criteria_primary_row)
-        items_filters_layout.addWidget(criteria_secondary_row)
+        items_filters_layout.addWidget(criteria_row)
         items_filters_layout.addWidget(actions_row)
         items_layout.addWidget(items_filters)
         self._on_price_enable_changed(False)
@@ -2477,7 +2466,6 @@ class MainWindow(QMainWindow):
         self.items_src.setReadOnly(True)
         self.btn_items_open = QPushButton("Otevřít doklad")
         set_button_min_widths(self.btn_items_open)
-        self.btn_items_open.setEnabled(False)
         sri.addWidget(QLabel("Zdroj:"))
         sri.addWidget(self.items_src, 1)
         sri.addWidget(self.btn_items_open)
@@ -2495,12 +2483,9 @@ class MainWindow(QMainWindow):
         self.items_doc_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.items_doc_items_table.setMinimumWidth(320)
         ir.addWidget(self.items_doc_items_table, 1)
-        self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
-        self._configure_line_items_header(self.items_doc_items_table)
 
         self.items_preview = PdfPreviewView()
         ir.addWidget(self.items_preview, 2)
-        self.items_preview.set_status_text("Vyberte položku pro zobrazení zdroje.")
         items_split.addWidget(items_right)
 
         items_split.setStretchFactor(0, 3)
@@ -2553,14 +2538,10 @@ class MainWindow(QMainWindow):
         srcrow = QWidget(); sr = QHBoxLayout(srcrow); sr.setContentsMargins(0, 0, 0, 0)
         self.doc_src_line = QLineEdit(); self.doc_src_line.setReadOnly(True)
         self.btn_open_source = QPushButton("Otevřít soubor")
-        self.btn_zoom_in = QPushButton("+"); self.btn_zoom_out = QPushButton("-"); self.btn_zoom_reset = QPushButton("Přizpůsobit")
+        self.btn_zoom_in = QPushButton("+"); self.btn_zoom_out = QPushButton("-"); self.btn_zoom_reset = QPushButton("Fit")
         set_button_min_widths(self.btn_open_source, self.btn_zoom_reset)
         self.btn_zoom_in.setMinimumWidth(44)
         self.btn_zoom_out.setMinimumWidth(44)
-        self.btn_open_source.setEnabled(False)
-        self.btn_zoom_in.setEnabled(False)
-        self.btn_zoom_out.setEnabled(False)
-        self.btn_zoom_reset.setEnabled(False)
         sr.addWidget(QLabel("Zdroj:")); sr.addWidget(self.doc_src_line, 1); sr.addWidget(self.btn_open_source)
         sr.addWidget(self.btn_zoom_in); sr.addWidget(self.btn_zoom_out); sr.addWidget(self.btn_zoom_reset)
         rl.addWidget(srcrow)
@@ -2570,7 +2551,6 @@ class MainWindow(QMainWindow):
 
         self.preview_view = PdfPreviewView()
         rl.addWidget(self.preview_view, 3)
-        self.preview_view.set_status_text("Vyberte doklad pro zobrazení zdroje.")
 
         self.doc_items_table = QTableView()
         self.doc_items_table.setAlternatingRowColors(True)
@@ -2579,8 +2559,6 @@ class MainWindow(QMainWindow):
         self.doc_items_table.verticalHeader().setVisible(False)
         self.doc_items_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         rl.addWidget(self.doc_items_table, 2)
-        self.doc_items_table.setModel(TableModel(["#", "Název", "Množství", "DPH %", "Cena (s DPH)"], []))
-        self._configure_line_items_header(self.doc_items_table)
 
         items_bar = QWidget()
         ib = FlowLayout(items_bar, h_spacing=8, v_spacing=8)
@@ -2840,11 +2818,6 @@ class MainWindow(QMainWindow):
             self._items_total = int(total or 0)
             self._items_offset = len(self._items_rows)
             self._render_items_table(reset)
-            if reset and not self._items_rows:
-                self._apply_items_source_state(None, reason="Vyberte položku pro zobrazení zdroje.")
-                self.items_doc_summary.set_values({})
-                self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
-                self._configure_line_items_header(self.items_doc_items_table)
 
         if show_busy:
             self._run_with_busy("Hledám položky", "Vyhledávání…", _query, _apply)
@@ -2958,16 +2931,16 @@ class MainWindow(QMainWindow):
     def _configure_items_table_headers(self) -> None:
         self._apply_header_width_policy(
             self.items_table,
-            min_section=104,
+            min_section=96,
             resize_to_contents={0, 3, 8, 9, 11, 12},
             explicit_widths={
-                1: 240,
-                2: 200,
-                4: 160,
+                1: 220,
+                2: 190,
+                4: 150,
                 5: 184,
-                6: 210,
-                7: 152,
-                10: 156,
+                6: 190,
+                7: 136,
+                10: 150,
             },
         )
         self._items_selection_changed_v2(None, None)
@@ -2995,20 +2968,6 @@ class MainWindow(QMainWindow):
             explicit_widths={
                 1: 200,
                 2: 252,
-            },
-        )
-
-    def _configure_editable_items_header(self, table: QTableView) -> None:
-        self._apply_header_width_policy(
-            table,
-            min_section=108,
-            resize_to_contents={1, 4},
-            explicit_widths={
-                0: 160,
-                2: 272,
-                3: 192,
-                5: 132,
-                6: 168,
             },
         )
 
@@ -3095,7 +3054,8 @@ class MainWindow(QMainWindow):
                 return
             idxs = sm.selectedRows()
             if not idxs:
-                self._apply_items_source_state(None, reason="Vyberte položku pro zobrazení zdroje.")
+                self.items_preview.clear()
+                self.items_src.setText("")
                 self.items_doc_summary.set_values({})
                 self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
                 self._configure_line_items_header(self.items_doc_items_table)
@@ -3107,7 +3067,8 @@ class MainWindow(QMainWindow):
             return
 
         path = meta.get("current_path")
-        self._apply_items_source_state(path)
+        self._items_current_path = path
+        self.items_src.setText(path or "")
 
         issue = meta.get("issue_date")
         if hasattr(issue, "strftime"):
@@ -3156,6 +3117,11 @@ class MainWindow(QMainWindow):
         else:
             self.items_doc_items_table.setModel(TableModel(["Počet", "Název položky", "Cena bez DPH za kus"], []))
             self._configure_line_items_header(self.items_doc_items_table)
+
+        if path:
+            QTimer.singleShot(0, lambda: self._load_preview(self.items_preview, path))
+        else:
+            self.items_preview.clear()
 
     def _group_row_clicked(self, index: QModelIndex):
         try:
@@ -3379,50 +3345,6 @@ class MainWindow(QMainWindow):
             # preview error: do not crash GUI
             self.log.exception("Preview load failed for %s", p)
 
-    def _resolve_existing_source_path(self, path_str: str | None) -> str | None:
-        candidate = (path_str or "").strip()
-        if not candidate:
-            return None
-        try:
-            path = Path(candidate)
-        except Exception:
-            return None
-        if not path.exists() or not path.is_file():
-            return None
-        return str(path)
-
-    def _apply_doc_source_state(self, path_str: str | None, *, reason: str | None = None) -> None:
-        available = self._resolve_existing_source_path(path_str)
-        self._current_doc_path = available
-        self.doc_src_line.setText(
-            available
-            or reason
-            or ("Zdroj není dostupný. Soubor po importu už na očekávané cestě není." if (path_str or "").strip() else "Zdroj není dostupný.")
-        )
-        self.doc_src_line.setToolTip(self.doc_src_line.text())
-        self.btn_open_source.setEnabled(bool(available))
-        for button in (self.btn_zoom_in, self.btn_zoom_out, self.btn_zoom_reset):
-            button.setEnabled(bool(available))
-        if available:
-            QTimer.singleShot(0, lambda p=available: self._load_preview(self.preview_view, p))
-            return
-        self.preview_view.set_status_text(self.doc_src_line.text())
-
-    def _apply_items_source_state(self, path_str: str | None, *, reason: str | None = None) -> None:
-        available = self._resolve_existing_source_path(path_str)
-        self._items_current_path = available
-        self.items_src.setText(
-            available
-            or reason
-            or ("Zdroj dokladu není dostupný. Soubor už na očekávané cestě není." if (path_str or "").strip() else "Zdroj dokladu není dostupný.")
-        )
-        self.items_src.setToolTip(self.items_src.text())
-        self.btn_items_open.setEnabled(bool(available))
-        if available:
-            QTimer.singleShot(0, lambda p=available: self._load_preview(self.items_preview, p))
-            return
-        self.items_preview.set_status_text(self.items_src.text())
-
     def _open_file_path(self, path_str: str | None) -> None:
         if not path_str:
             return
@@ -3529,15 +3451,6 @@ class MainWindow(QMainWindow):
 
         # enable/disable "more"
         self.btn_docs_more.setEnabled(self._doc_offset < self._doc_total)
-        if reset and not self._docs_listing:
-            self._current_doc_id = None
-            self._current_doc_file_id = None
-            self._apply_doc_source_state(None, reason="Vyberte doklad pro zobrazení zdroje.")
-            self.doc_supplier_info.set_values({})
-            self.doc_items_table.setModel(TableModel(["#", "Název", "Množství", "DPH %", "Cena (s DPH)"], []))
-            self._configure_line_items_header(self.doc_items_table)
-            for button in (self.btn_items_add, self.btn_items_del, self.btn_items_save):
-                button.setEnabled(False)
 
         # auto-select first row on reset and hook selection change
         try:
@@ -3572,15 +3485,16 @@ class MainWindow(QMainWindow):
             return
         meta = self._docs_listing[row]
         doc_id = int(meta["doc_id"])
-        with self.sf_production() as prod_session, self.sf() as work_session:
-            det = db_api.get_document_detail(prod_session, doc_id, working_session=work_session)
+        with self.sf() as session:
+            det = db_api.get_document_detail(session, doc_id)
             doc: Document = det["doc"]
             f: DocumentFile = det["file"]
             items: List[LineItem] = det["items"]
 
         self._current_doc_id = int(doc.id)
         self._current_doc_file_id = int(f.id) if f else None
-        self._apply_doc_source_state(f.current_path if f else None)
+        self._current_doc_path = f.current_path if f else None
+        self.doc_src_line.setText(self._current_doc_path or "")
         supplier_name = ""
         supplier_ico = ""
         try:
@@ -3622,12 +3536,13 @@ class MainWindow(QMainWindow):
         self._current_doc_items_model = model
         self.doc_items_table.setModel(model)
         self.doc_items_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._configure_editable_items_header(self.doc_items_table)
 
         for b in (self.btn_items_add, self.btn_items_del, self.btn_items_save):
             b.setEnabled(True)
 
         # load preview after table is ready to avoid blocking UI
+        QTimer.singleShot(0, lambda: self._load_preview(self.preview_view, self._current_doc_path))
+
     def _open_selected_source_v2(self) -> None:
         self._open_file_path(self._current_doc_path)
 
@@ -4460,22 +4375,63 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Modely OpenAI", msg)
 
     def _on_import_progress(self, msg: str) -> None:
-        self._import_status = msg
-        try:
-            self.lbl_run_status.setText(msg)
-        except Exception:
-            pass
-
-        # Forward into single progress dialog (IMPORT + processing).
         try:
             if not getattr(self, "progress", None) or not self.progress.active:
                 return
             text = str(msg or "").strip()
+            if text.startswith("__CURRENT_FILE__|"):
+                parts = text.split("|", 4)
+                if len(parts) >= 5:
+                    try:
+                        i = int(parts[1])
+                        total = int(parts[2])
+                    except Exception:
+                        i, total = 0, 0
+                    file_name = parts[3].strip()
+                    file_path = parts[4].strip()
+                    if total > 0:
+                        try:
+                            if self.progress.batch.total <= 0:
+                                self.progress.batch.total = int(total)
+                        except Exception:
+                            pass
+                    step = f"Soubor {i}/{total}: {file_name}" if total > 0 else f"Soubor: {file_name}"
+                    self._import_status = step
+                    try:
+                        self.lbl_run_status.setText(step)
+                    except Exception:
+                        pass
+                    history_entry = f"Vybrán soubor: {file_name}"
+                    self.progress.update(
+                        step=step,
+                        total=total if total > 0 else None,
+                        value=max(0, i - 1) if i > 0 else None,
+                        current_file=file_path or file_name,
+                        history_entry=history_entry,
+                    )
+                    return
             if text.startswith("__BATCH_RESULT__|"):
                 parts = text.split("|", 2)
                 status = parts[1] if len(parts) > 1 else ""
+                file_name = parts[2].strip() if len(parts) > 2 else ""
                 self.progress.mark_batch_done(status)
+                status_map = {
+                    "PROCESSED": "Soubor byl úspěšně zařazen do výstupu.",
+                    "PRODUCTION": "Soubor byl úspěšně zařazen do výstupu.",
+                    "QUARANTINE": "Soubor byl přesunut do karantény k ruční kontrole.",
+                    "DUPLICATE": "Soubor byl vyhodnocen jako duplicita.",
+                    "ERROR": "Soubor skončil chybou.",
+                }
+                self.progress.update(
+                    step=None,
+                    history_entry=(f"{file_name}: {status_map.get(str(status or '').upper(), 'Soubor byl dokončen.')}" if file_name else status_map.get(str(status or '').upper(), "Soubor byl dokončen.")),
+                )
                 return
+            self._import_status = text
+            try:
+                self.lbl_run_status.setText(text)
+            except Exception:
+                pass
             # Zpracovávám i/total: file
             if text.startswith("Zpracovávám") and "/" in text:
                 import re
@@ -4495,7 +4451,9 @@ class MainWindow(QMainWindow):
             if "OpenAI" in text or "openai" in text.lower():
                 # keep the andon alive on any OpenAI-related status messages
                 self.progress.set_openai_phase(text)
-            self.progress.update(step=text)
+            current_file = getattr(self.progress, "_current_file", "")
+            history_entry = f"{Path(current_file).name}: {text}" if current_file else text
+            self.progress.update(step=text, history_entry=history_entry)
         except Exception:
             pass
 
@@ -4570,25 +4528,10 @@ class MainWindow(QMainWindow):
         if output_dir_val:
             deep_set(self.cfg, ["paths", "output_dir"], output_dir_val)
 
-        # Quick guard: if the INPUT tree has no files at all, skip launching
-        # the import thread/progress dialog and let the user know.
-        try:
-            has_any_file = False
-            for _dirpath, _dirnames, filenames in os.walk(input_dir_val):
-                if filenames:
-                    has_any_file = True
-                    break
-            if not has_any_file:
-                QMessageBox.information(self, "IMPORTUJ", "V INPUT nejsou žádné soubory k importu.")
-                return
-        except Exception:
-            # If the check fails for any reason, continue with normal import flow.
-            pass
-
         self._audit_event("import.start", "Import started", input_dir=input_dir_val, output_dir=output_dir_val)
         self._import_running = True
         self._import_stop_event.clear()
-        self._import_status = "Načítám INPUT…"
+        self._import_status = "Spouštím import a načítám INPUT…"
         try:
             self.btn_import.setEnabled(False)
             self.btn_import_stop.setEnabled(True)
@@ -4666,6 +4609,20 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.processor.log.info("Import stop requested by user.")
+        try:
+            if getattr(self, "progress", None) and self.progress.active:
+                self.progress.update(step="Zastavuji import…", history_entry="Požadavek na zastavení přijat. Ukončuji rozpracovaný soubor…")
+        except Exception:
+            pass
+
+        def _hard_stop_if_needed() -> None:
+            if self._import_stop_event.is_set() and self._import_thread is not None:
+                self._force_stop_thread(self._import_thread)
+
+        try:
+            QTimer.singleShot(1500, self, _hard_stop_if_needed)
+        except Exception:
+            _hard_stop_if_needed()
 
     def _force_stop_thread(self, th: QThread | None, *, wait_ms: int = 1200) -> None:
         if th is None:
@@ -4694,15 +4651,26 @@ class MainWindow(QMainWindow):
     def _cancel_import_now(self) -> None:
         self._audit_event("import.cancel", "Import canceled by user")
         self._import_stop_event.set()
-        self._force_stop_thread(self._import_thread)
-        self._import_running = False
-        self._import_status = "Zastaveno uživatelem."
+        self._import_status = "Zastavuji import…"
         try:
-            self.btn_import.setEnabled(True)
             self.btn_import_stop.setEnabled(False)
             self.lbl_run_status.setText(self._import_status)
         except Exception:
             pass
+        try:
+            if getattr(self, "progress", None) and self.progress.active:
+                self.progress.update(step="Zastavuji import…", history_entry="Požadavek na zastavení přijat. Ukončuji rozpracovaný soubor…")
+        except Exception:
+            pass
+
+        def _hard_stop_if_needed() -> None:
+            if self._import_stop_event.is_set() and self._import_thread is not None:
+                self._force_stop_thread(self._import_thread)
+
+        try:
+            QTimer.singleShot(1500, self, _hard_stop_if_needed)
+        except Exception:
+            _hard_stop_if_needed()
 
     def _retry_extract(self, file_id: int, use_openai: bool) -> None:
         """Opakované vytěžení konkrétního souboru (offline nebo OpenAI) s průběhem."""
@@ -5488,7 +5456,14 @@ class MainWindow(QMainWindow):
         self._docs_new_search()
 
     def _open_selected_source(self):
-        self._open_file_path(self._current_doc_path)
+        p = (self.doc_src_line.text() or "").strip()
+        if not p:
+            return
+        fp = Path(p)
+        if not fp.exists():
+            QMessageBox.warning(self, "Soubor", "Soubor neexistuje.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(fp)))
 
     def _on_doc_selected_fast(self, *_):
         model = self.docs_table.model()
@@ -5507,24 +5482,39 @@ class MainWindow(QMainWindow):
         except Exception:
             return
 
-        with self.sf_production() as prod_session, self.sf() as work_session:
+        with self.sf() as session:
             try:
-                detail = db_api.get_document_detail(prod_session, doc_id, working_session=work_session)
+                detail = db_api.get_document_detail(session, doc_id)
                 d: Document = detail["doc"]
                 f: DocumentFile = detail["file"]
                 items: List[LineItem] = detail["items"]
             except Exception:
                 return
 
-        src = f.current_path if f else None
-        self._apply_doc_source_state(src)
+        src = f.current_path if f else ""
+        self.doc_src_line.setText(src or "")
 
         item_headers = ["#", "Název", "Množství", "DPH %", "Cena (s DPH)"]
         item_rows: List[List[Any]] = []
         for it in items:
             item_rows.append([it.line_no, it.name, it.quantity, it.vat_rate, it.line_total])
         self.doc_items_table.setModel(TableModel(item_headers, item_rows))
-        self._configure_line_items_header(self.doc_items_table)
+        self.doc_items_table.resizeColumnsToContents()
+
+        self.preview_view.clear()
+        if src and src.lower().endswith(".pdf") and Path(src).exists():
+            key = (src, self._preview_dpi)
+            px = self._preview_cache.get(key)
+            if px is None:
+                try:
+                    imgs = render_pdf_to_images(Path(src), dpi=self._preview_dpi, max_pages=1)
+                    if imgs:
+                        px = pil_to_pixmap(imgs[0])
+                        self._preview_cache[key] = px
+                except Exception:
+                    px = QPixmap()
+            if px and not px.isNull():
+                self.preview_view.set_pixmap(px)
 
     def refresh_unprocessed(self, force: bool = True):
         """Seznam karanténních souborů (FS + DB), řádek = jeden soubor."""
@@ -6044,14 +6034,12 @@ class MainWindow(QMainWindow):
         self.unproc_currency.setText("CZK")
         self._current_unproc_items_model = EditableItemsModel([])
         self.unproc_items_table.setModel(self._current_unproc_items_model)
-        self._configure_editable_items_header(self.unproc_items_table)
         self._update_unproc_total_hint()
 
     def _unproc_item_add(self):
         if not hasattr(self, "_current_unproc_items_model") or self._current_unproc_items_model is None:
             self._current_unproc_items_model = EditableItemsModel([])
             self.unproc_items_table.setModel(self._current_unproc_items_model)
-            self._configure_editable_items_header(self.unproc_items_table)
         self._current_unproc_items_model.insertRows(self._current_unproc_items_model.rowCount(), 1)
         self._update_unproc_total_hint()
 

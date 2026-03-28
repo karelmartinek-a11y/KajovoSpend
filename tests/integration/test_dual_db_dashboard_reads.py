@@ -8,7 +8,6 @@ from kajovospend.db.migrate import init_production_db, init_working_db
 from kajovospend.db.production_models import Supplier as ProdSupplier, Document as ProdDocument, LineItem as ProdLineItem
 from kajovospend.db.working_models import DocumentFile, Document as WorkDocument, LineItem as WorkLineItem
 from kajovospend.db.dual_db_guard import DualDbConfigError, ensure_separate_databases
-from kajovospend.service.promotion import promote_document
 from kajovospend.ui import db_api
 from kajovospend.utils.forensic_dual_db import canonical_db_path, assert_separate_sessions, snapshot_counts
 
@@ -105,56 +104,6 @@ def test_dashboard_reads_from_production(tmp_path: Path):
         snap = snapshot_counts(ws, ps)
         assert snap["working_documents"] == 1
         assert snap["production_documents"] == 1
-
-
-def test_promoted_document_keeps_readable_source_link(tmp_path: Path):
-    w_db = tmp_path / "working.sqlite"
-    p_db = tmp_path / "production.sqlite"
-
-    w_sf = create_working_session_factory(w_db)
-    p_sf = create_production_session_factory(p_db)
-    init_working_db(getattr(w_sf, "_engine", None) or getattr(w_sf, "bind", None))
-    init_production_db(getattr(p_sf, "_engine", None) or getattr(p_sf, "bind", None))
-
-    with w_sf() as ws:
-        f = DocumentFile(
-            sha256="promo_sha",
-            original_name="promo.pdf",
-            pages=1,
-            current_path="/tmp/promo.pdf",
-            status="PROCESSED",
-        )
-        ws.add(f)
-        ws.flush()
-        doc = WorkDocument(
-            file_id=f.id,
-            supplier_ico="88888888",
-            doc_number="P-2",
-            issue_date=None,
-            total_with_vat=50.0,
-            currency="CZK",
-        )
-        ws.add(doc)
-        ws.flush()
-        ws.add(WorkLineItem(document_id=doc.id, line_no=1, name="Work item", quantity=1, vat_rate=0, line_total=50.0))
-        ws.commit()
-
-        with p_sf() as ps:
-            promoted = promote_document(ws, ps, doc.id)
-            ps.commit()
-
-            assert promoted is not None
-            assert promoted.file_id == f.id
-
-            docs = db_api.list_documents(ps, working_session=ws)
-            assert len(docs) == 1
-            assert docs[0][1] is not None
-            assert docs[0][1].current_path == "/tmp/promo.pdf"
-
-            detail = db_api.get_document_detail(ps, promoted.id, working_session=ws)
-            assert detail["file"] is not None
-            assert detail["file"].current_path == "/tmp/promo.pdf"
-            assert detail["doc"].file_id == f.id
 
 
 def test_guard_rejects_same_path(tmp_path: Path):

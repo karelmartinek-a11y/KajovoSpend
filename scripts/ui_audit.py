@@ -39,12 +39,10 @@ def main() -> int:
         report_path = Path(report["workspace"]) / "artifacts" / "ui_audit_report.json"
         write_json_report(report_path, report)
     print(f"GUI audit hotový: {report_path}")
-    print(
-        f"Screenshoty: {len(report['screenshots'])}, incidenty: {report['summary']['incident_count']}, "
-        f"truth issues: {report['summary'].get('truth_issue_count', 0)}"
-    )
+    print(f"Screenshoty: {len(report['screenshots'])}, incidenty: {report['summary']['incident_count']}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

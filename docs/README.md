@@ -43,11 +43,11 @@ Doporučený postup je spustit připravený skript:
 
 ```bash
 bash scripts/bootstrap_codex_env.sh
-source .venv/bin/activate
+source .venv312/bin/activate
 ```
 
 Skript automaticky:
-- vybere dostupný Python `>=3.11` a vezme nejvyšší dostupnou stabilní verzi,
+- vybere dostupný Python `>=3.11` (preferuje 3.12.12 (kvůli wheel kompatibilitě), pak 3.13.8),
 - vytvoří virtuální prostředí,
 - doinstaluje závislosti z `requirements.txt` včetně modulu `build`,
 - nastaví/aktualizuje `git remote origin` na `https://github.com/karelmartinek-a11y/KajovoSpend.git`.
@@ -81,9 +81,9 @@ copy config.example.yaml config.yaml
   - `PYTHONPATH=src pytest tests/unit/test_openai_mode_gating.py`
   - `PYTHONPATH=src pytest tests/unit/test_openai_fallback_retry.py tests/unit/test_openai_truncation_retry.py tests/unit/test_openai_parse_recovery.py`
   - `PYTHONPATH=src pytest tests/unit/test_supplier_gate.py tests/unit/test_forensic_openai_linkage.py`
-- `PYTHONPATH=src pytest tests/test_forensic_logging.py tests/test_json_schema_defaults.py tests/test_openai_schema_invariants.py`
+  - `PYTHONPATH=src pytest tests/test_forensic_logging.py tests/test_json_schema_defaults.py tests/test_openai_schema_invariants.py`
 - Kompletní rychlý běh: `PYTHONPATH=src pytest tests`
-- Podporované verze jsou Python 3.11 až 3.13; bootstrap i lokální install jsou nastavené tak, aby na 3.13 používaly wheel-only cestu bez source buildů.
+- CI aktuálně běží na Pythonu 3.11 a 3.12 (na 3.13 chybí binární wheel pro pandas 2.2.x; až bude dostupný, můžeme matrix rozšířit).
 
 ## Spuštění
 

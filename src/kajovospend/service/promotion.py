@@ -55,7 +55,6 @@ def promote_document(
             pending_ares=doc.supplier.pending_ares if doc.supplier else None,
         )
 
-    # Přenášíme i zdrojový file_id, aby šlo produkční doklad dohledat zpět na working soubor.
     prod_doc = insert_document_from_working(prod_session, supplier, doc, items)
     prod_session.commit()
     return prod_doc
