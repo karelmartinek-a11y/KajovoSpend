@@ -1,0 +1,94 @@
+{
+  "workspace": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf",
+  "config_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\config.yaml",
+  "fixture_pdf": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\fixture.pdf",
+  "template_pdf": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\data\\templates\\gui_smoke\\sample.pdf",
+  "screenshots": [
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_00_DASHBOARD.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_01_PROVOZNÍ_PANEL.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_02_KARANTÉNA_DUPLICITY.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_03_NASTAVENÍ.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_04_DODAVATELÉ.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_05_STANDARDNÍ_ÚČTENKY.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_06_POLOŽKY.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_07_ÚČTENKY.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\supplier_dialog.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\progress_dialog.png",
+    "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\receipt_template_editor_dialog.png"
+  ],
+  "tabs": [
+    {
+      "name": "DASHBOARD",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_00_DASHBOARD.png",
+      "widget_count": 84,
+      "incidents": []
+    },
+    {
+      "name": "PROVOZNÍ PANEL",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_01_PROVOZNÍ_PANEL.png",
+      "widget_count": 20,
+      "incidents": []
+    },
+    {
+      "name": "KARANTÉNA/DUPLICITY",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_02_KARANTÉNA_DUPLICITY.png",
+      "widget_count": 51,
+      "incidents": []
+    },
+    {
+      "name": "NASTAVENÍ",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_03_NASTAVENÍ.png",
+      "widget_count": 96,
+      "incidents": []
+    },
+    {
+      "name": "DODAVATELÉ",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_04_DODAVATELÉ.png",
+      "widget_count": 51,
+      "incidents": []
+    },
+    {
+      "name": "STANDARDNÍ ÚČTENKY",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_05_STANDARDNÍ_ÚČTENKY.png",
+      "widget_count": 21,
+      "incidents": []
+    },
+    {
+      "name": "POLOŽKY",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_06_POLOŽKY.png",
+      "widget_count": 68,
+      "incidents": []
+    },
+    {
+      "name": "ÚČTENKY",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\tab_07_ÚČTENKY.png",
+      "widget_count": 57,
+      "incidents": []
+    }
+  ],
+  "dialogs": [
+    {
+      "name": "supplier_dialog",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\supplier_dialog.png",
+      "widget_count": 24,
+      "incidents": []
+    },
+    {
+      "name": "progress_dialog",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\progress_dialog.png",
+      "widget_count": 13,
+      "incidents": []
+    },
+    {
+      "name": "receipt_template_editor_dialog",
+      "image_path": "C:\\Users\\provo\\AppData\\Local\\Temp\\codex-gui-smoke-20260328-pt7s5fcf\\artifacts\\receipt_template_editor_dialog.png",
+      "widget_count": 44,
+      "incidents": []
+    }
+  ],
+  "summary": {
+    "tab_count": 8,
+    "dialog_count": 3,
+    "incident_count": 0
+  }
+}
